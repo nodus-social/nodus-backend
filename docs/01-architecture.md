@@ -65,7 +65,7 @@ The dependency direction is one-way: `server → api → store → core`, and
 2. **Scope.** Route → required scope, checked before the handler runs. `read` for
    GETs, `write` for POSTs, `follow` for relationship changes.
 3. **Handler.** Loads through `store`, decides through `core`, writes DTOs typed by
-   the `nodus-sdk` shared contract. A handler that needs more than one write does it
+   the `nodus-client-sdk` shared contract. A handler that needs more than one write does it
    in one transaction through a single store function.
 4. **Fan-out.** A local write enqueues `fan_out` in the same transaction; the
    worker writes `timeline_entry` rows. A request never fans out inline, because a

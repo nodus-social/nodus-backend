@@ -85,7 +85,7 @@ Two dependencies are allowed and one is forbidden:
 
 | Layer | Used by | Why |
 | --- | --- | --- |
-| `nodus-instance` (protocol model) and `nodus-shared` (the DTOs the two products share) — the *headless* SDK | SSR and the API | they describe what a status *is* on the wire, with no lifecycle |
+| `nodus-client-core` (protocol model) and `nodus-shared` (the DTOs the two products share) — the *headless* SDK | SSR and the API | they describe what a status *is* on the wire, with no lifecycle |
 | `AppState`, `Command`, `Sdk`, ports — the *stateful* SDK | the browser only | a state machine exists to make one long-lived app coherent |
 
 The SSR render is a pure function of (request, database row): it has no subscription,
