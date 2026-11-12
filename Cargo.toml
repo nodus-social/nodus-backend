@@ -1,0 +1,58 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/nodus-social/nodus-backend"
+
+[workspace.dependencies]
+nodus-server-core = { path = "crates/core" }
+nodus-server-store = { path = "crates/store" }
+nodus-server-api = { path = "crates/api" }
+nodus-server-federation = { path = "crates/federation" }
+nodus-server-worker = { path = "crates/worker" }
+
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls",
+  "postgres",
+  "chrono",
+  "json",
+  "migrate",
+  "macros",
+] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "request-id", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+ulid = { version = "1", features = ["serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "warn"
+items_after_statements = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

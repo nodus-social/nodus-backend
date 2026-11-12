@@ -1,0 +1,21 @@
+[package]
+name = "nodus-server-federation"
+description = "ActivityPub request signing and verification: digest, date and RSA signature checks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+
+[lints]
+workspace = true
