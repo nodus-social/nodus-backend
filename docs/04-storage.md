@@ -84,6 +84,17 @@ filesystem backend for development, behind `trait BlobStore`. Variants are produ
 `media_process`, not in the request: upload answers `202` with a `media_attachment`
 whose `url` is null until the worker finishes, exactly as Mastodon's async flow does.
 
+Variants are stored in `media_variant` as three layers:
+
+| layer | purpose | lifetime |
+|---|---|---|
+| `preview` | compressed preview for timelines/feed, max 1280px | semi-permanent, pruned with the status |
+| `compressed` | compressed full-size web copy, max 4096px | 24-72 hours, recreated on demand |
+| `lossless` | original bytes for art marked by the author | semi-permanent, opt-in only |
+
+The original bytes are never the default remote cache. This bounds federation
+growth: a remote post that nobody opens keeps only its preview variant.
+
 ## Migrations
 
 `sqlx` migrations, forward-only, one directory, numbered. Every migration runs inside

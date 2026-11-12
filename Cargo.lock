@@ -1592,6 +1592,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus-server-media"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "nodus-server-sdk"
 version = "0.1.0"
 dependencies = [

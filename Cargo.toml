@@ -12,6 +12,7 @@ repository = "https://github.com/nodus-social/nodus-backend"
 [workspace.dependencies]
 nodus-server-core = { path = "crates/core" }
 nodus-server-store = { path = "crates/store" }
+nodus-server-media = { path = "crates/media" }
 nodus-server-api = { path = "crates/api" }
 nodus-server-federation = { path = "crates/federation" }
 nodus-server-worker = { path = "crates/worker" }

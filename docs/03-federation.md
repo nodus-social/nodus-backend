@@ -81,7 +81,9 @@ status published
 ## Fetching
 
 Remote actors, statuses and media are fetched lazily and cached: actor documents 15
-minutes, statuses 5 minutes, media by digest forever. Fetching requires an
+minutes, statuses 5 minutes. Media is not cached forever: a preview variant
+lives with the status, the compressed full-size layer has a 24-72 hour cache
+window, and originals are retained only when the author marked them lossless. Fetching requires an
 `Accept: application/activity+json` GET signed with the **instance actor's** key
 (`/actor`), because some instances refuse unsigned fetches — Mastodon itself does
 not, but spending one signature is cheaper than discovering who does.

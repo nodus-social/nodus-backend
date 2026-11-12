@@ -104,6 +104,19 @@ object storage:
 - blobs are keyed by SHA-256, so duplicate uploads converge on one object;
 - the API serves URLs from object storage or a caching proxy, not from the worker.
 
+### CDN cache
+
+Variant URLs are content-addressed (`media/{source}/{layer}/{variant}`), so they
+can be served `immutable`. The API emits `Cache-Control` from
+`nodus_server_media::CachePolicy`:
+
+- preview/lossless: `public, max-age=2592000, s-maxage=2592000, immutable`
+- compressed: `public, max-age=259200, s-maxage=259200` (72 hours, refreshed on demand)
+
+A CDN may retain the short layer longer than the origin; the origin's `prune`
+pass only deletes expired `compressed` rows and never touches a status's
+preview layer. Purging a status or account purges all three keys.
+
 A single media service would be a throughput bottleneck and a single point of
 failure for every image on the instance. Co-locating media workers with the
 monolith is fine at small scale; scaling them out is just more replicas. A GPU
