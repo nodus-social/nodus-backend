@@ -20,8 +20,8 @@ use nodus_server_core::limits::STATUS_MAX_CHARS;
 use nodus_server_sdk::misskey::api::{Meta, Note, NoteVisibility, User};
 use nodus_server_sdk::misskey::{Aid, Reaction};
 use nodus_server_store::accounts::{self, AccountRow, Authenticated};
-use nodus_server_store::external_ids;
 use nodus_server_store::statuses::{self, StatusRow};
+use nodus_server_store::{events, external_ids};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -452,6 +452,13 @@ async fn create_note(
             reblog_of_id: renote_internal.as_deref(),
             language: None,
         },
+    )
+    .await?;
+    events::append(
+        state.store().pool(),
+        "timeline:local",
+        "status",
+        &json!({ "status_id": row.id }),
     )
     .await?;
     let account = accounts::by_id(state.store().pool(), &row.account_id)

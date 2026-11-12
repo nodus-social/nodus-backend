@@ -11,6 +11,7 @@ pub mod dto;
 pub mod error;
 pub mod mastodon;
 pub mod misskey;
+pub mod nodus;
 pub mod reactions;
 pub mod state;
 
@@ -38,6 +39,7 @@ pub fn router(state: AppState) -> axum::Router {
         )
         .route("/api/v1/statuses/{id}/reactions", get(reactions::list))
         .merge(misskey::router())
+        .merge(nodus::router())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }

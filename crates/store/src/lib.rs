@@ -6,6 +6,7 @@
 //! the status commit together") checkable in one place.
 
 pub mod accounts;
+pub mod events;
 pub mod external_ids;
 pub mod jobs;
 pub mod statuses;

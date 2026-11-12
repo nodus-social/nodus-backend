@@ -1508,6 +1508,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus-performance-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nodus-server"
 version = "0.1.0"
 dependencies = [
@@ -1531,6 +1539,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "futures-core",
  "http-body-util",
  "nodus-server-core",
  "nodus-server-sdk",
@@ -1542,6 +1551,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "tracing",
@@ -1574,6 +1584,7 @@ version = "0.1.0"
 dependencies = [
  "nodus-activitypub-sdk",
  "nodus-misskey-sdk",
+ "nodus-performance-sdk",
 ]
 
 [[package]]
@@ -1584,9 +1595,11 @@ dependencies = [
  "nodus-server-core",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
+ "ulid",
 ]
 
 [[package]]
