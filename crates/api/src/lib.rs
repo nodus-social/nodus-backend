@@ -10,6 +10,7 @@ pub mod auth;
 pub mod dto;
 pub mod error;
 pub mod mastodon;
+pub mod misskey;
 pub mod reactions;
 pub mod state;
 
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> axum::Router {
             put(reactions::set).delete(reactions::remove),
         )
         .route("/api/v1/statuses/{id}/reactions", get(reactions::list))
+        .merge(misskey::router())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -130,6 +132,45 @@ mod tests {
                     .uri("/api/v1/statuses/01j00000000000000000000000/reaction")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"reaction":"👍"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn misskey_meta_is_public() {
+        let response = router(state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/meta")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains(r#""maxNoteTextLength":500"#), "body was {body}");
+    }
+
+    #[tokio::test]
+    async fn misskey_note_creation_requires_a_token() {
+        let response = router(state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notes/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"hello"}"#))
                     .expect("request"),
             )
             .await
