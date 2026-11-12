@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/nodus/events", get(events_stream))
         .route("/api/v1/nodus/sync/root", get(root))
         .route("/api/v1/nodus/sync/diff", post(diff))
+        .route("/api/v1/nodus/sync/snapshot", get(snapshot))
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +204,60 @@ async fn root(
         hash,
         count: u64::try_from(count).unwrap_or_default(),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotQuery {
+    collection: String,
+    #[serde(default)]
+    max_id: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn snapshot(
+    State(state): State<AppState>,
+    _auth: Auth,
+    axum::extract::Query(query): axum::extract::Query<SnapshotQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let root = events::root(state.store().pool(), &query.collection)
+        .await?
+        .unwrap_or_default();
+    let mut params = PageParams::new();
+    params.limit = query.limit;
+    if let Some(max_id) = query.max_id.as_deref() {
+        params.max_id = Some(
+            max_id
+                .parse::<Id>()
+                .map_err(|_| ApiError::unprocessable("max_id is not an id"))?,
+        );
+    }
+    let page = if query.collection == "timeline:local" {
+        statuses::public_page(state.store().pool(), params, true).await?
+    } else if let Some(actor) = query.collection.strip_prefix("timeline:") {
+        statuses::home_page(state.store().pool(), actor, params).await?
+    } else {
+        return Err(ApiError::unprocessable("unknown collection"));
+    };
+    let mut items = Vec::with_capacity(page.items.len());
+    for row in &page.items {
+        if let Some(account) = accounts::by_id(state.store().pool(), &row.account_id).await? {
+            items.push(
+                serde_json::to_value(crate::dto::StatusDto::from_row(
+                    row,
+                    &account,
+                    state.instance(),
+                ))
+                .map_err(|error| serialise_error(&error))?,
+            );
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "collection": query.collection,
+        "root": root,
+        "items": items,
+        "next": page.next_max_id,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
