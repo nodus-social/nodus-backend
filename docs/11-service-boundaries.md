@@ -39,7 +39,8 @@ call stays in-process or crosses a process boundary.
 Every RPC that crosses a process boundary carries `x-nodus-service-secret`.
 The server interceptor validates it with `nodus_service_sdk::SharedSecret::verify`
 before the request reaches the service trait; the client attaches it with
-`SharedSecret::attach`. A missing, empty or wrong secret is an authentication
+`SharedSecret::attach`; the `grpc` feature provides `ClientSecret` and
+`grpc::verify`. A missing, empty or wrong secret is an authentication
 error, never an anonymous request. Each service gets its own secret in split
 mode so one compromised service cannot call every other service.
 
