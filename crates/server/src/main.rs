@@ -125,6 +125,7 @@ async fn provision_bootstrap(store: &Store, bootstrap: &Bootstrap) -> Result<(),
         }
     };
 
+    accounts::set_admin(store.pool(), &account.id, true).await?;
     let auth = PgAuthStore::new(store.pool().clone());
     if auth.has_credential(&bootstrap.email).await? {
         tracing::info!(username = %account.username, "bootstrap user already has a login");
@@ -134,7 +135,6 @@ async fn provision_bootstrap(store: &Store, bootstrap: &Bootstrap) -> Result<(),
         .map_err(|error| std::io::Error::other(format!("password hash failed: {error}")))?;
     auth.create_credential(&account.id, &bootstrap.email, &password_hash)
         .await?;
-    accounts::set_admin(store.pool(), &account.id, true).await?;
     tracing::info!(username = %account.username, "bootstrap user created as administrator");
     Ok(())
 }
