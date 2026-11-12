@@ -16,7 +16,7 @@ use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::OsRng;
 use rsa::RsaPrivateKey;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use nodus_server_core::PageParams;
 use nodus_server_sdk::activitypub::{Activity, Actor, Collection, CollectionPage, Note, Webfinger};
@@ -307,6 +307,7 @@ async fn note_document(state: &AppState, row: &StatusRow, account: &AccountRow) 
         to,
         cc,
         mentions: Vec::new(),
+        extra: Map::default(),
     })
 }
 
@@ -403,6 +404,7 @@ fn actor_document(state: &AppState, account: &AccountRow) -> Actor {
         discoverable: account.discoverable,
         indexable: account.indexable,
         manually_approves_followers: account.locked,
+        extra: Map::default(),
     }
 }
 
