@@ -6,11 +6,15 @@
 
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::time::Duration;
 
-use axum::extract::State;
-use axum::routing::post;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -36,6 +40,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/notes/local-timeline", post(local_timeline))
         .route("/api/notes/global-timeline", post(global_timeline))
         .route("/api/notes/timeline", post(home_timeline))
+        .route("/streaming", get(streaming))
         .route("/api/notes/create", post(create_note))
         .route("/api/notes/delete", post(delete_note))
         .route("/api/notes/reactions/create", post(create_reaction))
@@ -495,6 +500,76 @@ async fn delete_note(
     )
     .await?;
     Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamingQuery {
+    #[serde(default)]
+    i: Option<String>,
+}
+
+async fn streaming(
+    State(state): State<AppState>,
+    Query(query): Query<StreamingQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(token) = query.i else {
+        return ApiError::unauthorized("token is required").into_response();
+    };
+    let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+    if accounts::verify_token(state.store().pool(), &digest)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return ApiError::unauthorized("invalid token").into_response();
+    }
+    upgrade.on_upgrade(move |socket| stream_events(state, socket))
+}
+
+async fn stream_events(state: AppState, socket: WebSocket) {
+    let (mut sink, mut source) = socket.split();
+    let _ = sink
+        .send(Message::Text(r#"{"type":"connected","body":{}}"#.into()))
+        .await;
+    let mut last = events::root(state.store().pool(), "timeline:local")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let rows = events::after(state.store().pool(), "timeline:local", &last, 50)
+                    .await
+                    .unwrap_or_default();
+                for row in rows {
+                    last.clone_from(&row.hash);
+                    let body = json!({
+                        "id": row.id,
+                        "type": "note",
+                        "body": row.payload,
+                    });
+                    if sink.send(Message::Text(body.to_string().into())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            message = source.next() => {
+                match message {
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => return,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if sink.send(Message::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
