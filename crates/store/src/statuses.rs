@@ -169,6 +169,22 @@ pub struct NewStatus<'a> {
 }
 
 /// Inserts a local status and returns it exactly as a timeline would.
+/// Soft-deletes a status owned by `account_id`.
+pub async fn delete_owned(
+    pool: &PgPool,
+    status_id: &str,
+    account_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE status SET deleted_at = now()          WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(status_id)
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sqlx::Error> {
     let sql = format!(
         "INSERT INTO status (id, account_id, content, content_html, content_source, \

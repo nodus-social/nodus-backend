@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/notes/global-timeline", post(global_timeline))
         .route("/api/notes/timeline", post(home_timeline))
         .route("/api/notes/create", post(create_note))
+        .route("/api/notes/delete", post(delete_note))
         .route("/api/notes/reactions/create", post(create_reaction))
         .route("/api/notes/reactions/delete", post(delete_reaction))
 }
@@ -465,6 +466,35 @@ async fn create_note(
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(note_for(&state, &row, &account).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteBody {
+    #[serde(default)]
+    i: Option<String>,
+    note_id: String,
+}
+
+async fn delete_note(
+    State(state): State<AppState>,
+    Json(body): Json<DeleteBody>,
+) -> ApiResult<Json<Value>> {
+    let auth = authenticate(&state, body.i.as_deref()).await?;
+    let local = external_ids::resolve(state.store().pool(), "status", &body.note_id)
+        .await?
+        .unwrap_or_else(|| body.note_id.clone());
+    if !statuses::delete_owned(state.store().pool(), &local, &auth.account.id).await? {
+        return Err(ApiError::not_found("No such note"));
+    }
+    events::append(
+        state.store().pool(),
+        "timeline:local",
+        "delete",
+        &json!({ "status_id": local }),
+    )
+    .await?;
+    Ok(Json(json!({})))
 }
 
 #[derive(Debug, Deserialize)]
