@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::CookieJar;
 use chrono::{DateTime, Utc};
+use leptos::prelude::*;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -64,17 +65,30 @@ async fn start(
         return (StatusCode::UNAUTHORIZED, Html("<p>Sign in first.</p>")).into_response();
     }
     let permission = scopes.join(",");
-    let html = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Authorize {name}</title>\
-         <form method=\"post\" action=\"/miauth/{session}\">\
-         <h1>Authorize {name}</h1><p>Scopes: {permission}</p>\
-         <input type=\"hidden\" name=\"name\" value=\"{name}\">\
-         <button type=\"submit\">Approve</button></form>",
-        name = escape(&query.name),
-        session = escape(&session),
-        permission = escape(&permission),
-    );
-    Html(html).into_response()
+    let action = format!("/miauth/{session}");
+    let name = query.name;
+    let title = format!("Authorize {name}");
+    let scopes = format!("Scopes: {permission}");
+    let body = Owner::new().with(|| {
+        view! {
+            <html>
+                <head>
+                    <meta charset="utf-8" />
+                    <title>{title.clone()}</title>
+                </head>
+                <body>
+                    <form method="post" action=action>
+                        <h1>{title}</h1>
+                        <p>{scopes}</p>
+                        <input type="hidden" name="name" value=name />
+                        <button type="submit">"Approve"</button>
+                    </form>
+                </body>
+            </html>
+        }
+        .to_html()
+    });
+    Html(format!("<!DOCTYPE html>{body}")).into_response()
 }
 
 #[derive(Debug, Deserialize)]

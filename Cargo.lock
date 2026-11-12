@@ -1542,6 +1542,7 @@ dependencies = [
  "chrono",
  "futures-core",
  "http-body-util",
+ "leptos",
  "nodus-auth",
  "nodus-server-core",
  "nodus-server-sdk",
