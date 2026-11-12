@@ -6,6 +6,7 @@
 //! same id and deduped, so a status that crosses the threshold never appears twice.
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
 use nodus_server_core::limits::BIG_ACCOUNT_THRESHOLD;
@@ -19,6 +20,8 @@ pub struct StatusRow {
     pub uri: Option<String>,
     pub content: String,
     pub content_html: String,
+    pub content_source: Option<String>,
+    pub content_format: String,
     pub spoiler_text: String,
     pub visibility: String,
     pub sensitive: bool,
@@ -35,7 +38,7 @@ pub struct StatusRow {
 }
 
 const STATUS_COLUMNS: &str = "s.id, s.account_id, s.uri, s.content, s.content_html, \
-     s.spoiler_text, s.visibility, s.sensitive, s.in_reply_to_id, s.in_reply_to_account_id, \
+     s.content_source, s.content_format, s.spoiler_text, s.visibility, s.sensitive, s.in_reply_to_id, s.in_reply_to_account_id, \
      s.reblog_of_id, s.language, s.local, s.edited_at, s.created_at, \
      s.favourites_count, s.reblogs_count, s.replies_count";
 
@@ -154,6 +157,8 @@ pub struct NewStatus<'a> {
     pub account_id: &'a str,
     pub content: &'a str,
     pub content_html: &'a str,
+    pub content_source: Option<&'a str>,
+    pub content_format: &'a str,
     pub spoiler_text: &'a str,
     pub visibility: &'a str,
     pub sensitive: bool,
@@ -165,9 +170,10 @@ pub struct NewStatus<'a> {
 /// Inserts a local status and returns it exactly as a timeline would.
 pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sqlx::Error> {
     let sql = format!(
-        "INSERT INTO status (id, account_id, content, content_html, spoiler_text, visibility, \
-                             sensitive, in_reply_to_id, in_reply_to_account_id, language, local) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true) \
+        "INSERT INTO status (id, account_id, content, content_html, content_source, \
+                             content_format, spoiler_text, visibility, sensitive, \
+                             in_reply_to_id, in_reply_to_account_id, language, local) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, true) \
          RETURNING {STATUS_COLUMNS_SIMPLE}"
     );
     sqlx::query_as::<_, StatusRow>(&sql)
@@ -175,6 +181,8 @@ pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sql
         .bind(new.account_id)
         .bind(new.content)
         .bind(new.content_html)
+        .bind(new.content_source)
+        .bind(new.content_format)
         .bind(new.spoiler_text)
         .bind(new.visibility)
         .bind(new.sensitive)
@@ -187,9 +195,66 @@ pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sql
 
 /// `RETURNING` cannot carry the `s.` alias the page queries use.
 const STATUS_COLUMNS_SIMPLE: &str = "id, account_id, uri, content, content_html, \
-     spoiler_text, visibility, sensitive, in_reply_to_id, in_reply_to_account_id, \
+     content_source, content_format, spoiler_text, visibility, sensitive, in_reply_to_id, in_reply_to_account_id, \
      reblog_of_id, language, local, edited_at, created_at, \
      favourites_count, reblogs_count, replies_count";
+
+/// A reaction and how many accounts chose it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
+pub struct ReactionCount {
+    pub reaction: String,
+    pub count: i64,
+}
+
+/// Adds or replaces one account's reaction on a status.
+///
+/// Misskey allows one reaction per account per note, so a second call replaces
+/// the first rather than adding a second row.
+pub async fn set_reaction(
+    pool: &PgPool,
+    status_id: &str,
+    account_id: &str,
+    reaction: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO status_reaction (status_id, account_id, reaction) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (status_id, account_id) \
+         DO UPDATE SET reaction = EXCLUDED.reaction, created_at = now()",
+    )
+    .bind(status_id)
+    .bind(account_id)
+    .bind(reaction)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Removes an account's reaction, if it has one.
+pub async fn remove_reaction(
+    pool: &PgPool,
+    status_id: &str,
+    account_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM status_reaction WHERE status_id = $1 AND account_id = $2")
+        .bind(status_id)
+        .bind(account_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Reaction counts for one status, most common first.
+pub async fn reactions(pool: &PgPool, status_id: &str) -> Result<Vec<ReactionCount>, sqlx::Error> {
+    sqlx::query_as::<_, ReactionCount>(
+        "SELECT reaction, COUNT(*)::bigint AS count \
+           FROM status_reaction WHERE status_id = $1 \
+          GROUP BY reaction ORDER BY count DESC, reaction ASC",
+    )
+    .bind(status_id)
+    .fetch_all(pool)
+    .await
+}
 
 /// Truncates to the page size and reports the cursor when more rows exist.
 ///
