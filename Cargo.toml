@@ -15,7 +15,7 @@ nodus-server-store = { path = "crates/store" }
 nodus-server-api = { path = "crates/api" }
 nodus-server-federation = { path = "crates/federation" }
 nodus-server-worker = { path = "crates/worker" }
-nodus-server-sdk = { path = "../server-sdk/crates/server", features = ["activitypub"] }
+nodus-server-sdk = { path = "../server-sdk/crates/server", features = ["activitypub", "misskey"] }
 
 axum = { version = "0.8", features = ["macros"] }
 axum-extra = { version = "0.10", features = ["cookie"] }

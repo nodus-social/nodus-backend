@@ -10,11 +10,12 @@ pub mod auth;
 pub mod dto;
 pub mod error;
 pub mod mastodon;
+pub mod reactions;
 pub mod state;
 
 pub use state::{AppState, InstanceConfig};
 
-use axum::routing::get;
+use axum::routing::{get, put};
 
 /// Builds the router. No port, no listener: the binary owns the process, this owns the
 /// surface.
@@ -30,6 +31,11 @@ pub fn router(state: AppState) -> axum::Router {
             "/api/v1/accounts/verify_credentials",
             get(mastodon::verify_credentials),
         )
+        .route(
+            "/api/v1/statuses/{id}/reaction",
+            put(reactions::set).delete(reactions::remove),
+        )
+        .route("/api/v1/statuses/{id}/reactions", get(reactions::list))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -113,6 +119,22 @@ mod tests {
     async fn a_malformed_cursor_is_422_rather_than_an_empty_page() {
         let (status, _) = get_json("/api/v1/timelines/public?max_id=not-an-id").await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn reactions_require_a_token_even_when_the_status_id_is_unknown() {
+        let response = router(state())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/statuses/01j00000000000000000000000/reaction")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reaction":"👍"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
