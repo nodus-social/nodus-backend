@@ -1537,10 +1537,12 @@ name = "nodus-server-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "axum-extra",
  "base64",
  "chrono",
  "futures-core",
  "http-body-util",
+ "nodus-auth",
  "nodus-server-core",
  "nodus-server-sdk",
  "nodus-server-store",
