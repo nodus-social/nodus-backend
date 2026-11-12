@@ -52,11 +52,13 @@ drain. The API therefore enqueues and returns.
 
 *Revisit if:* never — the only question is where the worker runs, not whether.
 
-## D6 — Redis for pub/sub only
+## D6 — Redis for coordination, never ownership
 
-Streaming across replicas needs fan-out to connected sockets; Redis pub/sub does that
-with two commands and no schema. It is never the source of truth: timelines, jobs and
-sessions live in Postgres, so a Redis restart costs a reconnect, not data.
+Streaming across replicas needs fan-out to connected sockets; delivery needs one
+rate limit shared by every replica; some workers benefit from short-lived caches.
+Redis does all three with no schema. It is never the source of truth: timelines,
+jobs, sessions and sync logs live in Postgres, so a Redis restart costs a reconnect
+or a duplicated fetch, not data. The per-worker table is in `docs/09-deployment.md`.
 
 *Revisit if:* streaming volume requires a dedicated fan-out service; the boundary
 stays the same.

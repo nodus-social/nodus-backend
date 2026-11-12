@@ -2,10 +2,14 @@
 
 Status: draft · Last revised: 2026-11-07
 
-One binary serves the client API, another runs jobs. Both are stateless apart from
-Postgres, so both scale by replica count. The frontend is mounted into the first
-binary rather than served by a separate process, because a page that renders a
-timeline is a request that already has the data.
+The default deployment is one binary with several roles: it serves the client API,
+runs jobs, and handles federation in the same process. The roles can be split out
+for scale — a database service and stateless logic services over gRPC — but that is
+an operational choice, not the starting point. The frontend is mounted into the API
+process rather than served by a separate frontend server, because a page that
+renders a timeline is a request that already has the data.
+
+See `docs/09-deployment.md` for the topology and the split profile.
 
 ```mermaid
 flowchart LR
@@ -13,13 +17,10 @@ flowchart LR
   browser[["browser"]]
   remote[["remote instance"]]
 
-  subgraph pod["nodus-server (N replicas)"]
+  subgraph pod["nodus (roles=api,worker,federation)"]
     api["axum: /api/v1/*"]
     stream["streaming: SSE / WS"]
     ssr["leptos SSR router<br/>(nodus-web)"]
-  end
-
-  subgraph workers["nodus-server-worker (M replicas)"]
     deliver["deliver"]
     ingest["ingest_remote"]
     media["media_process"]
@@ -28,7 +29,7 @@ flowchart LR
 
   db[("Postgres")]
   obj[["object storage<br/>(media)"]]
-  redis[("Redis<br/>pub/sub + leases")]
+  redis[("Redis<br/>coordination (optional)")]
 
   app --> api
   browser --> ssr
@@ -36,11 +37,15 @@ flowchart LR
   api --> db
   ssr --> api
   stream --> redis
-  workers --> db
-  workers --> obj
-  workers -->|"HTTP signatures"| remote
-  remote -->|"POST /inbox"| api
-  api -->|"enqueue"| db
+  fan --> db
+  deliver --> db
+  ingest --> db
+  media --> db
+  deliver --> obj
+  media --> obj
+  deliver -->|HTTP signatures| remote
+  remote -->|POST /inbox| api
+  api -->|enqueue| db
 ```
 
 ## Crates
@@ -84,9 +89,10 @@ The `job` table with `FOR UPDATE SKIP LOCKED` and a lease (`locked_until`,
 - backlog is observable with one `GROUP BY`, no extra component;
 - Kubernetes scaling is "more worker pods", not "more consumers on a broker".
 
-Redis is used for what it is good at — pub/sub for streaming, short-lived locks —
-never as the source of truth. If Redis is down, timelines still work and only
-cross-replica streaming degrades.
+Redis is used for what it is good at — cross-replica pub/sub, short-lived locks
+and per-host rate limiting — never as the source of truth. If Redis is down,
+timelines still work and only cross-replica streaming and shared rate limiting
+degrade. The role-by-role table is in `docs/09-deployment.md`.
 
 ## Process model
 
@@ -113,8 +119,9 @@ role that has `SELECT` only.
 
 ## Deployment
 
-Kubernetes by default: `Deployment` for `nodus-server` (HPA on CPU + request rate),
-`Deployment` for `nodus-server-worker` (HPA on job backlog, not CPU), one
-`StatefulSet` for Postgres, `Ingress` terminating TLS. Redis is optional in M0.
-Migrations run as a `Job` before rollout, `nodus-server --migrate-only`. The full
-manifest set and its reasoning live in `docs/05-workers.md`.
+The smallest supported deployment is one process, one Postgres and an optional
+Redis. Kubernetes is a scale-out shape: a `Deployment` for the API roles (HPA on
+CPU + request rate), worker deployments by queue class (HPA on backlog, not CPU),
+one `StatefulSet` for Postgres and an `Ingress` terminating TLS. Migrations run as
+a one-shot job before rollout, `nodus migrate`. The topology, split-profile and
+media/worker scaling rules live in `docs/09-deployment.md`.

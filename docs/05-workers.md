@@ -2,9 +2,11 @@
 
 Status: draft · Last revised: 2026-11-07
 
-The worker is a second deployment of the same codebase. It exists so that a post
-does not wait for fan-out, and so that delivery to a slow instance cannot consume a
-request thread.
+The worker is a role of the same binary, not a separate codebase. In the default
+monolith it runs beside the API; in the split profile it becomes a separate
+deployment. It exists so that a post does not wait for fan-out, and so that delivery
+to a slow instance cannot consume a request thread. The full topology and the
+worker classes that use Redis are in `docs/09-deployment.md`.
 
 ## Job table contract
 
@@ -52,6 +54,20 @@ RETURNING id, kind, payload, attempts;
 | `ingest_remote` | fetches a remote actor, status or thread | on demand (lazy), and refresh |
 | `prune` | tombstoned statuses > 30 d, finished jobs > 7 d, expired tokens | hourly, one pod |
 
+## Redis, per worker class
+
+Postgres is the queue and the source of truth. Redis is optional coordination and a
+cache; every use below has a Postgres or local fallback, and a Redis flush is never
+data loss.
+
+| Worker | Redis use | Fallback |
+| --- | --- | --- |
+| streaming fan-out | cross-replica pub/sub and resume cursors | per-replica sockets; client resyncs |
+| `deliver` | per-host token bucket shared by replicas | process-local limiter + Postgres lease |
+| `ingest_remote` | in-flight/negative cache | duplicate fetch |
+| `media_process` | hot digest/progress cache | object-store digest is authoritative |
+| `prune` | optional singleton hint | Postgres advisory lock |
+
 ## Runtime shape
 
 - One loop per replica: claim → handle → repeat, with a bounded concurrency
@@ -92,7 +108,7 @@ because the API does not drain the backlog.
 
 ## Migrations and rollouts
 
-`nodus-server --migrate-only` runs as a `Job` with `backoffLimit: 0` in an
+`nodus migrate` runs as a `Job` with `backoffLimit: 0` in an
 `initContainer`-free step before `kubectl rollout`. Both deployments then start
 against a schema that is already at head. Because the old worker keeps running
 during a rollout, migrations must be additive within a release (`docs/04-storage.md`).

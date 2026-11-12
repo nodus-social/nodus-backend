@@ -17,6 +17,8 @@ It is a server: accounts, posts, media, follows, timelines, moderation, and the
 client API that every Mastodon app expects. Federation by ActivityPub follows in a
 later milestone, deliberately behind the client API, so that the expensive part
 (signatures, delivery, remote actors) lands on a surface that already works.
+Authentication is Mastodon OAuth by default and can delegate account login to an
+OIDC provider without changing the client flow (`docs/10-auth.md`).
 
 It is not a proxy in front of someone else's instance, and it is not a hosting
 product. One deployment serves one instance. There is no multi-tenancy, no
@@ -67,3 +69,6 @@ cargo run -p nodus-server-worker   # job runner, one process per replica
 | `docs/05-workers.md` | job kinds, leases, scaling on Kubernetes |
 | `docs/06-ssr.md` | how `nodus-web` is mounted and where the boundary sits |
 | `docs/07-decisions.md` | decisions with the reason each was made |
+| `docs/08-nodus-protocol.md` | batch, event subscription and state-hash history sync |
+| `docs/09-deployment.md` | monolith default, split gRPC profile, media and federation workers |
+| `docs/10-auth.md` | Mastodon OAuth, optional OIDC/MAS-style identity provider |
