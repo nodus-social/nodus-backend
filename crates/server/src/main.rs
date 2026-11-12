@@ -186,9 +186,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         domain = %config.instance.domain,
         "nodus server listening"
     );
-    axum::serve(listener, app(&store, &config))
-        .with_graceful_shutdown(shutdown())
-        .await?;
+    axum::serve(
+        listener,
+        app(&store, &config).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await?;
     Ok(())
 }
 
