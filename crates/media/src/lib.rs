@@ -54,6 +54,8 @@ pub struct CachePolicy {
     pub preview: Duration,
     pub compressed: Duration,
     pub lossless: Duration,
+    /// Original kept after upload so the author can still opt in after posting.
+    pub lossless_pending: Duration,
 }
 
 impl Default for CachePolicy {
@@ -62,6 +64,7 @@ impl Default for CachePolicy {
             preview: Duration::from_hours(720),
             compressed: Duration::from_hours(72),
             lossless: Duration::from_hours(720),
+            lossless_pending: Duration::from_hours(24),
         }
     }
 }
@@ -90,13 +93,58 @@ impl CachePolicy {
     }
 }
 
+/// What the uploaded media actually is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A still image. Always re-encoded to `WebP`.
+    Image,
+    /// An animated image (GIF or animated `WebP`/PNG). Re-encoded to animated `WebP`.
+    AnimatedImage,
+    /// A video. Re-encoded to multi-resolution `WebM`.
+    Video,
+}
+
+impl Kind {
+    /// Classify by the uploaded content type. Unknown types are treated as
+    /// still images so they still receive a safe preview.
+    #[must_use]
+    pub fn from_content_type(content_type: &str) -> Self {
+        match content_type.split(';').next().unwrap_or_default().trim() {
+            "image/gif" | "image/apng" => Self::AnimatedImage,
+            "video/mp4" | "video/webm" | "video/quicktime" | "video/ogg" => Self::Video,
+            _ => Self::Image,
+        }
+    }
+
+    /// Output container for this kind.
+    #[must_use]
+    pub const fn format(self) -> Format {
+        match self {
+            Self::Video => Format::Webm,
+            Self::Image | Self::AnimatedImage => Format::Webp,
+        }
+    }
+}
+
+/// Output format of a generated variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Webp,
+    Webm,
+    /// The untouched upload. Only used by the lossless layer.
+    Original,
+}
+
 /// One generated variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VariantSpec {
     pub layer: Layer,
+    pub format: Format,
     pub max_edge: u32,
     pub quality: u8,
     pub lossless: bool,
+    /// Whether this variant survives after the lossless decision window.
+    pub retain: bool,
 }
 
 /// Why a variant plan was rejected.
@@ -106,11 +154,49 @@ pub enum Error {
     EmptyDimensions,
     #[error("quality must be between 1 and 100")]
     Quality,
+    #[error("lossless media is not allowed for this account")]
+    LosslessNotAllowed,
+}
+
+/// Which lossless layers an account is permitted to request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LosslessPermissions {
+    pub images: bool,
+    pub videos: bool,
+}
+
+impl LosslessPermissions {
+    /// No lossless uploads.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            images: false,
+            videos: false,
+        }
+    }
+
+    /// Both kinds.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            images: true,
+            videos: true,
+        }
+    }
+
+    /// Whether this permission covers a media kind.
+    #[must_use]
+    pub const fn allows(self, kind: Kind) -> bool {
+        match kind {
+            Kind::Image | Kind::AnimatedImage => self.images,
+            Kind::Video => self.videos,
+        }
+    }
 }
 
 /// Preview longest edge. The variant is downscaled and recompressed;
 /// larger sources are reduced, smaller ones are not upscaled.
-pub const DOWNSCALED_EDGE: u32 = 1280;
+pub const PREVIEW_EDGE: u32 = 1280;
 /// Compressed full-size longest edge. This is a cache cap, not an upscale.
 pub const COMPRESSED_EDGE: u32 = 4096;
 
@@ -119,31 +205,7 @@ pub const COMPRESSED_EDGE: u32 = 4096;
 /// `lossless` is an author opt-in for art. Without it the original bytes are not
 /// retained beyond the short compressed window.
 pub fn plan(width: u32, height: u32, lossless: bool) -> Result<Vec<VariantSpec>, Error> {
-    if width == 0 || height == 0 {
-        return Err(Error::EmptyDimensions);
-    }
-    let mut variants = Vec::with_capacity(if lossless { 3 } else { 2 });
-    variants.push(VariantSpec {
-        layer: Layer::Preview,
-        max_edge: DOWNSCALED_EDGE,
-        quality: 82,
-        lossless: false,
-    });
-    variants.push(VariantSpec {
-        layer: Layer::Compressed,
-        max_edge: COMPRESSED_EDGE,
-        quality: 88,
-        lossless: false,
-    });
-    if lossless {
-        variants.push(VariantSpec {
-            layer: Layer::Lossless,
-            max_edge: u32::MAX,
-            quality: 100,
-            lossless: true,
-        });
-    }
-    Ok(variants)
+    plan_for(Kind::Image, width, height, lossless)
 }
 
 /// Content-addressed object key. The digest is the source bytes; the variant
@@ -154,16 +216,118 @@ pub fn object_key(source_digest: &str, variant_digest: &str, layer: Layer) -> St
     format!("media/{source_digest}/{}/{variant_digest}", layer.as_str())
 }
 
+/// Plan variants for a classified upload. Images and GIFs become `WebP`, video
+/// becomes `WebM` at every rendition; the original is kept only when asked.
+pub fn plan_for(
+    kind: Kind,
+    width: u32,
+    height: u32,
+    lossless: bool,
+) -> Result<Vec<VariantSpec>, Error> {
+    plan_with_permissions(kind, width, height, lossless, LosslessPermissions::all())
+}
+
+/// Plan variants under an account's lossless permissions. A requested lossless
+/// layer that the account may not use is an error, not a silent downgrade.
+pub fn plan_with_permissions(
+    kind: Kind,
+    width: u32,
+    height: u32,
+    lossless: bool,
+    permissions: LosslessPermissions,
+) -> Result<Vec<VariantSpec>, Error> {
+    if width == 0 || height == 0 {
+        return Err(Error::EmptyDimensions);
+    }
+    if lossless && !permissions.allows(kind) {
+        return Err(Error::LosslessNotAllowed);
+    }
+    let lossless = lossless && permissions.allows(kind);
+    let format = kind.format();
+    let mut variants = Vec::with_capacity(if lossless { 5 } else { 4 });
+    variants.push(VariantSpec {
+        layer: Layer::Preview,
+        format,
+        max_edge: PREVIEW_EDGE,
+        quality: 82,
+        lossless: false,
+        retain: true,
+    });
+    if matches!(kind, Kind::Video) {
+        let mut rendered = false;
+        for (edge, quality) in [(360, 76), (720, 80), (1080, 84), (2160, 86)] {
+            if height >= edge {
+                rendered = true;
+                variants.push(VariantSpec {
+                    layer: Layer::Compressed,
+                    format,
+                    max_edge: edge,
+                    quality,
+                    lossless: false,
+                    retain: true,
+                });
+            }
+        }
+        if !rendered {
+            variants.push(VariantSpec {
+                layer: Layer::Compressed,
+                format,
+                max_edge: height,
+                quality: 80,
+                lossless: false,
+                retain: true,
+            });
+        }
+    } else {
+        variants.push(VariantSpec {
+            layer: Layer::Compressed,
+            format,
+            max_edge: COMPRESSED_EDGE,
+            quality: 88,
+            lossless: false,
+            retain: true,
+        });
+    }
+    if (matches!(kind, Kind::Image | Kind::AnimatedImage) && permissions.allows(kind)) || lossless {
+        variants.push(VariantSpec {
+            layer: Layer::Lossless,
+            format: Format::Original,
+            max_edge: u32::MAX,
+            quality: 100,
+            lossless: true,
+            retain: lossless,
+        });
+    }
+    Ok(variants)
+}
+
+/// When a variant may be pruned. `None` means it lives with the status.
+#[must_use]
+pub fn expires_in(policy: CachePolicy, variant: &VariantSpec) -> Option<Duration> {
+    match variant.layer {
+        Layer::Preview => None,
+        Layer::Compressed => Some(policy.compressed),
+        Layer::Lossless if variant.retain => None,
+        Layer::Lossless => Some(policy.lossless_pending),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_normal_image_has_two_layers() {
+    fn a_normal_image_keeps_a_temporary_lossless_candidate() {
         let variants = plan(2400, 1600, false).expect("plan");
-        assert_eq!(variants.len(), 2);
+        assert_eq!(variants.len(), 3);
         assert_eq!(variants[0].layer, Layer::Preview);
         assert_eq!(variants[1].layer, Layer::Compressed);
+        assert_eq!(variants[2].layer, Layer::Lossless);
+        assert!(!variants[2].retain);
+        assert_eq!(
+            expires_in(CachePolicy::default(), &variants[2]),
+            Some(Duration::from_hours(24))
+        );
     }
 
     #[test]
@@ -172,6 +336,7 @@ mod tests {
         assert_eq!(variants.len(), 3);
         assert_eq!(variants[2].layer, Layer::Lossless);
         assert!(variants[2].lossless);
+        assert!(variants[2].retain);
     }
 
     #[test]
@@ -183,6 +348,72 @@ mod tests {
             .cache_control(Layer::Compressed)
             .contains("s-maxage="));
         assert!(policy.cache_control(Layer::Preview).contains("immutable"));
+    }
+
+    #[test]
+    fn a_gif_becomes_animated_webp() {
+        assert_eq!(Kind::from_content_type("image/gif"), Kind::AnimatedImage);
+        let variants = plan_for(Kind::AnimatedImage, 600, 400, false).expect("plan");
+        assert!(variants
+            .iter()
+            .filter(|variant| variant.layer != Layer::Lossless)
+            .all(|variant| variant.format == Format::Webp));
+    }
+
+    #[test]
+    fn a_video_gets_multiple_webm_renditions() {
+        assert_eq!(Kind::from_content_type("video/mp4"), Kind::Video);
+        let variants = plan_for(Kind::Video, 1920, 1080, false).expect("plan");
+        assert!(variants.len() >= 3);
+        assert!(variants
+            .iter()
+            .all(|variant| variant.format == Format::Webm));
+        assert!(variants.iter().any(|variant| variant.max_edge == 720));
+        assert!(variants.iter().any(|variant| variant.max_edge == 1080));
+    }
+
+    #[test]
+    fn lossless_video_keeps_the_original_after_the_webm_renditions() {
+        let variants = plan_for(Kind::Video, 1920, 1080, true).expect("plan");
+        let last = variants.last().expect("variant");
+        assert_eq!(last.layer, Layer::Lossless);
+        assert!(last.lossless);
+    }
+
+    #[test]
+    fn an_account_without_image_permission_cannot_request_lossless() {
+        assert_eq!(
+            plan_with_permissions(
+                Kind::Image,
+                800,
+                600,
+                true,
+                LosslessPermissions {
+                    images: false,
+                    videos: true
+                }
+            ),
+            Err(Error::LosslessNotAllowed)
+        );
+    }
+
+    #[test]
+    fn video_permission_does_not_grant_image_lossless() {
+        let variants = plan_with_permissions(
+            Kind::Video,
+            1920,
+            1080,
+            true,
+            LosslessPermissions {
+                images: false,
+                videos: true,
+            },
+        )
+        .expect("plan");
+        assert_eq!(
+            variants.last().map(|variant| variant.layer),
+            Some(Layer::Lossless)
+        );
     }
 
     #[test]

@@ -96,7 +96,10 @@ isolation demands it, then workers by queue class.
 ## Media
 
 Media is **not** a single global service. It is a stateless worker pool over shared
-object storage:
+object storage. Images and GIFs are always transcoded to WebP; videos are
+transcoded with GStreamer to multi-resolution WebM. Lossless originals are kept
+only on request (per upload, or an account default split between images and
+videos):
 
 - upload writes a `media_attachment` row and a `media_process` job;
 - any media worker can claim the job, fetch the object, produce variants, write
@@ -121,6 +124,16 @@ A single media service would be a throughput bottleneck and a single point of
 failure for every image on the instance. Co-locating media workers with the
 monolith is fine at small scale; scaling them out is just more replicas. A GPU
 transcode pool is a separate worker class if it is ever needed.
+
+## Logging and abuse alerts
+
+Every request is logged by `tower_http::trace::TraceLayer` with method, path,
+status and latency. Rejections with `401`, `403` or `429` are additionally
+persisted in `admin_alert` and logged at `warn` with the remote address. An
+administrator can list and acknowledge them at
+`GET /api/v1/admin/alerts` and `POST /api/v1/admin/alerts/{id}/ack`; the first
+bootstrap account is an administrator. Alert inserts are best-effort and never
+change the response.
 
 ## Redis: which workers need it
 

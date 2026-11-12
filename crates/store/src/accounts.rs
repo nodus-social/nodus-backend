@@ -36,6 +36,11 @@ pub struct AccountRow {
     pub private_key_pem: Option<String>,
     pub discoverable: bool,
     pub indexable: bool,
+    pub admin: bool,
+    pub lossless_images_default: bool,
+    pub lossless_videos_default: bool,
+    pub lossless_images_allowed: bool,
+    pub lossless_videos_allowed: bool,
     pub followers_count: i64,
     pub following_count: i64,
     pub statuses_count: i64,
@@ -46,13 +51,15 @@ pub struct AccountRow {
 
 const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS username, a.domain::text AS domain, \
      a.display_name, a.note, a.avatar_ref, a.header_ref, a.fields, a.locked, a.bot, a.local, a.uri, \
-     a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, \
-     a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.created_at";
+     a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, \
+     a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
+     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.created_at";
 
 const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
      display_name, note, avatar_ref, header_ref, fields, locked, bot, local, uri, \
-     inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, \
-     followers_count, following_count, statuses_count, last_status_at, suspended_at, created_at";
+     inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, \
+     lossless_images_default, lossless_videos_default, lossless_images_allowed, \
+     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, created_at";
 
 /// A token verified against an account.
 #[derive(Debug, Clone, FromRow)]
@@ -201,4 +208,52 @@ pub async fn update_discovery(
         .bind(indexable)
         .fetch_one(pool)
         .await
+}
+
+/// Update the account's default lossless preference per media kind.
+pub async fn set_media_preferences(
+    pool: &PgPool,
+    id: &str,
+    lossless_images: bool,
+    lossless_videos: bool,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET lossless_images_default = $2, lossless_videos_default = $3 \
+         WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(lossless_images)
+        .bind(lossless_videos)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Grant or revoke administrator access.
+pub async fn set_admin(pool: &PgPool, id: &str, admin: bool) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("UPDATE account SET admin = $2 WHERE id = $1")
+        .bind(id)
+        .bind(admin)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Limit or grant lossless uploads per media kind.
+pub async fn set_lossless_permissions(
+    pool: &PgPool,
+    id: &str,
+    images: bool,
+    videos: bool,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE account SET lossless_images_allowed = $2, lossless_videos_allowed = $3 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(images)
+    .bind(videos)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
 }

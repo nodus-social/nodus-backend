@@ -88,12 +88,32 @@ Variants are stored in `media_variant` as three layers:
 
 | layer | purpose | lifetime |
 |---|---|---|
-| `preview` | compressed preview for timelines/feed, max 1280px | semi-permanent, pruned with the status |
-| `compressed` | compressed full-size web copy, max 4096px | 24-72 hours, recreated on demand |
-| `lossless` | original bytes for art marked by the author | semi-permanent, opt-in only |
+| `preview` | WebP preview for timelines/feed, max 1280px | semi-permanent, pruned with the status |
+| `compressed` | WebP image / multi-resolution WebM video, max 4096px | 24-72 hours, recreated on demand |
+| `lossless` | untouched upload for art marked by the author | semi-permanent, opt-in only |
 
-The original bytes are never the default remote cache. This bounds federation
-growth: a remote post that nobody opens keeps only its preview variant.
+Every image and GIF is re-encoded to WebP; every video is decoded with GStreamer
+and rendered as multi-resolution WebM. The original bytes are never the default
+remote cache. This bounds federation growth: a remote post that nobody opens
+keeps only its preview variant.
+
+Lossless originals are a per-upload opt-in. Accounts can also default the opt-in
+separately for images and videos with `lossless_images_default` and
+`lossless_videos_default`, so memes stay compressed unless the author asks for
+the archive copy.
+
+Administrators can restrict lossless uploads per account and per kind with
+`lossless_images_allowed` and `lossless_videos_allowed`; a denied request for a
+lossless layer is rejected rather than silently downgraded. `POST
+/api/v1/admin/accounts/{id}/lossless` sets both flags.
+
+Processing starts on upload, not on post. A `media_attachment` carries
+`processing_state` (`pending|processing|ready|failed`), `processing_progress`
+and `processing_error`, so the composer can show a progress wheel and the final
+variant sizes before the status exists. The untouched original is kept for 24
+hours after upload; if the author has not opted into lossless by then, the
+`prune` worker deletes it. Marking the post lossless flips the variant to
+retained.
 
 ## Migrations
 

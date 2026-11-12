@@ -5,7 +5,9 @@
 //! One router, one error type, one state. Mounting is the caller's job: the server
 //! binary nests this under `/api` so the SSR frontend owns everything else.
 
+pub mod abuse;
 pub mod activitypub;
+pub mod admin;
 pub mod auth;
 pub mod dto;
 pub mod error;
@@ -42,6 +44,11 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(misskey::router())
         .merge(miauth::router())
         .merge(nodus::router())
+        .merge(admin::router())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            abuse::record,
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
