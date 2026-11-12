@@ -10,8 +10,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
-use nodus_server_core::{PageParams, PageSize};
 use nodus_server_core::id::Id;
+use nodus_server_core::{PageParams, PageSize};
 
 use crate::auth::Auth;
 use crate::dto::{
@@ -37,9 +37,10 @@ impl PageQuery {
         let parse = |raw: &Option<String>, field: &str| -> ApiResult<Option<Id>> {
             match raw {
                 None => Ok(None),
-                Some(value) => value.parse::<Id>().map(Some).map_err(|_| {
-                    ApiError::unprocessable(format!("{field} must be a valid id"))
-                }),
+                Some(value) => value
+                    .parse::<Id>()
+                    .map(Some)
+                    .map_err(|_| ApiError::unprocessable(format!("{field} must be a valid id"))),
             }
         };
         let params = PageParams::new()
@@ -116,7 +117,14 @@ pub async fn public_timeline(
         query.local.unwrap_or(true),
     )
     .await?;
-    timeline_response(&state, page.items, page.next_max_id, params, "/api/v1/timelines/public")
+    timeline_response(
+        &state,
+        page.items,
+        page.next_max_id,
+        params,
+        "/api/v1/timelines/public",
+    )
+    .await
 }
 
 /// `GET /api/v1/timelines/home`
@@ -127,13 +135,17 @@ pub async fn home_timeline(
 ) -> ApiResult<Response> {
     auth.require_scope("read")?;
     let params = query.params()?;
-    let page = nodus_server_store::statuses::home_page(
-        state.store().pool(),
-        &auth.0.account.id,
+    let page =
+        nodus_server_store::statuses::home_page(state.store().pool(), &auth.0.account.id, params)
+            .await?;
+    timeline_response(
+        &state,
+        page.items,
+        page.next_max_id,
         params,
+        "/api/v1/timelines/home",
     )
-    .await?;
-    timeline_response(&state, page.items, page.next_max_id, params, "/api/v1/timelines/home")
+    .await
 }
 
 /// `GET /api/v1/accounts/verify_credentials`
@@ -142,7 +154,10 @@ pub async fn verify_credentials(
     auth: Auth,
 ) -> ApiResult<Json<AccountDto>> {
     auth.require_scope("read")?;
-    Ok(Json(AccountDto::from_row(&auth.0.account, state.instance())))
+    Ok(Json(AccountDto::from_row(
+        &auth.0.account,
+        state.instance(),
+    )))
 }
 
 /// `GET /healthz` — the process answers. Deliberately does not touch the database:
@@ -161,7 +176,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 }
 
 /// Serialises a page and adds the `Link` header clients use to continue.
-fn timeline_response(
+async fn timeline_response(
     state: &AppState,
     rows: Vec<nodus_server_store::statuses::StatusRow>,
     next_max_id: Option<String>,
@@ -173,10 +188,10 @@ fn timeline_response(
     // will replace this once the profile fields the DTO needs are settled.
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let account = match nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id).await? {
-            Some(account) => account,
-            // A status whose author is gone is not renderable: skip rather than 500.
-            None => continue,
+        let Some(account) =
+            nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id).await?
+        else {
+            continue;
         };
         items.push(StatusDto::from_row(&row, &account, instance));
     }

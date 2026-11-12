@@ -51,8 +51,14 @@ impl AccountDto {
             Some(domain) => format!("{}@{domain}", row.username),
             None => row.username.clone(),
         };
-        let avatar = instance.url(&format!("/media/{}", row.avatar_ref.as_deref().unwrap_or("default-avatar.png")));
-        let header = instance.url(&format!("/media/{}", row.header_ref.as_deref().unwrap_or("default-header.png")));
+        let avatar = instance.url(&format!(
+            "/media/{}",
+            row.avatar_ref.as_deref().unwrap_or("default-avatar.png")
+        ));
+        let header = instance.url(&format!(
+            "/media/{}",
+            row.header_ref.as_deref().unwrap_or("default-header.png")
+        ));
         Self {
             id: row.id.clone(),
             username: row.username.clone(),
@@ -60,7 +66,7 @@ impl AccountDto {
             display_name: row.display_name.clone(),
             locked: row.locked,
             bot: row.bot,
-            discoverable: true,
+            discoverable: row.discoverable,
             group: false,
             created_at: row.created_at,
             note: row.note.clone(),
@@ -72,8 +78,10 @@ impl AccountDto {
             followers_count: row.followers_count,
             following_count: row.following_count,
             statuses_count: row.statuses_count,
-            last_status_at: row.last_status_at.map(|at| at.format("%Y-%m-%d").to_string()),
-            noindex: false,
+            last_status_at: row
+                .last_status_at
+                .map(|at| at.format("%Y-%m-%d").to_string()),
+            noindex: !row.indexable,
             emojis: Vec::new(),
             fields: row.fields.as_array().cloned().unwrap_or_default(),
             moved: None,
@@ -149,7 +157,10 @@ impl StatusDto {
             tags: Vec::new(),
             card: None,
             poll: None,
-            application: Some(ApplicationDto { name: "Nodus".to_owned(), website: None }),
+            application: Some(ApplicationDto {
+                name: "Nodus".to_owned(),
+                website: None,
+            }),
             favourited: false,
             reblogged: false,
             muted: false,

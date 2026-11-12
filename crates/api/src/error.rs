@@ -19,7 +19,10 @@ pub struct ApiError {
 impl ApiError {
     #[must_use]
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self {
+            status,
+            message: message.into(),
+        }
     }
 
     /// `401` — no token, or a token that no longer resolves.
@@ -63,7 +66,10 @@ impl IntoResponse for ApiError {
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
         tracing::error!(error = %error, "database error");
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong on our side")
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong on our side",
+        )
     }
 }
 
@@ -80,6 +86,9 @@ mod tests {
         let response = ApiError::not_found("Record not found").into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = to_bytes(response.into_body(), 1024).await.expect("body");
-        assert_eq!(String::from_utf8_lossy(&body), r#"{"error":"Record not found"}"#);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            r#"{"error":"Record not found"}"#
+        );
     }
 }

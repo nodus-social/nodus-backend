@@ -189,7 +189,11 @@ mod tests {
     fn the_next_link_is_absolute_path_plus_max_id() {
         let next = Id::new();
         let link = PageParams::new()
-            .next_link("/api/v1/timelines/home", Some(next), PageSize::default_max(None))
+            .next_link(
+                "/api/v1/timelines/home",
+                Some(next),
+                PageSize::default_max(None),
+            )
             .expect("a page with a next id");
         assert_eq!(
             link,
@@ -205,8 +209,14 @@ mod tests {
     #[test]
     fn an_upper_bound_is_reported_as_such() {
         let id = Id::new();
-        assert_eq!(PageParams::new().with_max_id(Some(id)).bound(), Some((id, true)));
-        assert_eq!(PageParams::new().with_min_id(Some(id)).bound(), Some((id, false)));
+        assert_eq!(
+            PageParams::new().with_max_id(Some(id)).bound(),
+            Some((id, true))
+        );
+        assert_eq!(
+            PageParams::new().with_min_id(Some(id)).bound(),
+            Some((id, false))
+        );
         assert_eq!(PageParams::new().bound(), None);
     }
 }

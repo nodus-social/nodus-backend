@@ -1,12 +1,15 @@
+#![allow(clippy::doc_markdown, clippy::struct_excessive_bools)]
+
 //! The Mastodon-compatible client API.
 //!
 //! One router, one error type, one state. Mounting is the caller's job: the server
 //! binary nests this under `/api` so the SSR frontend owns everything else.
 
+pub mod activitypub;
 pub mod auth;
 pub mod dto;
 pub mod error;
-pub mod routes;
+pub mod mastodon;
 pub mod state;
 
 pub use state::{AppState, InstanceConfig};
@@ -17,18 +20,24 @@ use axum::routing::get;
 /// surface.
 pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
-        .route("/healthz", get(routes::healthz))
-        .route("/readyz", get(routes::readyz))
-        .route("/api/v1/instance", get(routes::instance_v1))
-        .route("/api/v2/instance", get(routes::instance_v2))
-        .route("/api/v1/timelines/public", get(routes::public_timeline))
-        .route("/api/v1/timelines/home", get(routes::home_timeline))
+        .route("/healthz", get(mastodon::healthz))
+        .route("/readyz", get(mastodon::readyz))
+        .route("/api/v1/instance", get(mastodon::instance_v1))
+        .route("/api/v2/instance", get(mastodon::instance_v2))
+        .route("/api/v1/timelines/public", get(mastodon::public_timeline))
+        .route("/api/v1/timelines/home", get(mastodon::home_timeline))
         .route(
             "/api/v1/accounts/verify_credentials",
-            get(routes::verify_credentials),
+            get(mastodon::verify_credentials),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// The complete server surface: client API plus the ActivityPub documents a peer
+/// resolves from the domain root.
+pub fn root_router(state: AppState) -> axum::Router {
+    router(state.clone()).merge(activitypub::router(state))
 }
 
 #[cfg(test)]
@@ -62,11 +71,21 @@ mod tests {
 
     async fn get_json(path: &str) -> (StatusCode, String) {
         let response = router(state())
-            .oneshot(Request::builder().uri(path).body(Body::empty()).expect("request"))
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response");
         let status = response.status();
-        let body = response.into_body().collect().await.expect("body").to_bytes();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
     }
 
@@ -84,7 +103,10 @@ mod tests {
     async fn a_home_timeline_without_a_token_is_401_not_an_html_page() {
         let (status, body) = get_json("/api/v1/timelines/home").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(body.contains("The access token is invalid"), "body was {body}");
+        assert!(
+            body.contains("The access token is invalid"),
+            "body was {body}"
+        );
     }
 
     #[tokio::test]

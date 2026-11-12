@@ -1,3 +1,5 @@
+#![allow(clippy::doc_markdown)]
+
 //! ActivityPub signature verification.
 //!
 //! This module is deliberately small and total: it parses a `Signature` header, rebuilds
@@ -67,7 +69,11 @@ pub fn parse_header(raw: &str) -> Result<SignatureParams, VerifyError> {
             "algorithm" => algorithm = Some(value.to_owned()),
             "headers" => headers = Some(value.split_whitespace().map(str::to_owned).collect()),
             "signature" => {
-                signature = Some(BASE64.decode(value).map_err(|_| VerifyError::Malformed("bad signature"))?);
+                signature = Some(
+                    BASE64
+                        .decode(value)
+                        .map_err(|_| VerifyError::Malformed("bad signature"))?,
+                );
             }
             // Unknown parameters are ignored: the spec requires forward compatibility and
             // instance software in the wild adds fields.
@@ -124,7 +130,9 @@ pub fn verify_digest(body: &[u8], header: &str) -> Result<(), VerifyError> {
     if !alg.eq_ignore_ascii_case("sha-256") {
         return Err(VerifyError::UnsupportedAlgorithm(alg.to_owned()));
     }
-    let expected = BASE64.decode(encoded.trim()).map_err(|_| VerifyError::Malformed("bad digest"))?;
+    let expected = BASE64
+        .decode(encoded.trim())
+        .map_err(|_| VerifyError::Malformed("bad digest"))?;
     let actual = Sha256::digest(body);
     if expected.len() != actual.len() || !constant_time_eq(&expected, &actual) {
         return Err(VerifyError::DigestMismatch);
@@ -224,11 +232,16 @@ mod tests {
 
     #[test]
     fn parses_a_header_and_defaults_the_signed_list() {
-        let parsed = parse_header("keyId=\"https://a/b#main-key\",algorithm=\"rsa-sha256\",signature=\"AAAA\"")
-            .expect("header");
+        let parsed = parse_header(
+            "keyId=\"https://a/b#main-key\",algorithm=\"rsa-sha256\",signature=\"AAAA\"",
+        )
+        .expect("header");
         assert_eq!(parsed.key_id, "https://a/b#main-key");
         assert_eq!(parsed.algorithm, "rsa-sha256");
-        assert_eq!(parsed.headers, vec!["(request-target)", "host", "date", "digest"]);
+        assert_eq!(
+            parsed.headers,
+            vec!["(request-target)", "host", "date", "digest"]
+        );
         assert_eq!(parsed.signature, vec![0, 0, 0]);
     }
 
@@ -240,10 +253,9 @@ mod tests {
 
     #[test]
     fn the_signing_string_is_lowercased_method_and_space_separated() {
-        let params = parse_header(
-            "keyId=\"k\",headers=\"(request-target) host date\",signature=\"AAAA\"",
-        )
-        .expect("header");
+        let params =
+            parse_header("keyId=\"k\",headers=\"(request-target) host date\",signature=\"AAAA\"")
+                .expect("header");
         let signing = signing_string(&params, "POST", "/users/x/inbox", |name| match name {
             "host" => Some("example.test".to_owned()),
             "date" => Some("Sun, 06 Nov 1994 08:49:37 GMT".to_owned()),
@@ -287,7 +299,7 @@ mod tests {
             ],
             signature: Vec::new(),
         };
-        let headers = vec![
+        let headers = [
             ("host".to_owned(), "us.test".to_owned()),
             ("date".to_owned(), date.to_owned()),
             ("digest".to_owned(), digest.clone()),
@@ -304,13 +316,15 @@ mod tests {
             "keyId=\"https://a/b#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"{}\"",
             BASE64.encode(signed.to_bytes())
         );
-        let request_headers = vec![
+        let request_headers = [
             ("host".to_owned(), "us.test".to_owned()),
             ("date".to_owned(), date.to_owned()),
             ("digest".to_owned(), digest),
             ("signature".to_owned(), header),
         ];
-        let now = DateTime::parse_from_rfc2822(date).expect("date").with_timezone(&Utc);
+        let now = DateTime::parse_from_rfc2822(date)
+            .expect("date")
+            .with_timezone(&Utc);
 
         let request = SignedRequest {
             method: "POST",
@@ -322,14 +336,20 @@ mod tests {
         };
         assert!(verify(&request).is_ok());
 
-        let tampered = SignedRequest { body: br#"{"type":"Unfollow"}"#, ..request };
-        assert!(matches!(verify(&tampered), Err(VerifyError::DigestMismatch)));
+        let tampered = SignedRequest {
+            body: br#"{"type":"Unfollow"}"#,
+            ..request
+        };
+        assert!(matches!(
+            verify(&tampered),
+            Err(VerifyError::DigestMismatch)
+        ));
     }
 
     #[test]
     fn a_signature_older_than_the_window_is_refused() {
         let (_private, pem) = key_pair();
-        let headers = vec![
+        let headers = [
             ("host".to_owned(), "us.test".to_owned()),
             ("date".to_owned(), "Sun, 06 Nov 1994 08:49:37 GMT".to_owned()),
             (

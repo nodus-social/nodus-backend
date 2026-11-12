@@ -16,6 +16,7 @@ use nodus_server_core::Id;
 /// The cast is not cosmetic: sqlx has no codec for `citext`, and a `String` column
 /// read through a `citext` OID fails at runtime rather than at compile time.
 #[derive(Debug, Clone, FromRow)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct AccountRow {
     pub id: String,
     pub username: String,
@@ -29,6 +30,12 @@ pub struct AccountRow {
     pub bot: bool,
     pub local: bool,
     pub uri: Option<String>,
+    pub inbox_url: Option<String>,
+    pub shared_inbox_url: Option<String>,
+    pub public_key_pem: Option<String>,
+    pub private_key_pem: Option<String>,
+    pub discoverable: bool,
+    pub indexable: bool,
     pub followers_count: i64,
     pub following_count: i64,
     pub statuses_count: i64,
@@ -39,6 +46,7 @@ pub struct AccountRow {
 
 const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
      display_name, note, avatar_ref, header_ref, fields, locked, bot, local, uri, \
+     inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, \
      followers_count, following_count, statuses_count, last_status_at, suspended_at, created_at";
 
 /// A token verified against an account.
@@ -59,7 +67,9 @@ impl Authenticated {
             granted == scope
                 || granted == "read write follow push"
                 || (scope.starts_with(granted.as_str())
-                    && scope.get(granted.len()..).is_some_and(|rest| rest.starts_with(':')))
+                    && scope
+                        .get(granted.len()..)
+                        .is_some_and(|rest| rest.starts_with(':')))
         })
     }
 }
@@ -91,7 +101,10 @@ pub async fn verify_token(
 /// One account by id, local or remote.
 pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<AccountRow>, sqlx::Error> {
     let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM account WHERE id = $1");
-    sqlx::query_as::<_, AccountRow>(&sql).bind(id).fetch_optional(pool).await
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// A local account by username (`@alice`, without the domain).
@@ -99,9 +112,8 @@ pub async fn local_by_username(
     pool: &PgPool,
     username: &str,
 ) -> Result<Option<AccountRow>, sqlx::Error> {
-    let sql = format!(
-        "SELECT {ACCOUNT_COLUMNS} FROM account WHERE domain IS NULL AND username = $1"
-    );
+    let sql =
+        format!("SELECT {ACCOUNT_COLUMNS} FROM account WHERE domain IS NULL AND username = $1");
     sqlx::query_as::<_, AccountRow>(&sql)
         .bind(username)
         .fetch_optional(pool)
@@ -132,6 +144,56 @@ pub async fn insert(pool: &PgPool, new: &NewAccount<'_>) -> Result<AccountRow, s
         .bind(new.note)
         .bind(new.bot)
         .bind(new.locked)
+        .fetch_one(pool)
+        .await
+}
+
+/// Writes the actor identity a local account needs to be resolvable by a peer.
+///
+/// The URI is written once. Changing it after a remote server has cached the actor
+/// would break every existing follow, so a later call leaves an existing URI alone.
+pub async fn set_actor_identity(
+    pool: &PgPool,
+    id: &str,
+    uri: &str,
+    public_key_pem: &str,
+    private_key_pem: &str,
+    inbox_url: &str,
+    shared_inbox_url: Option<&str>,
+) -> Result<AccountRow, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET uri = COALESCE(uri, $2), public_key_pem = $3, \
+             private_key_pem = $4, inbox_url = COALESCE(inbox_url, $5), \
+             shared_inbox_url = COALESCE(shared_inbox_url, $6), updated_at = now() \
+         WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(uri)
+        .bind(public_key_pem)
+        .bind(private_key_pem)
+        .bind(inbox_url)
+        .bind(shared_inbox_url)
+        .fetch_one(pool)
+        .await
+}
+
+/// Updates the two discovery switches Mastodon's account settings expose: whether the
+/// profile may be recommended, and whether search engines may index it.
+pub async fn update_discovery(
+    pool: &PgPool,
+    id: &str,
+    discoverable: bool,
+    indexable: bool,
+) -> Result<AccountRow, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET discoverable = $2, indexable = $3, updated_at = now() \
+         WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(discoverable)
+        .bind(indexable)
         .fetch_one(pool)
         .await
 }

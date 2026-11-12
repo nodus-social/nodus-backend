@@ -25,7 +25,9 @@ impl Auth {
         if self.0.allows(scope) {
             Ok(())
         } else {
-            Err(ApiError::forbidden(format!("This action requires the {scope} scope")))
+            Err(ApiError::forbidden(format!(
+                "This action requires the {scope} scope"
+            )))
         }
     }
 }

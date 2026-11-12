@@ -128,11 +128,13 @@ pub async fn claim(
 
 /// Marks a job done.
 pub async fn succeed(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE job SET finished_at = now(), locked_by = NULL, locked_until = NULL WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await
-        .map(drop)
+    sqlx::query(
+        "UPDATE job SET finished_at = now(), locked_by = NULL, locked_until = NULL WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map(drop)
 }
 
 /// Releases a job for a later attempt, keeping the error for the operator.
@@ -191,7 +193,7 @@ pub async fn next_ready_at(pool: &PgPool) -> Result<Option<DateTime<Utc>>, sqlx:
         "SELECT min(earliest_at) FROM job \
           WHERE finished_at IS NULL AND (locked_until IS NULL OR locked_until < now())",
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
     Ok(row.and_then(|(at,)| at))
 }

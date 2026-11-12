@@ -50,10 +50,12 @@ pub struct StatusPage {
 
 /// One status by id, tombstoned rows excluded.
 pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<StatusRow>, sqlx::Error> {
-    let sql = format!(
-        "SELECT {STATUS_COLUMNS} FROM status s WHERE s.id = $1 AND s.deleted_at IS NULL"
-    );
-    sqlx::query_as::<_, StatusRow>(&sql).bind(id).fetch_optional(pool).await
+    let sql =
+        format!("SELECT {STATUS_COLUMNS} FROM status s WHERE s.id = $1 AND s.deleted_at IS NULL");
+    sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 /// `/api/v1/timelines/public`: public visibility only.
@@ -76,6 +78,33 @@ pub async fn public_page(
     let rows = sqlx::query_as::<_, StatusRow>(&sql)
         .bind(params.max_id.map(|id| id.to_string()))
         .bind(local_only)
+        .bind(size.as_i64() + 1)
+        .fetch_all(pool)
+        .await?;
+    Ok(finish(rows, size))
+}
+
+/// `GET /users/{username}/outbox`: local, publicly addressable statuses by one author.
+///
+/// Direct and followers-only posts are absent, not merely filtered by the caller. An
+/// outbox is a protocol surface a stranger can read, so the visibility predicate is in
+/// the query that every other outbox reader uses.
+pub async fn account_page(
+    pool: &PgPool,
+    account_id: &str,
+    params: PageParams,
+) -> Result<StatusPage, sqlx::Error> {
+    let size = PageSize::default_max(params.limit);
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM status s \
+         WHERE s.account_id = $1 AND s.deleted_at IS NULL \
+           AND s.visibility IN ('public', 'unlisted') \
+           AND ($2::text IS NULL OR s.id < $2) \
+         ORDER BY s.id DESC LIMIT $3"
+    );
+    let rows = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(account_id)
+        .bind(params.max_id.map(|id| id.to_string()))
         .bind(size.as_i64() + 1)
         .fetch_all(pool)
         .await?;
@@ -174,5 +203,8 @@ fn finish(mut rows: Vec<StatusRow>, size: PageSize) -> StatusPage {
     } else {
         None
     };
-    StatusPage { items: rows, next_max_id }
+    StatusPage {
+        items: rows,
+        next_max_id,
+    }
 }

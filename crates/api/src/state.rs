@@ -52,7 +52,9 @@ pub struct AppState {
 impl AppState {
     #[must_use]
     pub fn new(store: Store, instance: InstanceConfig) -> Self {
-        Self { inner: Arc::new(Inner { store, instance }) }
+        Self {
+            inner: Arc::new(Inner { store, instance }),
+        }
     }
 
     #[must_use]

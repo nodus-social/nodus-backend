@@ -1,3 +1,5 @@
+#![allow(clippy::doc_markdown)]
+
 //! Ids, visibility and the arithmetic that pagination depends on.
 //!
 //! Nothing here performs I/O and nothing here is async, so every rule that decides

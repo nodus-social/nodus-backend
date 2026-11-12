@@ -35,13 +35,16 @@ impl Id {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let generator = guard.get_or_insert_with(ulid::Generator::new);
-        generator.generate().map_or_else(|_| Ulid::new(), Ulid::from).into()
+        generator
+            .generate()
+            .map_or_else(|_| Ulid::new(), Ulid::from)
+            .into()
     }
 
     /// The raw 128 bits, for a database that stores ids as `bytea` or `uuid`.
     #[must_use]
     pub fn as_u128(self) -> u128 {
-        self.0.0
+        self.0 .0
     }
 
     /// Milliseconds since the Unix epoch encoded in the id. Used by tests and by
@@ -101,7 +104,9 @@ mod tests {
         let id = Id::new();
         let rendered = id.to_string();
         assert_eq!(rendered.len(), 26);
-        assert!(rendered.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(rendered
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         assert_eq!(Id::from_str(&rendered).expect("round trip"), id);
     }
 

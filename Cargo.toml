@@ -15,10 +15,15 @@ nodus-server-store = { path = "crates/store" }
 nodus-server-api = { path = "crates/api" }
 nodus-server-federation = { path = "crates/federation" }
 nodus-server-worker = { path = "crates/worker" }
+nodus-server-sdk = { path = "../server-sdk/crates/server", features = ["activitypub"] }
 
 axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+argon2 = "0.5"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+leptos = { version = "0.8.23", features = ["ssr"] }
+rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rsa = { version = "0.9", features = ["sha2", "pem"] }
@@ -33,12 +38,14 @@ sqlx = { version = "0.8", default-features = false, features = [
   "macros",
 ] }
 thiserror = "2"
+time = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "request-id", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ulid = { version = "1", features = ["serde"] }
+url = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

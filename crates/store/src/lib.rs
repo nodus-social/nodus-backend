@@ -66,12 +66,13 @@ impl Store {
             return false;
         }
         let applied: Result<i64, _> =
-            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success").fetch_one(&self.pool).await;
-        let pending: Result<i64, _> = sqlx::query_scalar(
-            "SELECT count(*) FROM _sqlx_migrations WHERE NOT success",
-        )
-        .fetch_one(&self.pool)
-        .await;
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success")
+                .fetch_one(&self.pool)
+                .await;
+        let pending: Result<i64, _> =
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE NOT success")
+                .fetch_one(&self.pool)
+                .await;
         matches!((applied, pending), (Ok(a), Ok(p)) if a > 0 && p == 0)
     }
 }
