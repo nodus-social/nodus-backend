@@ -1,0 +1,26 @@
+[package]
+name = "nodus-server"
+description = "Nodus server binary: monolith runtime for the client API, auth and ActivityPub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+nodus-auth = { path = "../auth" }
+nodus-server-api = { workspace = true }
+nodus-server-core = { workspace = true }
+nodus-server-store = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { workspace = true }
+
+[lints]
+workspace = true

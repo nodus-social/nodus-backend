@@ -27,6 +27,16 @@ use crate::store::{AuthStore, PgAuthStore, SessionAccount};
 pub mod domain;
 pub mod store;
 
+/// Hashes a bootstrap password with Argon2id's default parameters.
+pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+    use argon2::password_hash::{PasswordHasher, SaltString};
+
+    let salt = SaltString::encode_b64(&rand::random::<[u8; 16]>())?;
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)?
+        .to_string())
+}
+
 pub const SESSION_COOKIE: &str = "nodus_auth";
 const SESSION_DAYS: i64 = 30;
 const CODE_MINUTES: i64 = 5;

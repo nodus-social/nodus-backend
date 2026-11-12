@@ -114,6 +114,34 @@ impl PgAuthStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// Attaches a password credential to an existing local account.
+    pub async fn create_credential(
+        &self,
+        account_id: &str,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO account_credential (account_id, email, password_hash) VALUES ($1, $2, $3)",
+        )
+        .bind(account_id)
+        .bind(email)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether an email already has a login.
+    pub async fn has_credential(&self, email: &str) -> Result<bool, Error> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM account_credential WHERE email = $1)")
+                .bind(email)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(exists)
+    }
 }
 
 impl AuthStore for PgAuthStore {

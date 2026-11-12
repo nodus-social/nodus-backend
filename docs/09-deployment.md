@@ -193,6 +193,37 @@ object storage (local filesystem or S3)
 For a single-user or small instance this is the recommended shape. No Kubernetes,
 no service mesh, no gRPC.
 
+## Running the current binary
+
+The repository now has a working monolith binary in `crates/server`:
+
+```text
+NODUS_DATABASE_URL=postgres://nodus:nodus@localhost/nodus \
+NODUS_DOMAIN=social.example \
+NODUS_BASE_URL=https://social.example \
+NODUS_BIND=0.0.0.0:3000 \
+cargo run -p nodus-server
+```
+
+It runs migrations on startup, then serves the ActivityPub documents, the
+Mastodon-compatible client API and the auth/OAuth routes from one listener.
+`--migrate-only` applies migrations and exits.
+
+Set these three variables once to create the first local login:
+
+```text
+NODUS_BOOTSTRAP_EMAIL=admin@social.example
+NODUS_BOOTSTRAP_USERNAME=admin
+NODUS_BOOTSTRAP_PASSWORD=change-me
+```
+
+Bootstrap is idempotent: it creates the local account and credential only when
+they do not exist. It does not reset an existing password. For an HTTP-only local
+test set `NODUS_AUTH_SECURE_COOKIES=false`.
+
+The `--roles` flag and split topology below are the target design; the current
+binary starts the monolith surface only.
+
 ## Kubernetes shape
 
 When the monolith is no longer enough:
