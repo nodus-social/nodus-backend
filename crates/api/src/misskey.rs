@@ -31,7 +31,11 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/meta", post(meta))
         .route("/api/i", post(me))
+        .route("/api/users/show", post(show_user))
         .route("/api/notes/show", post(show_note))
+        .route("/api/notes/local-timeline", post(local_timeline))
+        .route("/api/notes/global-timeline", post(global_timeline))
+        .route("/api/notes/timeline", post(home_timeline))
         .route("/api/notes/create", post(create_note))
         .route("/api/notes/reactions/create", post(create_reaction))
         .route("/api/notes/reactions/delete", post(delete_reaction))
@@ -121,6 +125,16 @@ async fn note_for(state: &AppState, row: &StatusRow, account: &AccountRow) -> Ap
         })
         .collect();
     let reaction_count = reaction_map.values().sum();
+    let renote = match &row.reblog_of_id {
+        Some(renote) => match statuses::by_id(state.store().pool(), renote).await? {
+            Some(inner) => match accounts::by_id(state.store().pool(), &inner.account_id).await? {
+                Some(author) => Some(Box::new(Box::pin(note_for(state, &inner, &author)).await?)),
+                None => None,
+            },
+            None => None,
+        },
+        None => None,
+    };
     let renote_id = match &row.reblog_of_id {
         Some(reblog) => match statuses::by_id(state.store().pool(), reblog).await? {
             Some(inner) => Some(dialect_id(state, "status", &inner.id, inner.created_at).await?),
@@ -149,7 +163,7 @@ async fn note_for(state: &AppState, row: &StatusRow, account: &AccountRow) -> Ap
         reactions: reaction_map,
         reaction_count,
         renote_id,
-        renote: None,
+        renote,
         reply_id,
         reply: None,
         uri: row.uri.clone(),
@@ -211,6 +225,135 @@ async fn me(State(state): State<AppState>, Json(body): Json<TokenBody>) -> ApiRe
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UserBody {
+    #[serde(default)]
+    i: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+}
+
+async fn show_user(
+    State(state): State<AppState>,
+    Json(body): Json<UserBody>,
+) -> ApiResult<Json<User>> {
+    let _auth = authenticate(&state, body.i.as_deref()).await?;
+    if let Some(host) = body.host.as_deref().filter(|host| !host.is_empty()) {
+        if host != state.instance().domain {
+            return Err(ApiError::not_found(
+                "Remote users are not served by this endpoint",
+            ));
+        }
+    }
+    let account = match (body.user_id.as_deref(), body.username.as_deref()) {
+        (Some(user_id), _) => {
+            let local = external_ids::resolve(state.store().pool(), "account", user_id)
+                .await?
+                .unwrap_or_else(|| user_id.to_owned());
+            accounts::by_id(state.store().pool(), &local).await?
+        }
+        (None, Some(username)) => {
+            accounts::local_by_username(state.store().pool(), username).await?
+        }
+        (None, None) => return Err(ApiError::unprocessable("userId or username is required")),
+    }
+    .ok_or_else(|| ApiError::not_found("No such user"))?;
+    Ok(Json(user_for(&state, &account).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TimelineBody {
+    #[serde(default)]
+    i: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    until_id: Option<String>,
+    #[serde(default)]
+    since_id: Option<String>,
+}
+
+async fn local_timeline(
+    State(state): State<AppState>,
+    Json(body): Json<TimelineBody>,
+) -> ApiResult<Json<Vec<Note>>> {
+    timeline(&state, &body, Timeline::Local).await
+}
+
+async fn global_timeline(
+    State(state): State<AppState>,
+    Json(body): Json<TimelineBody>,
+) -> ApiResult<Json<Vec<Note>>> {
+    timeline(&state, &body, Timeline::Global).await
+}
+
+async fn home_timeline(
+    State(state): State<AppState>,
+    Json(body): Json<TimelineBody>,
+) -> ApiResult<Json<Vec<Note>>> {
+    timeline(&state, &body, Timeline::Home).await
+}
+
+#[derive(Clone, Copy)]
+enum Timeline {
+    Local,
+    Global,
+    Home,
+}
+
+async fn timeline(
+    state: &AppState,
+    body: &TimelineBody,
+    timeline: Timeline,
+) -> ApiResult<Json<Vec<Note>>> {
+    let mut params = nodus_server_core::pagination::PageParams::new();
+    if let Some(limit) = body.limit {
+        params.limit = Some(limit);
+    }
+    if let Some(until) = body.until_id.as_deref() {
+        let local = external_ids::resolve(state.store().pool(), "status", until)
+            .await?
+            .ok_or_else(|| ApiError::unprocessable("untilId is not a known note"))?;
+        params.max_id = Some(
+            local
+                .parse::<Id>()
+                .map_err(|_| ApiError::unprocessable("untilId is not a known note"))?,
+        );
+    }
+    if let Some(since) = body.since_id.as_deref() {
+        let local = external_ids::resolve(state.store().pool(), "status", since)
+            .await?
+            .ok_or_else(|| ApiError::unprocessable("sinceId is not a known note"))?;
+        params.since_id = Some(
+            local
+                .parse::<Id>()
+                .map_err(|_| ApiError::unprocessable("sinceId is not a known note"))?,
+        );
+    }
+    let page = match timeline {
+        Timeline::Local => statuses::public_page(state.store().pool(), params, true).await?,
+        Timeline::Global => statuses::public_page(state.store().pool(), params, false).await?,
+        Timeline::Home => {
+            let auth = authenticate(state, body.i.as_deref()).await?;
+            statuses::home_page(state.store().pool(), &auth.account.id, params).await?
+        }
+    };
+    let mut notes = Vec::with_capacity(page.items.len());
+    for row in &page.items {
+        let Some(account) = accounts::by_id(state.store().pool(), &row.account_id).await? else {
+            continue;
+        };
+        notes.push(note_for(state, row, &account).await?);
+    }
+    Ok(Json(notes))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NoteBody {
     #[serde(default)]
     i: Option<String>,
@@ -258,13 +401,20 @@ async fn create_note(
     Json(body): Json<CreateNoteBody>,
 ) -> ApiResult<Json<Note>> {
     let auth = authenticate(&state, body.i.as_deref()).await?;
-    if body.renote_id.is_some() {
-        return Err(ApiError::unprocessable(
-            "Renotes are not implemented on this endpoint yet",
-        ));
-    }
+    let renote_internal = match body.renote_id.as_deref() {
+        Some(external) => {
+            let local = external_ids::resolve(state.store().pool(), "status", external)
+                .await?
+                .ok_or_else(|| ApiError::not_found("No such renote target"))?;
+            statuses::by_id(state.store().pool(), &local)
+                .await?
+                .ok_or_else(|| ApiError::not_found("No such renote target"))?;
+            Some(local)
+        }
+        None => None,
+    };
     let text = body.text.unwrap_or_default();
-    if text.trim().is_empty() {
+    if renote_internal.is_none() && text.trim().is_empty() {
         return Err(ApiError::unprocessable("text is required"));
     }
     if text.chars().count() > usize::try_from(STATUS_MAX_CHARS).unwrap_or(usize::MAX) {
@@ -299,6 +449,7 @@ async fn create_note(
             sensitive: body.sensitive,
             in_reply_to_id: reply_internal.as_deref(),
             in_reply_to_account_id: reply_account.as_deref(),
+            reblog_of_id: renote_internal.as_deref(),
             language: None,
         },
     )

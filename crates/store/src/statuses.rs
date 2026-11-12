@@ -164,6 +164,7 @@ pub struct NewStatus<'a> {
     pub sensitive: bool,
     pub in_reply_to_id: Option<&'a str>,
     pub in_reply_to_account_id: Option<&'a str>,
+    pub reblog_of_id: Option<&'a str>,
     pub language: Option<&'a str>,
 }
 
@@ -172,8 +173,9 @@ pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sql
     let sql = format!(
         "INSERT INTO status (id, account_id, content, content_html, content_source, \
                              content_format, spoiler_text, visibility, sensitive, \
-                             in_reply_to_id, in_reply_to_account_id, language, local) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, true) \
+                             in_reply_to_id, in_reply_to_account_id, reblog_of_id, \
+                             language, local) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true) \
          RETURNING {STATUS_COLUMNS_SIMPLE}"
     );
     sqlx::query_as::<_, StatusRow>(&sql)
@@ -188,6 +190,7 @@ pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sql
         .bind(new.sensitive)
         .bind(new.in_reply_to_id)
         .bind(new.in_reply_to_account_id)
+        .bind(new.reblog_of_id)
         .bind(new.language)
         .fetch_one(pool)
         .await

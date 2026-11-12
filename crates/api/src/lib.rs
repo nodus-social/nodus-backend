@@ -159,7 +159,10 @@ mod tests {
             .expect("body")
             .to_bytes();
         let body = String::from_utf8_lossy(&body);
-        assert!(body.contains(r#""maxNoteTextLength":500"#), "body was {body}");
+        assert!(
+            body.contains(r#""maxNoteTextLength":500"#),
+            "body was {body}"
+        );
     }
 
     #[tokio::test]
