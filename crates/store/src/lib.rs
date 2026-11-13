@@ -7,6 +7,7 @@
 
 pub mod accounts;
 pub mod alerts;
+pub mod announcements;
 pub mod apps;
 pub mod events;
 pub mod external_ids;

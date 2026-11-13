@@ -9,6 +9,7 @@ pub mod abuse;
 pub mod accounts;
 pub mod activitypub;
 pub mod admin;
+pub mod announcements;
 pub mod apps;
 pub mod auth;
 pub mod dto;
@@ -104,6 +105,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(misskey::router())
         .merge(miauth::router())
         .merge(nodus::router())
+        .merge(announcements::router())
         .merge(admin::router())
         .merge(media::router())
         .merge(filters::router())
