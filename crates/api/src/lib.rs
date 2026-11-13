@@ -14,6 +14,7 @@ pub mod auth;
 pub mod dto;
 pub mod error;
 pub mod filters;
+pub mod hydrate;
 pub mod lists;
 pub mod mastodon;
 pub mod media;
@@ -89,6 +90,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(media::router())
         .merge(filters::router())
         .merge(lists::router())
+        .merge(hydrate::router())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             abuse::record,

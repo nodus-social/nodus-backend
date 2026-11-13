@@ -384,7 +384,10 @@ fn activity_target_id(activity: &Activity) -> Option<&str> {
     }
 }
 
-async fn ensure_remote_actor(state: &AppState, actor_url: &str) -> ApiResult<AccountRow> {
+pub(crate) async fn ensure_remote_actor(
+    state: &AppState,
+    actor_url: &str,
+) -> ApiResult<AccountRow> {
     if let Some(row) = accounts::by_uri(state.store().pool(), actor_url).await? {
         return Ok(row);
     }
@@ -446,7 +449,11 @@ async fn unfollow_local(state: &AppState, remote: &AccountRow, target: &str) -> 
     Ok(())
 }
 
-async fn ingest_note(state: &AppState, remote: &AccountRow, value: &Value) -> ApiResult<()> {
+pub(crate) async fn ingest_note(
+    state: &AppState,
+    remote: &AccountRow,
+    value: &Value,
+) -> ApiResult<()> {
     let note =
         Note::from_json(value).map_err(|error| ApiError::unprocessable(error.to_string()))?;
     let parent = match &note.in_reply_to {
