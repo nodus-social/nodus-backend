@@ -139,7 +139,11 @@ pub async fn public_page(
     let size = PageSize::default_max(params.limit);
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM status s \
+           JOIN account a ON a.id = s.account_id \
          WHERE s.deleted_at IS NULL AND s.visibility = 'public' \
+           AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM instance_block b WHERE b.domain = a.domain \
+                           AND b.severity IN ('suspend', 'silence')) \
            AND ($1::text IS NULL OR s.id < $1) \
            AND (NOT $2 OR s.local) \
          ORDER BY s.id DESC LIMIT $3"
@@ -193,15 +197,23 @@ pub async fn home_page(
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM timeline_entry e \
            JOIN status s ON s.id = e.status_id \
+           JOIN account a ON a.id = s.account_id \
           WHERE e.account_id = $1 AND e.kind = 'home' AND s.deleted_at IS NULL \
+            AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
+                            AND r.target_account_id = s.account_id AND r.kind = 'block') \
             AND ($2::text IS NULL OR s.id < $2) \
          UNION \
          SELECT {STATUS_COLUMNS} FROM status s \
+           JOIN account a ON a.id = s.account_id \
           WHERE s.account_id IN ( \
                   SELECT f.target_account_id FROM follow f \
-                    JOIN account a ON a.id = f.target_account_id \
-                   WHERE f.account_id = $1 AND a.followers_count >= $4) \
+                    JOIN account a2 ON a2.id = f.target_account_id \
+                   WHERE f.account_id = $1 AND a2.followers_count >= $4) \
             AND s.deleted_at IS NULL AND s.visibility <> 'direct' \
+            AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
+                            AND r.target_account_id = s.account_id AND r.kind = 'block') \
             AND ($2::text IS NULL OR s.id < $2) \
          ORDER BY id DESC LIMIT $3"
     );

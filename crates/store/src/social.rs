@@ -310,6 +310,9 @@ pub async fn notifications(
           WHERE account_id = $1 \
             AND ($2::text IS NULL OR id < $2) \
             AND (cardinality($3::text[]) = 0 OR kind = ANY($3)) \
+            AND NOT EXISTS (SELECT 1 FROM account_relation r \
+                            WHERE r.account_id = $1 AND r.target_account_id = from_account_id \
+                              AND (r.kind = 'block' OR (r.kind = 'mute' AND r.notifications))) \
           ORDER BY id DESC LIMIT $4",
     )
     .bind(account_id)

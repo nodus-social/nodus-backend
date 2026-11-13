@@ -388,6 +388,17 @@ pub(crate) async fn ensure_remote_actor(
     state: &AppState,
     actor_url: &str,
 ) -> ApiResult<AccountRow> {
+    let domain = url::Url::parse(actor_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    if domain.is_empty()
+        || nodus_server_store::moderation::blocked_domain(state.store().pool(), &domain)
+            .await?
+            .is_some()
+    {
+        return Err(ApiError::forbidden("domain is blocked"));
+    }
     if let Some(row) = accounts::by_uri(state.store().pool(), actor_url).await? {
         return Ok(row);
     }
@@ -395,10 +406,7 @@ pub(crate) async fn ensure_remote_actor(
         .actor_url(actor_url)
         .await
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;
-    let host = url::Url::parse(actor_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_default();
+    let host = domain;
     Ok(accounts::upsert_remote(
         state.store().pool(),
         &accounts::RemoteAccount {
