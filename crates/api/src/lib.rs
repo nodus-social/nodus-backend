@@ -13,6 +13,8 @@ pub mod apps;
 pub mod auth;
 pub mod dto;
 pub mod error;
+pub mod filters;
+pub mod lists;
 pub mod mastodon;
 pub mod media;
 pub mod miauth;
@@ -85,6 +87,8 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(nodus::router())
         .merge(admin::router())
         .merge(media::router())
+        .merge(filters::router())
+        .merge(lists::router())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             abuse::record,
@@ -225,6 +229,36 @@ mod tests {
                     .uri("/api/notes/create")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"text":"hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn lists_require_a_token() {
+        let response = router(state())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/lists")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn filters_require_a_token() {
+        let response = router(state())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v2/filters")
+                    .body(Body::empty())
                     .expect("request"),
             )
             .await
