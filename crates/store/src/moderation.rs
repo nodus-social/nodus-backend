@@ -348,10 +348,22 @@ pub async fn measure(
              FROM generate_series($1::date, $2::date, '1 day') d \
              GROUP BY d ORDER BY d"
         }
-        "reports" => {
+        "reports" | "opened_reports" => {
             "SELECT d::date AS date, count(r.id)::bigint AS value \
              FROM generate_series($1::date, $2::date, '1 day') d \
              LEFT JOIN report r ON r.created_at::date = d::date \
+             GROUP BY d ORDER BY d"
+        }
+        "resolved_reports" => {
+            "SELECT d::date AS date, count(r.id)::bigint AS value \
+             FROM generate_series($1::date, $2::date, '1 day') d \
+             LEFT JOIN report r ON r.updated_at::date = d::date AND r.state = 'resolved' \
+             GROUP BY d ORDER BY d"
+        }
+        "active_user_count" => {
+            "SELECT d::date AS date, count(DISTINCT s.account_id)::bigint AS value \
+             FROM generate_series($1::date, $2::date, '1 day') d \
+             LEFT JOIN status s ON s.created_at::date = d::date AND s.deleted_at IS NULL \
              GROUP BY d ORDER BY d"
         }
         _ => return Ok(Vec::new()),
