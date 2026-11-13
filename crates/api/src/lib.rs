@@ -57,6 +57,24 @@ pub fn router(state: AppState) -> axum::Router {
             post(accounts::follow).delete(accounts::unfollow),
         )
         .route(
+            "/api/v1/accounts/{id}/block",
+            axum::routing::post(accounts::block),
+        )
+        .route(
+            "/api/v1/accounts/{id}/unblock",
+            axum::routing::post(accounts::unblock),
+        )
+        .route(
+            "/api/v1/accounts/{id}/mute",
+            axum::routing::post(accounts::mute),
+        )
+        .route(
+            "/api/v1/accounts/{id}/unmute",
+            axum::routing::post(accounts::unmute),
+        )
+        .route("/api/v1/blocks", axum::routing::get(accounts::blocks))
+        .route("/api/v1/mutes", axum::routing::get(accounts::mutes))
+        .route(
             "/api/v1/accounts/relationships",
             get(accounts::relationships),
         )

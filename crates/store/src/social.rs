@@ -16,6 +16,9 @@ pub struct Relationship {
     pub requested: bool,
     pub showing_reblogs: bool,
     pub notifying: bool,
+    pub blocked: bool,
+    pub muting: bool,
+    pub muting_notifications: bool,
 }
 
 /// One account's relationship to another.
@@ -24,22 +27,30 @@ pub async fn relationship(
     account_id: &str,
     target_id: &str,
 ) -> Result<Relationship, sqlx::Error> {
-    let row: Option<(String, bool, bool)> = sqlx::query_as(
-        "SELECT state, reblogs, notify FROM follow \
-         WHERE account_id = $1 AND target_account_id = $2",
-    )
-    .bind(account_id)
-    .bind(target_id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(match row {
-        Some((state, reblogs, notify)) => Relationship {
-            following: state == "accepted",
-            requested: state == "pending",
-            showing_reblogs: reblogs,
-            notifying: notify,
-        },
-        None => Relationship::default(),
+    let row: (Option<String>, Option<bool>, Option<bool>, bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT f.state, f.reblogs, f.notify, \
+                    EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
+                            AND r.target_account_id = $2 AND r.kind = 'block'), \
+                    EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
+                            AND r.target_account_id = $2 AND r.kind = 'mute'), \
+                    COALESCE((SELECT r.notifications FROM account_relation r WHERE r.account_id = $1 \
+                            AND r.target_account_id = $2 AND r.kind = 'mute'), false) \
+             FROM (SELECT 1) seed \
+             LEFT JOIN follow f ON f.account_id = $1 AND f.target_account_id = $2",
+        )
+        .bind(account_id)
+        .bind(target_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(Relationship {
+        following: row.0.as_deref() == Some("accepted"),
+        requested: row.0.as_deref() == Some("pending"),
+        showing_reblogs: row.1.unwrap_or(false),
+        notifying: row.2.unwrap_or(false),
+        blocked: row.3,
+        muting: row.4,
+        muting_notifications: row.5,
     })
 }
 
@@ -485,4 +496,102 @@ pub async fn viewer_flags(
             )
         })
         .collect())
+}
+
+/// Blocks a target, removing follows in both directions and all notifications.
+pub async fn block(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(), sqlx::Error> {
+    if account_id == target_id {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO account_relation (account_id, target_account_id, kind) \
+         VALUES ($1, $2, 'block') ON CONFLICT DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(target_id)
+    .execute(&mut *tx)
+    .await?;
+    for (from, to) in [(account_id, target_id), (target_id, account_id)] {
+        let removed: Option<(String,)> = sqlx::query_as(
+            "DELETE FROM follow WHERE account_id = $1 AND target_account_id = $2 \
+             AND state = 'accepted' RETURNING account_id",
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if removed.is_some() {
+            sqlx::query("UPDATE account SET following_count = GREATEST(0, following_count - 1) WHERE id = $1")
+                .bind(from)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE account SET followers_count = GREATEST(0, followers_count - 1) WHERE id = $1")
+                .bind(to)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    sqlx::query(
+        "DELETE FROM notification WHERE (account_id = $1 AND from_account_id = $2) \
+         OR (account_id = $2 AND from_account_id = $1)",
+    )
+    .bind(account_id)
+    .bind(target_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+pub async fn unblock(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM account_relation WHERE account_id = $1 AND target_account_id = $2 AND kind = 'block'")
+        .bind(account_id)
+        .bind(target_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn mute(
+    pool: &PgPool,
+    account_id: &str,
+    target_id: &str,
+    notifications: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO account_relation (account_id, target_account_id, kind, notifications) \
+         VALUES ($1, $2, 'mute', $3) \
+         ON CONFLICT (account_id, target_account_id, kind) DO UPDATE \
+           SET notifications = EXCLUDED.notifications",
+    )
+    .bind(account_id)
+    .bind(target_id)
+    .bind(notifications)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn unmute(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM account_relation WHERE account_id = $1 AND target_account_id = $2 AND kind = 'mute'")
+        .bind(account_id)
+        .bind(target_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn relations(
+    pool: &PgPool,
+    account_id: &str,
+    kind: &str,
+) -> Result<Vec<crate::accounts::AccountRow>, sqlx::Error> {
+    sqlx::query_as::<_, crate::accounts::AccountRow>(
+        "SELECT a.* FROM account a JOIN account_relation r ON r.target_account_id = a.id \
+         WHERE r.account_id = $1 AND r.kind = $2 ORDER BY r.created_at DESC",
+    )
+    .bind(account_id)
+    .bind(kind)
+    .fetch_all(pool)
+    .await
 }

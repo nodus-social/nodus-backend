@@ -39,9 +39,9 @@ impl RelationshipDto {
             showing_reblogs: relationship.showing_reblogs,
             notifying: relationship.notifying,
             requested: relationship.requested,
-            blocked: false,
-            muting: false,
-            muting_notifications: false,
+            blocked: relationship.blocked,
+            muting: relationship.muting,
+            muting_notifications: relationship.muting_notifications,
             domain_blocking: false,
             endorsed: false,
             languages: Vec::new(),
@@ -175,6 +175,86 @@ pub async fn unfollow(
         nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
             .await?;
     Ok(Json(RelationshipDto::new(&id, &relationship)))
+}
+
+pub async fn block(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RelationshipDto>> {
+    auth.require_scope("write:blocks")?;
+    nodus_server_store::social::block(state.store().pool(), &auth.0.account.id, &id).await?;
+    let relationship =
+        nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
+            .await?;
+    Ok(Json(RelationshipDto::new(&id, &relationship)))
+}
+
+pub async fn unblock(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RelationshipDto>> {
+    auth.require_scope("write:blocks")?;
+    nodus_server_store::social::unblock(state.store().pool(), &auth.0.account.id, &id).await?;
+    let relationship =
+        nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
+            .await?;
+    Ok(Json(RelationshipDto::new(&id, &relationship)))
+}
+
+pub async fn mute(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    axum::extract::RawForm(body): axum::extract::RawForm,
+) -> ApiResult<Json<RelationshipDto>> {
+    auth.require_scope("write:mutes")?;
+    let notifications = !url::form_urlencoded::parse(&body)
+        .any(|(key, value)| key == "notifications" && value == "false");
+    nodus_server_store::social::mute(state.store().pool(), &auth.0.account.id, &id, notifications)
+        .await?;
+    let relationship =
+        nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
+            .await?;
+    Ok(Json(RelationshipDto::new(&id, &relationship)))
+}
+
+pub async fn unmute(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RelationshipDto>> {
+    auth.require_scope("write:mutes")?;
+    nodus_server_store::social::unmute(state.store().pool(), &auth.0.account.id, &id).await?;
+    let relationship =
+        nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
+            .await?;
+    Ok(Json(RelationshipDto::new(&id, &relationship)))
+}
+
+pub async fn blocks(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<AccountDto>>> {
+    auth.require_scope("read:blocks")?;
+    let rows =
+        nodus_server_store::social::relations(state.store().pool(), &auth.0.account.id, "block")
+            .await?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| AccountDto::from_row(row, state.instance()))
+            .collect(),
+    ))
+}
+
+pub async fn mutes(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<AccountDto>>> {
+    auth.require_scope("read:mutes")?;
+    let rows =
+        nodus_server_store::social::relations(state.store().pool(), &auth.0.account.id, "mute")
+            .await?;
+    Ok(Json(
+        rows.iter()
+            .map(|row| AccountDto::from_row(row, state.instance()))
+            .collect(),
+    ))
 }
 
 pub async fn relationships(
