@@ -83,3 +83,24 @@ mod tests {
         );
     }
 }
+
+/// Authentication that is optional: public endpoints use it to personalise a response
+/// without rejecting anonymous readers.
+#[derive(Debug, Clone)]
+pub struct MaybeAuth(pub Option<Auth>);
+
+impl FromRequestParts<AppState> for MaybeAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if parts.headers.get(AUTHORIZATION).is_none() {
+            return Ok(Self(None));
+        }
+        Auth::from_request_parts(parts, state)
+            .await
+            .map(|auth| Self(Some(auth)))
+    }
+}

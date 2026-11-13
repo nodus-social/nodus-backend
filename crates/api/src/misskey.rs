@@ -21,12 +21,13 @@ use sha2::{Digest, Sha256};
 
 use nodus_server_core::id::Id;
 use nodus_server_core::limits::STATUS_MAX_CHARS;
+use nodus_server_core::pagination::{PageParams, PageSize};
 use nodus_server_sdk::misskey::api::{File, Meta, Note, NoteVisibility, User};
 use nodus_server_sdk::misskey::{Aid, Reaction};
 use nodus_server_store::accounts::{self, AccountRow, Authenticated};
 use nodus_server_store::media::{self, MediaRow};
 use nodus_server_store::statuses::{self, StatusRow};
-use nodus_server_store::{events, external_ids};
+use nodus_server_store::{events, external_ids, social};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -37,6 +38,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/meta", post(meta))
         .route("/api/i", post(me))
         .route("/api/users/show", post(show_user))
+        .route("/api/users/notes", post(user_notes))
+        .route("/api/following/create", post(follow_user))
+        .route("/api/following/delete", post(unfollow_user))
+        .route("/api/notes/favorites/create", post(favorite_note))
+        .route("/api/notes/favorites/delete", post(unfavorite_note))
+        .route("/api/i/notifications", post(notifications))
         .route("/api/notes/show", post(show_note))
         .route("/api/notes/local-timeline", post(local_timeline))
         .route("/api/notes/global-timeline", post(global_timeline))
@@ -232,6 +239,24 @@ fn escape_html(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+async fn resolve_account(state: &AppState, external: &str) -> ApiResult<AccountRow> {
+    let local = external_ids::resolve(state.store().pool(), "account", external)
+        .await?
+        .unwrap_or_else(|| external.to_owned());
+    accounts::by_id(state.store().pool(), &local)
+        .await?
+        .ok_or_else(|| ApiError::not_found("No such user"))
+}
+
+async fn resolve_note(state: &AppState, external: &str) -> ApiResult<StatusRow> {
+    let local = external_ids::resolve(state.store().pool(), "status", external)
+        .await?
+        .ok_or_else(|| ApiError::not_found("No such note"))?;
+    statuses::by_id(state.store().pool(), &local)
+        .await?
+        .ok_or_else(|| ApiError::not_found("No such note"))
+}
+
 async fn meta(State(state): State<AppState>) -> Json<Meta> {
     let instance = state.instance();
     Json(Meta {
@@ -301,6 +326,179 @@ struct TimelineBody {
     until_id: Option<String>,
     #[serde(default)]
     since_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserNoteBody {
+    #[serde(default)]
+    i: Option<String>,
+    user_id: String,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    until_id: Option<String>,
+}
+
+async fn user_notes(
+    State(state): State<AppState>,
+    Json(body): Json<UserNoteBody>,
+) -> ApiResult<Json<Vec<Note>>> {
+    let _auth = authenticate(&state, body.i.as_deref()).await?;
+    let account = resolve_account(&state, &body.user_id).await?;
+    let mut params = PageParams::new();
+    params.limit = body.limit;
+    if let Some(until) = body.until_id.as_deref() {
+        let local = external_ids::resolve(state.store().pool(), "status", until)
+            .await?
+            .ok_or_else(|| ApiError::unprocessable("untilId is not a known note"))?;
+        params.max_id = Some(
+            local
+                .parse::<Id>()
+                .map_err(|_| ApiError::unprocessable("untilId is not a known note"))?,
+        );
+    }
+    let page = statuses::account_page(state.store().pool(), &account.id, params).await?;
+    let mut notes = Vec::with_capacity(page.items.len());
+    for row in &page.items {
+        notes.push(note_for(&state, row, &account).await?);
+    }
+    Ok(Json(notes))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FollowBody {
+    #[serde(default)]
+    i: Option<String>,
+    user_id: String,
+}
+
+async fn follow_user(
+    State(state): State<AppState>,
+    Json(body): Json<FollowBody>,
+) -> ApiResult<Json<User>> {
+    let auth = authenticate(&state, body.i.as_deref()).await?;
+    let target = resolve_account(&state, &body.user_id).await?;
+    let outcome = social::follow(
+        state.store().pool(),
+        &auth.account.id,
+        &target.id,
+        true,
+        false,
+    )
+    .await?;
+    if outcome == social::FollowOutcome::Following {
+        social::notify(
+            state.store().pool(),
+            &target.id,
+            "follow",
+            &auth.account.id,
+            None,
+        )
+        .await?;
+    }
+    Ok(Json(user_for(&state, &target).await?))
+}
+
+async fn unfollow_user(
+    State(state): State<AppState>,
+    Json(body): Json<FollowBody>,
+) -> ApiResult<Json<User>> {
+    let auth = authenticate(&state, body.i.as_deref()).await?;
+    let target = resolve_account(&state, &body.user_id).await?;
+    social::unfollow(state.store().pool(), &auth.account.id, &target.id).await?;
+    Ok(Json(user_for(&state, &target).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoriteBody {
+    #[serde(default)]
+    i: Option<String>,
+    note_id: String,
+}
+
+async fn favorite_note(
+    State(state): State<AppState>,
+    Json(body): Json<FavoriteBody>,
+) -> ApiResult<Json<Note>> {
+    let auth = authenticate(&state, body.i.as_deref()).await?;
+    let row = resolve_note(&state, &body.note_id).await?;
+    social::favourite(state.store().pool(), &auth.account.id, &row.id).await?;
+    let account = accounts::by_id(state.store().pool(), &row.account_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("No such note"))?;
+    Ok(Json(note_for(&state, &row, &account).await?))
+}
+
+async fn unfavorite_note(
+    State(state): State<AppState>,
+    Json(body): Json<FavoriteBody>,
+) -> ApiResult<Json<Note>> {
+    let auth = authenticate(&state, body.i.as_deref()).await?;
+    let row = resolve_note(&state, &body.note_id).await?;
+    social::unfavourite(state.store().pool(), &auth.account.id, &row.id).await?;
+    let account = accounts::by_id(state.store().pool(), &row.account_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("No such note"))?;
+    Ok(Json(note_for(&state, &row, &account).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationsBody {
+    #[serde(default)]
+    i: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    until_id: Option<String>,
+}
+
+async fn notifications(
+    State(state): State<AppState>,
+    Json(body): Json<NotificationsBody>,
+) -> ApiResult<Json<Vec<Value>>> {
+    let auth = authenticate(&state, body.i.as_deref()).await?;
+    let limit = PageSize::clamp(body.limit, nodus_server_core::limits::PAGE_MAX);
+    let rows = social::notifications(
+        state.store().pool(),
+        &auth.account.id,
+        body.until_id.as_deref(),
+        i64::from(limit.get()),
+        &[],
+    )
+    .await?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(from) = accounts::by_id(state.store().pool(), &row.from_account_id).await? else {
+            continue;
+        };
+        let user = user_for(&state, &from).await?;
+        let note = match row.status_id.as_deref() {
+            Some(id) => match statuses::by_id(state.store().pool(), id).await? {
+                Some(status) => {
+                    match accounts::by_id(state.store().pool(), &status.account_id).await? {
+                        Some(author) => Some(note_for(&state, &status, &author).await?),
+                        None => None,
+                    }
+                }
+                None => None,
+            },
+            None => None,
+        };
+        items.push(json!({
+            "id": row.id,
+            "createdAt": row.created_at.to_rfc3339(),
+            "type": row.kind,
+            "userId": user.id,
+            "user": user,
+            "note": note,
+            "isRead": row.seen_at.is_some(),
+        }));
+    }
+    Ok(Json(items))
 }
 
 async fn local_timeline(

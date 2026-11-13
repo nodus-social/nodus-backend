@@ -6,8 +6,10 @@
 //! binary nests this under `/api` so the SSR frontend owns everything else.
 
 pub mod abuse;
+pub mod accounts;
 pub mod activitypub;
 pub mod admin;
+pub mod apps;
 pub mod auth;
 pub mod dto;
 pub mod error;
@@ -18,10 +20,11 @@ pub mod misskey;
 pub mod nodus;
 pub mod reactions;
 pub mod state;
+pub mod statuses;
 
 pub use state::{AppState, InstanceConfig};
 
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 
 /// Builds the router. No port, no listener: the binary owns the process, this owns the
 /// surface.
@@ -29,6 +32,7 @@ pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/healthz", get(mastodon::healthz))
         .route("/readyz", get(mastodon::readyz))
+        .route("/api/v1/apps", axum::routing::post(apps::register))
         .route("/api/v1/instance", get(mastodon::instance_v1))
         .route("/api/v2/instance", get(mastodon::instance_v2))
         .route("/api/v1/timelines/public", get(mastodon::public_timeline))
@@ -40,6 +44,40 @@ pub fn router(state: AppState) -> axum::Router {
         .route(
             "/api/v1/statuses/{id}/reaction",
             put(reactions::set).delete(reactions::remove),
+        )
+        .route("/api/v1/accounts/{id}", get(accounts::show))
+        .route("/api/v1/accounts/lookup", get(accounts::lookup))
+        .route("/api/v1/accounts/{id}/followers", get(accounts::followers))
+        .route("/api/v1/accounts/{id}/following", get(accounts::following))
+        .route(
+            "/api/v1/accounts/{id}/follow",
+            post(accounts::follow).delete(accounts::unfollow),
+        )
+        .route(
+            "/api/v1/accounts/relationships",
+            get(accounts::relationships),
+        )
+        .route("/api/v1/statuses", post(statuses::create))
+        .route(
+            "/api/v1/statuses/{id}",
+            get(statuses::show).delete(statuses::destroy),
+        )
+        .route(
+            "/api/v1/statuses/{id}/favourite",
+            post(statuses::favourite).delete(statuses::unfavourite),
+        )
+        .route(
+            "/api/v1/statuses/{id}/bookmark",
+            post(statuses::bookmark).delete(statuses::unbookmark),
+        )
+        .route(
+            "/api/v1/statuses/{id}/reblog",
+            post(statuses::reblog).delete(statuses::unreblog),
+        )
+        .route("/api/v1/statuses/{id}/context", get(statuses::context))
+        .route(
+            "/api/v1/accounts/{id}/statuses",
+            get(statuses::account_statuses),
         )
         .route("/api/v1/statuses/{id}/reactions", get(reactions::list))
         .merge(misskey::router())

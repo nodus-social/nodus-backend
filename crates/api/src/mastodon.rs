@@ -33,7 +33,7 @@ pub struct PageQuery {
 
 impl PageQuery {
     /// Parses cursors, turning a malformed one into `422` instead of an empty page.
-    fn params(&self) -> ApiResult<PageParams> {
+    pub(crate) fn params(&self) -> ApiResult<PageParams> {
         let parse = |raw: &Option<String>, field: &str| -> ApiResult<Option<Id>> {
             match raw {
                 None => Ok(None),

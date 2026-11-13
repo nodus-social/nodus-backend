@@ -323,10 +323,14 @@ async fn token<S: AuthStore>(
     let Ok(Some(app)) = state.store.client_app(&form.client_id).await else {
         return oauth_error("invalid_client");
     };
-    if app.scopes.iter().all(|scope| !scope.is_empty())
-        && form.client_secret.as_deref().is_none_or(str::is_empty)
+    if let Some(secret) = form
+        .client_secret
+        .as_deref()
+        .filter(|value| !value.is_empty())
     {
-        // Public clients are allowed, but the code is still bound to the client_id.
+        if token_hash(secret) != app.client_secret_hash {
+            return oauth_error("invalid_client");
+        }
     }
     let Ok(Some(stored)) = state.store.consume_code(&token_hash(code)).await else {
         return oauth_error("invalid_grant");

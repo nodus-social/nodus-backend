@@ -61,6 +61,73 @@ pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<StatusRow>, sqlx::E
         .await
 }
 
+/// One status by its canonical `ActivityPub` URI.
+pub async fn by_uri(pool: &PgPool, uri: &str) -> Result<Option<StatusRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM status s WHERE s.uri = $1 AND s.deleted_at IS NULL"
+    );
+    sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(uri)
+        .fetch_optional(pool)
+        .await
+}
+
+/// A remote note learned from an inbound activity.
+#[derive(Debug, Clone)]
+pub struct NewRemoteStatus<'a> {
+    pub id: &'a str,
+    pub account_id: &'a str,
+    pub uri: &'a str,
+    pub content: &'a str,
+    pub content_html: &'a str,
+    pub spoiler_text: &'a str,
+    pub sensitive: bool,
+    pub in_reply_to_id: Option<&'a str>,
+    pub in_reply_to_account_id: Option<&'a str>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Inserts or refreshes a remote note, keyed by its canonical URI.
+pub async fn upsert_remote(
+    pool: &PgPool,
+    new: &NewRemoteStatus<'_>,
+) -> Result<StatusRow, sqlx::Error> {
+    let sql = format!(
+        "INSERT INTO status (id, account_id, uri, content, content_html, spoiler_text, \
+             visibility, sensitive, in_reply_to_id, in_reply_to_account_id, local, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'public', $7, $8, $9, false, $10) \
+         ON CONFLICT (uri) DO UPDATE SET content = EXCLUDED.content, \
+             content_html = EXCLUDED.content_html, spoiler_text = EXCLUDED.spoiler_text, \
+             sensitive = EXCLUDED.sensitive, edited_at = now() \
+         RETURNING {STATUS_COLUMNS_SIMPLE}"
+    );
+    sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(new.id)
+        .bind(new.account_id)
+        .bind(new.uri)
+        .bind(new.content)
+        .bind(new.content_html)
+        .bind(new.spoiler_text)
+        .bind(new.sensitive)
+        .bind(new.in_reply_to_id)
+        .bind(new.in_reply_to_account_id)
+        .bind(new.created_at)
+        .fetch_one(pool)
+        .await
+}
+
+/// Soft-deletes a remote status by URI.
+pub async fn delete_remote(pool: &PgPool, uri: &str) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE status SET deleted_at = now() WHERE uri = $1 AND deleted_at IS NULL",
+    )
+    .bind(uri)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
+}
+
 /// `/api/v1/timelines/public`: public visibility only.
 ///
 /// `local_only` is the default the app asks for (`public:local`); the federated view
@@ -291,4 +358,179 @@ fn finish(mut rows: Vec<StatusRow>, size: PageSize) -> StatusPage {
         items: rows,
         next_max_id,
     }
+}
+
+/// The complete local write: status, media attachments, mentions, tags, timeline fan-out.
+///
+/// Fan-out is immediate here because a local follower timeline is a single indexed
+/// insert. Remote delivery is a worker concern and must not hold this transaction.
+pub async fn create(
+    pool: &PgPool,
+    new: &NewStatus<'_>,
+    media_ids: &[String],
+    mention_ids: &[String],
+    tags: &[String],
+) -> Result<StatusRow, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let sql = format!(
+        "INSERT INTO status (id, account_id, content, content_html, content_source, \
+                             content_format, spoiler_text, visibility, sensitive, \
+                             in_reply_to_id, in_reply_to_account_id, reblog_of_id, \
+                             language, local) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true) \
+         RETURNING {STATUS_COLUMNS_SIMPLE}"
+    );
+    let row = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(new.id)
+        .bind(new.account_id)
+        .bind(new.content)
+        .bind(new.content_html)
+        .bind(new.content_source)
+        .bind(new.content_format)
+        .bind(new.spoiler_text)
+        .bind(new.visibility)
+        .bind(new.sensitive)
+        .bind(new.in_reply_to_id)
+        .bind(new.in_reply_to_account_id)
+        .bind(new.reblog_of_id)
+        .bind(new.language)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    if !media_ids.is_empty() {
+        sqlx::query(
+            "UPDATE media_attachment SET status_id = $1 \
+             WHERE id = ANY($2) AND account_id = $3 AND status_id IS NULL",
+        )
+        .bind(new.id)
+        .bind(media_ids)
+        .bind(new.account_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for mention in mention_ids {
+        sqlx::query(
+            "INSERT INTO status_mention (status_id, account_id) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(new.id)
+        .bind(mention)
+        .execute(&mut *tx)
+        .await?;
+    }
+    for tag in tags {
+        sqlx::query(
+            "INSERT INTO status_tag (status_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(new.id)
+        .bind(tag)
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO timeline_entry (account_id, status_id, kind) \
+         SELECT $1, $2, 'home' \
+         UNION SELECT account_id, $2, 'home' FROM follow \
+                WHERE target_account_id = $1 AND state = 'accepted' \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(new.account_id)
+    .bind(new.id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE account SET statuses_count = statuses_count + 1, last_status_at = now() \
+         WHERE id = $1",
+    )
+    .bind(new.account_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Copies a status into the booster's timeline.
+pub async fn reblog(
+    pool: &PgPool,
+    account_id: &str,
+    original_id: &str,
+) -> Result<Option<StatusRow>, sqlx::Error> {
+    let Some(original) = by_id(pool, original_id).await? else {
+        return Ok(None);
+    };
+    if original.visibility == "direct" {
+        return Ok(None);
+    }
+    let id = nodus_server_core::Id::new().to_string();
+    let mut tx = pool.begin().await?;
+    let sql = format!(
+        "INSERT INTO status (id, account_id, content, content_html, content_format, \
+                             visibility, reblog_of_id, local) \
+         VALUES ($1, $2, '', '', 'html', $3, $4, true) \
+         RETURNING {STATUS_COLUMNS_SIMPLE}"
+    );
+    let row = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(&id)
+        .bind(account_id)
+        .bind(&original.visibility)
+        .bind(original_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE status SET reblogs_count = \
+             (SELECT count(*) FROM status WHERE reblog_of_id = $1 AND deleted_at IS NULL) \
+         WHERE id = $1",
+    )
+    .bind(original_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO timeline_entry (account_id, status_id, kind) \
+         SELECT $1, $2, 'home' \
+         UNION SELECT account_id, $2, 'home' FROM follow \
+                WHERE target_account_id = $1 AND state = 'accepted' \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(&id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(row))
+}
+
+/// Ancestors and descendants of a status, oldest first.
+pub async fn context(
+    pool: &PgPool,
+    id: &str,
+) -> Result<(Vec<StatusRow>, Vec<StatusRow>), sqlx::Error> {
+    let ancestors = format!(
+        "WITH RECURSIVE chain AS ( \
+             SELECT {STATUS_COLUMNS} FROM status s WHERE s.id = \
+                 (SELECT in_reply_to_id FROM status WHERE id = $1) \
+             UNION ALL \
+             SELECT {STATUS_COLUMNS} FROM status s \
+               JOIN chain c ON s.id = c.in_reply_to_id \
+              WHERE s.deleted_at IS NULL \
+         ) SELECT * FROM chain ORDER BY id ASC"
+    );
+    let descendants = format!(
+        "WITH RECURSIVE tree AS ( \
+             SELECT {STATUS_COLUMNS} FROM status s \
+              WHERE s.in_reply_to_id = $1 AND s.deleted_at IS NULL \
+             UNION ALL \
+             SELECT {STATUS_COLUMNS} FROM status s \
+               JOIN tree t ON s.in_reply_to_id = t.id \
+              WHERE s.deleted_at IS NULL \
+         ) SELECT * FROM tree ORDER BY id ASC"
+    );
+    let ancestors = sqlx::query_as::<_, StatusRow>(&ancestors)
+        .bind(id)
+        .fetch_all(pool)
+        .await?;
+    let descendants = sqlx::query_as::<_, StatusRow>(&descendants)
+        .bind(id)
+        .fetch_all(pool)
+        .await?;
+    Ok((ancestors, descendants))
 }

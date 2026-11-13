@@ -17,8 +17,10 @@ nodus-server-store = { workspace = true }
 nodus-auth = { path = "../auth" }
 axum-extra = { workspace = true }
 leptos = { workspace = true }
-nodus-server-sdk = { workspace = true, features = ["nodus", "misskey"] }
+nodus-server-sdk = { workspace = true, features = ["nodus", "misskey", "native", "federation", "crypto"] }
+rand = { workspace = true }
 rsa = { workspace = true }
+url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

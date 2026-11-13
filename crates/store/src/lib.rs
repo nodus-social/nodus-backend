@@ -7,10 +7,12 @@
 
 pub mod accounts;
 pub mod alerts;
+pub mod apps;
 pub mod events;
 pub mod external_ids;
 pub mod jobs;
 pub mod media;
+pub mod social;
 pub mod statuses;
 
 use sqlx::postgres::PgPoolOptions;

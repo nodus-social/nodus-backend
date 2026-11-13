@@ -119,6 +119,65 @@ pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<AccountRow>, sqlx::
         .await
 }
 
+/// One account by its canonical `ActivityPub` actor URL.
+pub async fn by_uri(pool: &PgPool, uri: &str) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM account WHERE uri = $1");
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(uri)
+        .fetch_optional(pool)
+        .await
+}
+
+/// A remote actor learned from an inbound activity.
+#[derive(Debug, Clone)]
+pub struct RemoteAccount<'a> {
+    pub uri: &'a str,
+    pub username: &'a str,
+    pub domain: &'a str,
+    pub display_name: &'a str,
+    pub note: &'a str,
+    pub avatar: Option<&'a str>,
+    pub inbox_url: Option<&'a str>,
+    pub shared_inbox_url: Option<&'a str>,
+    pub public_key_pem: Option<&'a str>,
+    pub locked: bool,
+    pub bot: bool,
+}
+
+/// Inserts or refreshes a remote actor by its canonical URI.
+pub async fn upsert_remote(
+    pool: &PgPool,
+    remote: &RemoteAccount<'_>,
+) -> Result<AccountRow, sqlx::Error> {
+    let sql = format!(
+        "INSERT INTO account (id, username, domain, display_name, note, avatar_ref, local, uri, \
+             inbox_url, shared_inbox_url, public_key_pem, locked, bot) \
+         VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10, $11, $12) \
+         ON CONFLICT (uri) DO UPDATE SET display_name = EXCLUDED.display_name, note = EXCLUDED.note, \
+             avatar_ref = COALESCE(EXCLUDED.avatar_ref, account.avatar_ref), \
+             inbox_url = COALESCE(EXCLUDED.inbox_url, account.inbox_url), \
+             shared_inbox_url = COALESCE(EXCLUDED.shared_inbox_url, account.shared_inbox_url), \
+             public_key_pem = COALESCE(EXCLUDED.public_key_pem, account.public_key_pem), \
+             locked = EXCLUDED.locked, bot = EXCLUDED.bot, updated_at = now() \
+         RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(Id::new().to_string())
+        .bind(remote.username)
+        .bind(remote.domain)
+        .bind(remote.display_name)
+        .bind(remote.note)
+        .bind(remote.avatar)
+        .bind(remote.uri)
+        .bind(remote.inbox_url)
+        .bind(remote.shared_inbox_url)
+        .bind(remote.public_key_pem)
+        .bind(remote.locked)
+        .bind(remote.bot)
+        .fetch_one(pool)
+        .await
+}
+
 /// A local account by username (`@alice`, without the domain).
 pub async fn local_by_username(
     pool: &PgPool,
@@ -256,4 +315,73 @@ pub async fn set_lossless_permissions(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Followers or following, newest follow edge first. Full account rows so the API can
+/// reuse `AccountDto` without a second query per row.
+pub async fn follow_page(
+    pool: &PgPool,
+    account_id: &str,
+    followers: bool,
+    max_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<AccountRow>, sqlx::Error> {
+    let sql = if followers {
+        format!(
+            "SELECT {ACCOUNT_COLUMNS_ALIASED} FROM follow f JOIN account a ON a.id = f.account_id \
+              WHERE f.target_account_id = $1 AND f.state = 'accepted' \
+                AND ($2::text IS NULL OR f.id < $2) \
+              ORDER BY f.id DESC LIMIT $3"
+        )
+    } else {
+        format!(
+            "SELECT {ACCOUNT_COLUMNS_ALIASED} FROM follow f JOIN account a ON a.id = f.target_account_id \
+              WHERE f.account_id = $1 AND f.state = 'accepted' \
+                AND ($2::text IS NULL OR f.id < $2) \
+              ORDER BY f.id DESC LIMIT $3"
+        )
+    };
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(account_id)
+        .bind(max_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+/// Resolves `user` or `user@domain` to a local account.
+pub async fn lookup(pool: &PgPool, acct: &str) -> Result<Option<AccountRow>, sqlx::Error> {
+    let mut parts = acct.trim_start_matches('@').split('@');
+    let username = parts.next().unwrap_or_default();
+    let domain = parts.next();
+    let sql = format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM account \
+          WHERE username = $1 AND (($2::text IS NULL AND domain IS NULL) OR domain = $2)"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(username)
+        .bind(domain)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Local account search by username, display name and bio.
+pub async fn search_local(
+    pool: &PgPool,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<AccountRow>, sqlx::Error> {
+    let pattern = format!("%{}%", query.trim());
+    let sql = format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM account \
+          WHERE domain IS NULL AND suspended_at IS NULL \
+            AND (username ILIKE $1 OR display_name ILIKE $1 OR note ILIKE $1) \
+          ORDER BY (username ILIKE $2) DESC, followers_count DESC, username ASC LIMIT $3"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(&pattern)
+        .bind(format!("{}%", query.trim()))
+        .bind(limit)
+        .fetch_all(pool)
+        .await
 }

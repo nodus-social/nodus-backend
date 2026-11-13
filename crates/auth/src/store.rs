@@ -29,6 +29,7 @@ pub struct Credential {
 pub struct ClientApp {
     pub id: String,
     pub client_id: String,
+    pub client_secret_hash: String,
     pub name: String,
     pub redirect_uris: Vec<String>,
     pub scopes: Vec<String>,
@@ -166,21 +167,22 @@ impl AuthStore for PgAuthStore {
     }
 
     async fn client_app(&self, client_id: &str) -> Result<Option<ClientApp>, Error> {
-        let row = sqlx::query_as::<_, (String, String, String, Vec<String>, Vec<String>)>(
-            "SELECT id, client_id, name, redirect_uris, scopes FROM oauth_app WHERE client_id = $1",
+        let row = sqlx::query_as::<_, (String, String, String, String, Vec<String>, Vec<String>)>(
+            "SELECT id, client_id, client_secret_hash, name, redirect_uris, scopes FROM oauth_app WHERE client_id = $1",
         )
         .bind(client_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(
-            row.map(|(id, client_id, name, redirect_uris, scopes)| ClientApp {
+        Ok(row.map(
+            |(id, client_id, client_secret_hash, name, redirect_uris, scopes)| ClientApp {
                 id,
                 client_id,
+                client_secret_hash,
                 name,
                 redirect_uris,
                 scopes,
-            }),
-        )
+            },
+        ))
     }
 
     async fn create_session(
