@@ -12,6 +12,7 @@ pub mod auth;
 pub mod dto;
 pub mod error;
 pub mod mastodon;
+pub mod media;
 pub mod miauth;
 pub mod misskey;
 pub mod nodus;
@@ -45,6 +46,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(miauth::router())
         .merge(nodus::router())
         .merge(admin::router())
+        .merge(media::router())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             abuse::record,

@@ -21,9 +21,10 @@ use sha2::{Digest, Sha256};
 
 use nodus_server_core::id::Id;
 use nodus_server_core::limits::STATUS_MAX_CHARS;
-use nodus_server_sdk::misskey::api::{Meta, Note, NoteVisibility, User};
+use nodus_server_sdk::misskey::api::{File, Meta, Note, NoteVisibility, User};
 use nodus_server_sdk::misskey::{Aid, Reaction};
 use nodus_server_store::accounts::{self, AccountRow, Authenticated};
+use nodus_server_store::media::{self, MediaRow};
 use nodus_server_store::statuses::{self, StatusRow};
 use nodus_server_store::{events, external_ids};
 
@@ -121,6 +122,7 @@ async fn note_for(state: &AppState, row: &StatusRow, account: &AccountRow) -> Ap
     let id = dialect_id(state, "status", &row.id, row.created_at).await?;
     let user_id = dialect_id(state, "account", &account.id, account.created_at).await?;
     let reactions = statuses::reactions(state.store().pool(), &row.id).await?;
+    let attachments = media::by_status(state.store().pool(), &row.id).await?;
     let reaction_map: BTreeMap<String, u64> = reactions
         .into_iter()
         .map(|entry| {
@@ -177,14 +179,32 @@ async fn note_for(state: &AppState, row: &StatusRow, account: &AccountRow) -> Ap
             .uri
             .clone()
             .or_else(|| Some(state.instance().url(&format!("/notes/{}", row.id)))),
-        file_ids: Vec::new(),
-        files: Vec::new(),
+        file_ids: attachments.iter().map(|file| file.id.clone()).collect(),
+        files: attachments
+            .iter()
+            .map(|file| file_for(state, file))
+            .collect(),
         tags: Vec::new(),
         poll: None,
         emojis: BTreeMap::new(),
         channel_id: None,
         is_hidden: row.visibility != "public",
     })
+}
+
+fn file_for(state: &AppState, row: &MediaRow) -> File {
+    let url = state.instance().url(&format!("/media/{}", row.id));
+    File {
+        id: row.id.clone(),
+        name: None,
+        kind: Some(row.content_type.clone()),
+        mime_type: Some(row.content_type.clone()),
+        url: url.clone(),
+        thumbnail_url: Some(url),
+        size: u64::try_from(row.size).unwrap_or_default(),
+        is_sensitive: row.sensitive,
+        blurhash: row.blurhash.clone(),
+    }
 }
 
 fn visibility_out(visibility: &str) -> NoteVisibility {
@@ -400,6 +420,8 @@ struct CreateNoteBody {
     reply_id: Option<String>,
     #[serde(default)]
     renote_id: Option<String>,
+    #[serde(default, alias = "fileIds")]
+    file_ids: Vec<String>,
 }
 
 async fn create_note(
@@ -407,6 +429,15 @@ async fn create_note(
     Json(body): Json<CreateNoteBody>,
 ) -> ApiResult<Json<Note>> {
     let auth = authenticate(&state, body.i.as_deref()).await?;
+    let attachments = media::by_ids(state.store().pool(), &body.file_ids).await?;
+    if attachments.len() != body.file_ids.len()
+        || attachments
+            .iter()
+            .any(|attachment| attachment.account_id != auth.account.id)
+    {
+        return Err(ApiError::unprocessable("Unknown file id"));
+    }
+    let media_sensitive = attachments.iter().any(|attachment| attachment.sensitive);
     let renote_internal = match body.renote_id.as_deref() {
         Some(external) => {
             let local = external_ids::resolve(state.store().pool(), "status", external)
@@ -452,7 +483,7 @@ async fn create_note(
             content_format: "mfm",
             spoiler_text: &cw,
             visibility: visibility_in(body.visibility),
-            sensitive: body.sensitive,
+            sensitive: body.sensitive || media_sensitive,
             in_reply_to_id: reply_internal.as_deref(),
             in_reply_to_account_id: reply_account.as_deref(),
             reblog_of_id: renote_internal.as_deref(),
@@ -460,6 +491,15 @@ async fn create_note(
         },
     )
     .await?;
+    if !body.file_ids.is_empty() {
+        media::attach(
+            state.store().pool(),
+            &body.file_ids,
+            &auth.account.id,
+            &row.id,
+        )
+        .await?;
+    }
     events::append(
         state.store().pool(),
         "timeline:local",

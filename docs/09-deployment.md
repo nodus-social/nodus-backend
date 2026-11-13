@@ -228,12 +228,15 @@ NODUS_DATABASE_URL=postgres://nodus:nodus@localhost/nodus \
 NODUS_DOMAIN=social.example \
 NODUS_BASE_URL=https://social.example \
 NODUS_BIND=0.0.0.0:3000 \
+NODUS_MEDIA_DIR=/srv/nodus/media \
 cargo run -p nodus-server
 ```
 
 It runs migrations on startup, then serves the ActivityPub documents, the
 Mastodon-compatible client API and the auth/OAuth routes from one listener.
-`--migrate-only` applies migrations and exits.
+`--migrate-only` applies migrations and exits. Uploaded bytes are stored in
+`NODUS_MEDIA_DIR` (default `./media`); in a split deployment every API process
+needs the same object store, not a per-container directory.
 
 Set these three variables once to create the first local login:
 

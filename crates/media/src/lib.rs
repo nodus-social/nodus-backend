@@ -156,6 +156,8 @@ pub enum Error {
     Quality,
     #[error("lossless media is not allowed for this account")]
     LosslessNotAllowed,
+    #[error("the upload is not a decodable image")]
+    Image,
 }
 
 /// Which lossless layers an account is permitted to request.
@@ -427,5 +429,58 @@ mod tests {
     #[test]
     fn empty_dimensions_are_rejected() {
         assert_eq!(plan(0, 10, false), Err(Error::EmptyDimensions));
+    }
+}
+
+/// A generated placeholder and the source dimensions that clients need for layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preview {
+    pub blurhash: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Decodes an uploaded image and produces a blurhash placeholder.
+///
+/// This runs on the unmodified upload, before any preview is generated, so a
+/// post can render its placeholder while the worker is still re-encoding.
+pub fn blurhash(bytes: &[u8]) -> Result<Preview, Error> {
+    let source = image::load_from_memory(bytes).map_err(|_| Error::Image)?;
+    let (width, height) = (source.width(), source.height());
+    if width == 0 || height == 0 {
+        return Err(Error::EmptyDimensions);
+    }
+    let small = source.resize(32, 32, image::imageops::FilterType::Triangle);
+    let rgba = small.to_rgba8();
+    let hash = blurhash::encode(4, 3, rgba.width(), rgba.height(), &rgba.into_raw())
+        .map_err(|_| Error::Image)?;
+    Ok(Preview {
+        blurhash: hash,
+        width,
+        height,
+    })
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn an_image_gets_a_placeholder_and_its_source_dimensions() {
+        let image = image::RgbaImage::from_pixel(8, 4, image::Rgba([220, 30, 90, 255]));
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("png");
+        let preview = blurhash(png.into_inner().as_slice()).expect("blurhash");
+        assert!((4..=120).contains(&preview.blurhash.len()));
+        assert_eq!((preview.width, preview.height), (8, 4));
+    }
+
+    #[test]
+    fn a_non_image_is_rejected() {
+        assert_eq!(blurhash(b"not an image"), Err(Error::Image));
     }
 }

@@ -11,6 +11,7 @@ use nodus_server_core::limits::{
     IMAGE_SIZE_LIMIT, MEDIA_MAX_ATTACHMENTS, STATUS_MAX_CHARS, URL_RESERVED_CHARS, VIDEO_SIZE_LIMIT,
 };
 use nodus_server_store::accounts::AccountRow;
+use nodus_server_store::media::MediaRow;
 use nodus_server_store::statuses::StatusRow;
 
 use crate::state::InstanceConfig;
@@ -112,7 +113,7 @@ pub struct StatusDto {
     pub content_source: Option<String>,
     pub reblog: Option<Box<Self>>,
     pub account: AccountDto,
-    pub media_attachments: Vec<serde_json::Value>,
+    pub media_attachments: Vec<MediaAttachmentDto>,
     pub mentions: Vec<serde_json::Value>,
     pub tags: Vec<serde_json::Value>,
     pub card: Option<serde_json::Value>,
@@ -122,6 +123,66 @@ pub struct StatusDto {
     pub reblogged: bool,
     pub muted: bool,
     pub bookmarked: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MediaAttachmentDto {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub url: String,
+    pub preview_url: String,
+    pub remote_url: Option<String>,
+    pub text_url: Option<String>,
+    pub meta: serde_json::Value,
+    pub description: Option<String>,
+    pub blurhash: Option<String>,
+    pub sensitive: bool,
+}
+
+impl MediaAttachmentDto {
+    #[must_use]
+    pub fn from_row(row: &MediaRow, instance: &InstanceConfig) -> Self {
+        let url = instance.url(&format!("/media/{}", row.id));
+        let kind = match row.content_type.as_str() {
+            "image/gif" => "gifv",
+            "video/mp4" | "video/webm" | "video/quicktime" | "video/ogg" => "video",
+            "audio/mpeg" | "audio/ogg" | "audio/wav" => "audio",
+            content_type if content_type.starts_with("image/") => "image",
+            _ => "unknown",
+        };
+        let mut original = serde_json::Map::new();
+        original.insert(
+            "size".to_owned(),
+            serde_json::json!(format!(
+                "{}x{}",
+                row.width.unwrap_or(0),
+                row.height.unwrap_or(0)
+            )),
+        );
+        original.insert("width".to_owned(), serde_json::json!(row.width));
+        original.insert("height".to_owned(), serde_json::json!(row.height));
+        original.insert(
+            "aspect".to_owned(),
+            serde_json::json!(match (row.width, row.height) {
+                (Some(width), Some(height)) if height > 0 => f64::from(width) / f64::from(height),
+                _ => 1.0,
+            }),
+        );
+        original.insert("size_bytes".to_owned(), serde_json::json!(row.size));
+        Self {
+            id: row.id.clone(),
+            kind: kind.to_owned(),
+            url: url.clone(),
+            preview_url: url,
+            remote_url: None,
+            text_url: None,
+            meta: serde_json::json!({ "original": original }),
+            description: (!row.description.is_empty()).then(|| row.description.clone()),
+            blurhash: row.blurhash.clone(),
+            sensitive: row.sensitive,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -135,6 +196,17 @@ impl StatusDto {
     /// clients use `uri` as the stable identity and `url` as the human page.
     #[must_use]
     pub fn from_row(row: &StatusRow, account: &AccountRow, instance: &InstanceConfig) -> Self {
+        Self::from_row_with_media(row, account, instance, &[])
+    }
+
+    /// Builds a status with its already-loaded attachments.
+    #[must_use]
+    pub fn from_row_with_media(
+        row: &StatusRow,
+        account: &AccountRow,
+        instance: &InstanceConfig,
+        media: &[MediaRow],
+    ) -> Self {
         let url = instance.url(&format!("/@{}/{}", account.username, row.id));
         Self {
             id: row.id.clone(),
@@ -156,7 +228,10 @@ impl StatusDto {
             content_source: row.content_source.clone(),
             reblog: None,
             account: AccountDto::from_row(account, instance),
-            media_attachments: Vec::new(),
+            media_attachments: media
+                .iter()
+                .map(|row| MediaAttachmentDto::from_row(row, instance))
+                .collect(),
             mentions: Vec::new(),
             tags: Vec::new(),
             card: None,

@@ -19,7 +19,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use nodus_server_core::PageParams;
-use nodus_server_sdk::activitypub::{Activity, Actor, Collection, CollectionPage, Note, Webfinger};
+use nodus_server_sdk::activitypub::{
+    Activity, Actor, Attachment, Collection, CollectionPage, Note, Webfinger,
+};
 use nodus_server_store::accounts::{self, AccountRow};
 use nodus_server_store::statuses::{self, StatusRow};
 
@@ -289,6 +291,24 @@ async fn note_document(state: &AppState, row: &StatusRow, account: &AccountRow) 
         ),
         _ => return Err(ApiError::not_found("Record not found")),
     };
+    let media = nodus_server_store::media::by_status(state.store().pool(), &row.id).await?;
+    let attachments = media
+        .iter()
+        .map(|media| Attachment {
+            kind: if media.content_type.starts_with("video/") {
+                "Video".to_owned()
+            } else if media.content_type.starts_with("image/") {
+                "Image".to_owned()
+            } else {
+                "Document".to_owned()
+            },
+            url: state.instance().url(&format!("/media/{}", media.id)),
+            preview_url: Some(state.instance().url(&format!("/media/{}", media.id))),
+            description: (!media.description.is_empty()).then(|| media.description.clone()),
+            width: media.width.and_then(|value| u32::try_from(value).ok()),
+            height: media.height.and_then(|value| u32::try_from(value).ok()),
+        })
+        .collect();
     Ok(Note {
         id: id.clone(),
         url: state
@@ -298,7 +318,7 @@ async fn note_document(state: &AppState, row: &StatusRow, account: &AccountRow) 
         published: row.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
         sensitive: row.sensitive,
         summary: row.spoiler_text.clone(),
-        attachments: Vec::new(),
+        attachments,
         emojis: Vec::new(),
         in_reply_to: parent,
         replies: Some(format!("{id}/replies")),

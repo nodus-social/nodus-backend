@@ -9,6 +9,8 @@ publish = false
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+blurhash = "0.2.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 [lints]
 workspace = true

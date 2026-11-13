@@ -73,6 +73,16 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
+impl From<std::io::Error> for ApiError {
+    fn from(error: std::io::Error) -> Self {
+        tracing::error!(error = %error, "media storage error");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong on our side",
+        )
+    }
+}
+
 /// Result alias used by handlers.
 pub type ApiResult<T> = Result<T, ApiError>;
 

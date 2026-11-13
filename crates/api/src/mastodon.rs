@@ -187,13 +187,25 @@ async fn timeline_response(
     // The account of each status is loaded per row for now; one join in the page query
     // will replace this once the profile fields the DTO needs are settled.
     let mut items = Vec::with_capacity(rows.len());
+    let status_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let media = nodus_server_store::media::by_statuses(state.store().pool(), &status_ids).await?;
     for row in rows {
         let Some(account) =
             nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id).await?
         else {
             continue;
         };
-        items.push(StatusDto::from_row(&row, &account, instance));
+        let attachments: Vec<_> = media
+            .iter()
+            .filter(|attachment| attachment.status_id.as_deref() == Some(row.id.as_str()))
+            .cloned()
+            .collect();
+        items.push(StatusDto::from_row_with_media(
+            &row,
+            &account,
+            instance,
+            &attachments,
+        ));
     }
 
     let mut response = Json(items).into_response();

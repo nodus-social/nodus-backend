@@ -12,6 +12,7 @@ axum = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 nodus-server-core = { workspace = true }
+nodus-server-media = { workspace = true }
 nodus-server-store = { workspace = true }
 nodus-auth = { path = "../auth" }
 axum-extra = { workspace = true }
