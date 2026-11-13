@@ -19,13 +19,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use nodus_server_core::PageParams;
+use nodus_server_sdk::activitypub::ActivityPub;
 use nodus_server_sdk::activitypub::{
     Activity, ActivityKind, ActivityObject, Actor, Attachment, Collection, CollectionPage, Note,
     Webfinger,
 };
 use nodus_server_sdk::federation::signature::crypto::{body_digest, RsaVerifier};
 use nodus_server_sdk::federation::signature::{HttpSignature, Verifier};
-use nodus_server_sdk::activitypub::ActivityPub;
 use nodus_server_store::accounts::{self, AccountRow};
 use nodus_server_store::statuses::{self, StatusRow};
 
@@ -287,8 +287,8 @@ async fn verify_signature(
         .get("signature")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| ApiError::unauthorized("Missing HTTP signature"))?;
-    let signature = HttpSignature::parse(raw)
-        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
+    let signature =
+        HttpSignature::parse(raw).map_err(|error| ApiError::unauthorized(error.to_string()))?;
     if let Some(digest) = headers.get("digest").and_then(|value| value.to_str().ok()) {
         if digest != body_digest(body) {
             return Err(ApiError::unauthorized("Body digest does not match"));
@@ -297,11 +297,19 @@ async fn verify_signature(
     if let Some(date) = headers.get("date").and_then(|value| value.to_str().ok()) {
         let parsed = chrono::DateTime::parse_from_rfc2822(date)
             .map_err(|_| ApiError::unauthorized("Invalid Date header"))?;
-        if (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_minutes().abs() > 5 {
+        if (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
+            .num_minutes()
+            .abs()
+            > 5
+        {
             return Err(ApiError::unauthorized("Signature is stale"));
         }
     }
-    let key_actor = signature.key_id.split('#').next().unwrap_or(&signature.key_id);
+    let key_actor = signature
+        .key_id
+        .split('#')
+        .next()
+        .unwrap_or(&signature.key_id);
     let actor = ActivityPub::new()
         .actor_url(key_actor)
         .await
@@ -415,41 +423,23 @@ async fn local_target(state: &AppState, actor_url: &str) -> ApiResult<Option<Acc
         return Ok(None);
     }
     let username = actor_url.rsplit('/').next().unwrap_or_default();
-    accounts::local_by_username(state.store().pool(), username).await.map_err(Into::into)
+    accounts::local_by_username(state.store().pool(), username)
+        .await
+        .map_err(Into::into)
 }
 
-async fn follow_local(
-    state: &AppState,
-    remote: &AccountRow,
-    target: &str,
-) -> ApiResult<()> {
+async fn follow_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiResult<()> {
     let Some(local) = local_target(state, target).await? else {
         return Ok(());
     };
-    nodus_server_store::social::follow(
-        state.store().pool(),
-        &remote.id,
-        &local.id,
-        true,
-        false,
-    )
-    .await?;
-    nodus_server_store::social::notify(
-        state.store().pool(),
-        &local.id,
-        "follow",
-        &remote.id,
-        None,
-    )
-    .await?;
+    nodus_server_store::social::follow(state.store().pool(), &remote.id, &local.id, true, false)
+        .await?;
+    nodus_server_store::social::notify(state.store().pool(), &local.id, "follow", &remote.id, None)
+        .await?;
     Ok(())
 }
 
-async fn unfollow_local(
-    state: &AppState,
-    remote: &AccountRow,
-    target: &str,
-) -> ApiResult<()> {
+async fn unfollow_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiResult<()> {
     if let Some(local) = local_target(state, target).await? {
         nodus_server_store::social::unfollow(state.store().pool(), &remote.id, &local.id).await?;
     }
@@ -457,14 +447,16 @@ async fn unfollow_local(
 }
 
 async fn ingest_note(state: &AppState, remote: &AccountRow, value: &Value) -> ApiResult<()> {
-    let note = Note::from_json(value)
-        .map_err(|error| ApiError::unprocessable(error.to_string()))?;
+    let note =
+        Note::from_json(value).map_err(|error| ApiError::unprocessable(error.to_string()))?;
     let parent = match &note.in_reply_to {
         Some(uri) => statuses::by_uri(state.store().pool(), uri).await?,
         None => None,
     };
-    let created_at = chrono::DateTime::parse_from_rfc3339(&note.published)
-        .map_or_else(|_| chrono::Utc::now(), |date| date.with_timezone(&chrono::Utc));
+    let created_at = chrono::DateTime::parse_from_rfc3339(&note.published).map_or_else(
+        |_| chrono::Utc::now(),
+        |date| date.with_timezone(&chrono::Utc),
+    );
     statuses::upsert_remote(
         state.store().pool(),
         &statuses::NewRemoteStatus {

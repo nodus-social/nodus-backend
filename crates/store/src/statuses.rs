@@ -63,9 +63,8 @@ pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<StatusRow>, sqlx::E
 
 /// One status by its canonical `ActivityPub` URI.
 pub async fn by_uri(pool: &PgPool, uri: &str) -> Result<Option<StatusRow>, sqlx::Error> {
-    let sql = format!(
-        "SELECT {STATUS_COLUMNS} FROM status s WHERE s.uri = $1 AND s.deleted_at IS NULL"
-    );
+    let sql =
+        format!("SELECT {STATUS_COLUMNS} FROM status s WHERE s.uri = $1 AND s.deleted_at IS NULL");
     sqlx::query_as::<_, StatusRow>(&sql)
         .bind(uri)
         .fetch_optional(pool)
@@ -118,14 +117,14 @@ pub async fn upsert_remote(
 
 /// Soft-deletes a remote status by URI.
 pub async fn delete_remote(pool: &PgPool, uri: &str) -> Result<bool, sqlx::Error> {
-    Ok(sqlx::query(
-        "UPDATE status SET deleted_at = now() WHERE uri = $1 AND deleted_at IS NULL",
+    Ok(
+        sqlx::query("UPDATE status SET deleted_at = now() WHERE uri = $1 AND deleted_at IS NULL")
+            .bind(uri)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1,
     )
-    .bind(uri)
-    .execute(pool)
-    .await?
-    .rows_affected()
-        == 1)
 }
 
 /// `/api/v1/timelines/public`: public visibility only.

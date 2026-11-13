@@ -37,6 +37,7 @@ pub struct AccountRow {
     pub discoverable: bool,
     pub indexable: bool,
     pub admin: bool,
+    pub approved: bool,
     pub lossless_images_default: bool,
     pub lossless_videos_default: bool,
     pub lossless_images_allowed: bool,
@@ -46,20 +47,21 @@ pub struct AccountRow {
     pub statuses_count: i64,
     pub last_status_at: Option<DateTime<Utc>>,
     pub suspended_at: Option<DateTime<Utc>>,
+    pub silenced_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
 const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS username, a.domain::text AS domain, \
      a.display_name, a.note, a.avatar_ref, a.header_ref, a.fields, a.locked, a.bot, a.local, a.uri, \
-     a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, \
+     a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.approved, \
      a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
-     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.created_at";
+     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.created_at";
 
 const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
      display_name, note, avatar_ref, header_ref, fields, locked, bot, local, uri, \
-     inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, \
+     inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, approved, \
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \
-     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, created_at";
+     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, created_at";
 
 /// A token verified against an account.
 #[derive(Debug, Clone, FromRow)]
@@ -94,7 +96,8 @@ pub async fn verify_token(
     let sql = format!(
         "SELECT {ACCOUNT_COLUMNS_ALIASED}, t.scopes FROM oauth_token t \
          JOIN account a ON a.id = t.account_id \
-         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND a.suspended_at IS NULL"
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND a.suspended_at IS NULL \
+           AND a.approved"
     );
     let row = sqlx::query_as::<_, Authenticated>(&sql)
         .bind(token_hash)

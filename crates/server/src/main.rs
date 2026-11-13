@@ -129,7 +129,7 @@ async fn provision_bootstrap(store: &Store, bootstrap: &Bootstrap) -> Result<(),
 
     accounts::set_admin(store.pool(), &account.id, true).await?;
     let auth = PgAuthStore::new(store.pool().clone());
-    if auth.has_credential(&bootstrap.email).await? {
+    if auth.has_credential_for_account(&account.id).await? {
         tracing::info!(username = %account.username, "bootstrap user already has a login");
         return Ok(());
     }

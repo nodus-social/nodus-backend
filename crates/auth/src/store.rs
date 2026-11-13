@@ -143,6 +143,17 @@ impl PgAuthStore {
                 .await?;
         Ok(exists)
     }
+
+    /// Whether an account already has a password login.
+    pub async fn has_credential_for_account(&self, account_id: &str) -> Result<bool, Error> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM account_credential WHERE account_id = $1)",
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
 }
 
 impl AuthStore for PgAuthStore {

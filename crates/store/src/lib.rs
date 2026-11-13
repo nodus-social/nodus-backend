@@ -12,6 +12,7 @@ pub mod events;
 pub mod external_ids;
 pub mod jobs;
 pub mod media;
+pub mod moderation;
 pub mod social;
 pub mod statuses;
 
