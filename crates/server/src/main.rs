@@ -9,11 +9,13 @@
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::Router;
 use nodus_auth::store::PgAuthStore;
 use nodus_server_api::{AppState, InstanceConfig};
-use nodus_server_store::Store;
+use nodus_server_store::{media, Store};
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
 const DEFAULT_DATABASE_URL: &str = "postgres://nodus:nodus@localhost/nodus";
@@ -139,6 +141,45 @@ async fn provision_bootstrap(store: &Store, bootstrap: &Bootstrap) -> Result<(),
     Ok(())
 }
 
+fn media_dir() -> PathBuf {
+    std::env::var_os("NODUS_MEDIA_DIR").map_or_else(|| PathBuf::from("./media"), PathBuf::from)
+}
+
+fn variants_dir() -> PathBuf {
+    std::env::var_os("NODUS_MEDIA_VARIANTS_DIR")
+        .map_or_else(|| media_dir().join("variants"), PathBuf::from)
+}
+
+async fn prune_media(store: &Store) {
+    let pool = store.pool();
+    match media::delete_expired_variants(pool).await {
+        Ok(digests) => {
+            for digest in digests {
+                if !media::variant_digest_referenced(pool, &digest)
+                    .await
+                    .unwrap_or(true)
+                {
+                    let _ = tokio::fs::remove_file(variants_dir().join(&digest)).await;
+                }
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not prune media variants"),
+    }
+    match media::expired_originals(pool).await {
+        Ok(digests) => {
+            for digest in digests {
+                if !media::original_digest_referenced(pool, &digest)
+                    .await
+                    .unwrap_or(true)
+                {
+                    let _ = tokio::fs::remove_file(media_dir().join(&digest)).await;
+                }
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not prune media originals"),
+    }
+}
+
 async fn shutdown() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
@@ -179,6 +220,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     store.migrate().await?;
     if let Some(bootstrap) = &config.bootstrap {
         provision_bootstrap(&store, bootstrap).await?;
+    }
+    {
+        let store = store.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                ticker.tick().await;
+                prune_media(&store).await;
+            }
+        });
     }
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(

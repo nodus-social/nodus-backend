@@ -138,12 +138,15 @@ pub struct MediaAttachmentDto {
     pub description: Option<String>,
     pub blurhash: Option<String>,
     pub sensitive: bool,
+    pub processing_state: String,
+    pub processing_progress: i16,
 }
 
 impl MediaAttachmentDto {
     #[must_use]
     pub fn from_row(row: &MediaRow, instance: &InstanceConfig) -> Self {
-        let url = instance.url(&format!("/media/{}", row.id));
+        let url = instance.url(&format!("/media/{}/compressed", row.id));
+        let preview_url = instance.url(&format!("/media/{}/preview", row.id));
         let kind = match row.content_type.as_str() {
             "image/gif" => "gifv",
             "video/mp4" | "video/webm" | "video/quicktime" | "video/ogg" => "video",
@@ -173,14 +176,16 @@ impl MediaAttachmentDto {
         Self {
             id: row.id.clone(),
             kind: kind.to_owned(),
-            url: url.clone(),
-            preview_url: url,
+            url,
+            preview_url,
             remote_url: None,
             text_url: None,
             meta: serde_json::json!({ "original": original }),
             description: (!row.description.is_empty()).then(|| row.description.clone()),
             blurhash: row.blurhash.clone(),
             sensitive: row.sensitive,
+            processing_state: row.processing_state.clone(),
+            processing_progress: row.processing_progress,
         }
     }
 }

@@ -101,11 +101,15 @@ transcoded with GStreamer to multi-resolution WebM. Lossless originals are kept
 only on request (per upload, or an account default split between images and
 videos):
 
-- upload writes a `media_attachment` row and a `media_process` job;
-- any media worker can claim the job, fetch the object, produce variants, write
-  blurhash and update the row;
-- blobs are keyed by SHA-256, so duplicate uploads converge on one object;
-- the API serves URLs from object storage or a caching proxy, not from the worker.
+- upload writes a `media_attachment` row, generates blurhash, and starts the
+  processor;
+- the monolith processes variants in-process; every API replica needs its own
+  `ffmpeg`/`ffprobe` today (`NODUS_FFMPEG`, `NODUS_FFPROBE`);
+- variant files live under `NODUS_MEDIA_VARIANTS_DIR` (default
+  `NODUS_MEDIA_DIR/variants`), keyed by SHA-256;
+- `GET /api/v1/media/{id}` reports `pending|processing|ready|failed` and progress;
+- the hourly prune task removes expired compressed variants and unrequested
+  originals after the 24h lossless window.
 
 ### CDN cache
 
@@ -229,6 +233,7 @@ NODUS_DOMAIN=social.example \
 NODUS_BASE_URL=https://social.example \
 NODUS_BIND=0.0.0.0:3000 \
 NODUS_MEDIA_DIR=/srv/nodus/media \
+NODUS_MEDIA_VARIANTS_DIR=/srv/nodus/media/variants \
 cargo run -p nodus-server
 ```
 

@@ -11,6 +11,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod process;
+
 /// The three cache layers, cheapest and longest-lived first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +160,12 @@ pub enum Error {
     LosslessNotAllowed,
     #[error("the upload is not a decodable image")]
     Image,
+    #[error("media processing failed: {0}")]
+    Io(String),
+    #[error("encoder failed: {0}")]
+    Process(String),
+    #[error("this layer has no encoder")]
+    Unsupported,
 }
 
 /// Which lossless layers an account is permitted to request.
