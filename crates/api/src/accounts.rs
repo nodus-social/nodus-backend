@@ -98,39 +98,29 @@ async fn follow_list(
 ) -> ApiResult<Response> {
     let params = query.params()?;
     let size = PageSize::clamp(params.limit, nodus_server_core::limits::PAGE_MAX_ACCOUNTS);
-    let rows = nodus_server_store::accounts::follow_page(
-        state.store().pool(),
-        &id,
-        followers,
-        params.max_id.map(|id| id.to_string()).as_deref(),
-        i64::from(size.get()) + 1,
-    )
-    .await?;
-    let next = rows
-        .get(size.get() as usize)
-        .map(|_| rows[size.get() as usize - 1].id.clone());
-    let items: Vec<_> = rows
-        .into_iter()
-        .take(size.get() as usize)
-        .map(|row| AccountDto::from_row(&row, state.instance()))
+    let page =
+        nodus_server_store::accounts::follow_page(state.store().pool(), &id, followers, params)
+            .await?;
+    let items: Vec<_> = page
+        .items
+        .iter()
+        .map(|row| AccountDto::from_row(row, state.instance()))
         .collect();
-    if let Some(next) = next {
+    let mut response = Json(items).into_response();
+    if let Some(next) = page.next_max_id {
         let path = format!(
             "/api/v1/accounts/{id}/{}",
             if followers { "followers" } else { "following" }
         );
-        let link = params.next_link(&path, next.parse().ok(), size);
-        let mut response = Json(items).into_response();
-        if let Some(link) = link {
+        if let Some(link) = params.next_link(&path, next.parse().ok(), size) {
             if let Ok(value) = HeaderValue::from_str(&link) {
                 response
                     .headers_mut()
                     .insert(axum::http::header::LINK, value);
             }
         }
-        return Ok(response);
     }
-    Ok(Json(items).into_response())
+    Ok(response)
 }
 
 pub async fn follow(

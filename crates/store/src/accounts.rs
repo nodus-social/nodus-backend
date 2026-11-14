@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool};
 
-use nodus_server_core::Id;
+use nodus_server_core::limits::PAGE_MAX_ACCOUNTS;
+use nodus_server_core::{Id, PageOrder, PageParams, PageSize};
 
 /// A row of `account`, with `citext` cast to `text`.
 ///
@@ -320,36 +321,66 @@ pub async fn set_lossless_permissions(
     Ok(result.rows_affected() == 1)
 }
 
-/// Followers or following, newest follow edge first. Full account rows so the API can
-/// reuse `AccountDto` without a second query per row.
+/// A page of accounts from a follow list, with the `follow.id` cursor for the next page.
+#[derive(Debug, Clone)]
+pub struct FollowPage {
+    pub items: Vec<AccountRow>,
+    pub next_max_id: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct FollowAccountRow {
+    follow_id: String,
+    #[sqlx(flatten)]
+    account: AccountRow,
+}
+
+/// Followers or following, ordered by the follow edge id (`f.id`). Full account rows so
+/// the API can reuse `AccountDto` without a second query per row.
 pub async fn follow_page(
     pool: &PgPool,
     account_id: &str,
     followers: bool,
-    max_id: Option<&str>,
-    limit: i64,
-) -> Result<Vec<AccountRow>, sqlx::Error> {
-    let sql = if followers {
-        format!(
-            "SELECT {ACCOUNT_COLUMNS_ALIASED} FROM follow f JOIN account a ON a.id = f.account_id \
-              WHERE f.target_account_id = $1 AND f.state = 'accepted' \
-                AND ($2::text IS NULL OR f.id < $2) \
-              ORDER BY f.id DESC LIMIT $3"
-        )
-    } else {
-        format!(
-            "SELECT {ACCOUNT_COLUMNS_ALIASED} FROM follow f JOIN account a ON a.id = f.target_account_id \
-              WHERE f.account_id = $1 AND f.state = 'accepted' \
-                AND ($2::text IS NULL OR f.id < $2) \
-              ORDER BY f.id DESC LIMIT $3"
-        )
+    params: PageParams,
+) -> Result<FollowPage, sqlx::Error> {
+    let size = PageSize::clamp(params.limit, PAGE_MAX_ACCOUNTS);
+    let max_id = params.max_id.map(|id| id.to_string());
+    let lower_id = params.lower_bound().map(|id| id.to_string());
+    let order = match params.order() {
+        PageOrder::NewestFirst => "DESC",
+        PageOrder::OldestFirst => "ASC",
     };
-    sqlx::query_as::<_, AccountRow>(&sql)
+    let (join_col, filter_col) = if followers {
+        ("f.account_id", "f.target_account_id")
+    } else {
+        ("f.target_account_id", "f.account_id")
+    };
+    let sql = format!(
+        "SELECT f.id AS follow_id, {ACCOUNT_COLUMNS_ALIASED} \
+           FROM follow f JOIN account a ON a.id = {join_col} \
+          WHERE {filter_col} = $1 AND f.state = 'accepted' \
+            AND ($2::text IS NULL OR f.id < $2) \
+            AND ($3::text IS NULL OR f.id > $3) \
+          ORDER BY f.id {order} LIMIT $4"
+    );
+    let mut rows = sqlx::query_as::<_, FollowAccountRow>(&sql)
         .bind(account_id)
         .bind(max_id)
-        .bind(limit)
+        .bind(lower_id)
+        .bind(size.as_i64() + 1)
         .fetch_all(pool)
-        .await
+        .await?;
+    let limit = usize::try_from(size.get()).unwrap_or(usize::from(u16::MAX));
+    let next_max_id = if rows.len() > limit {
+        rows.truncate(limit);
+        rows.last().map(|row| row.follow_id.clone())
+    } else {
+        None
+    };
+    Ok(FollowPage {
+        items: rows.into_iter().map(|row| row.account).collect(),
+        next_max_id,
+    })
 }
 
 /// Resolves `user` or `user@domain` to a local account.
