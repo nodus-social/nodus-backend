@@ -135,6 +135,7 @@ async fn actor(State(state): State<AppState>, Path(username): Path<String>) -> A
 #[derive(Debug, Deserialize)]
 struct OutboxQuery {
     page: Option<bool>,
+    max_id: Option<String>,
 }
 
 async fn outbox(
@@ -156,10 +157,18 @@ async fn outbox(
         }));
     }
 
+    let max_id = query
+        .max_id
+        .as_deref()
+        .map(|raw| {
+            raw.parse::<nodus_server_core::Id>()
+                .map_err(|_| ApiError::unprocessable("max_id must be a valid id"))
+        })
+        .transpose()?;
     let page = statuses::account_page(
         state.store().pool(),
         &account.id,
-        PageParams::new().with_limit(Some(20)),
+        PageParams::new().with_max_id(max_id).with_limit(Some(20)),
     )
     .await?;
     let mut items = Vec::with_capacity(page.items.len());
@@ -169,13 +178,17 @@ async fn outbox(
     let next = page
         .next_max_id
         .map(|id| format!("{collection_url}?page=true&max_id={id}"));
+    let page_id = match max_id {
+        Some(id) => format!("{collection_url}?page=true&max_id={id}"),
+        None => format!("{collection_url}?page=true"),
+    };
     Ok(document_response(&OutboxPage {
         value: CollectionPage {
             items,
             next,
             total_items: u64::try_from(account.statuses_count).unwrap_or_default(),
         }
-        .to_json(&format!("{collection_url}?page=true"), &collection_url),
+        .to_json(&page_id, &collection_url),
     }))
 }
 
@@ -658,6 +671,7 @@ fn actor_document(state: &AppState, account: &AccountRow) -> Actor {
         outbox: Some(format!("{actor}/outbox")),
         inbox: Some(format!("{actor}/inbox")),
         shared_inbox: Some(state.instance().url("/inbox")),
+        public_key_id: None,
         public_key_pem: account.public_key_pem.clone(),
         published: Some(
             account

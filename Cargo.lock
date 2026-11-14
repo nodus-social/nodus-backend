@@ -1894,8 +1894,8 @@ name = "nodus-federation"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "nodus-activitypub-core",
- "reqwest",
  "rsa",
  "serde",
  "serde_json",

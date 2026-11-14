@@ -10,7 +10,7 @@ use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
 use nodus_server_core::limits::BIG_ACCOUNT_THRESHOLD;
-use nodus_server_core::{PageParams, PageSize};
+use nodus_server_core::{PageOrder, PageParams, PageSize};
 
 /// A row of `status`, as the timeline queries return it.
 #[derive(Debug, Clone, FromRow)]
@@ -127,6 +127,16 @@ pub async fn delete_remote(pool: &PgPool, uri: &str) -> Result<bool, sqlx::Error
     )
 }
 
+fn page_bounds(params: PageParams) -> (Option<String>, Option<String>, &'static str) {
+    let max_id = params.max_id.map(|id| id.to_string());
+    let lower_id = params.lower_bound().map(|id| id.to_string());
+    let order = match params.order() {
+        PageOrder::NewestFirst => "DESC",
+        PageOrder::OldestFirst => "ASC",
+    };
+    (max_id, lower_id, order)
+}
+
 /// `/api/v1/timelines/public`: public visibility only.
 ///
 /// `local_only` is the default the app asks for (`public:local`); the federated view
@@ -137,6 +147,7 @@ pub async fn public_page(
     local_only: bool,
 ) -> Result<StatusPage, sqlx::Error> {
     let size = PageSize::default_max(params.limit);
+    let (max_id, lower_id, order) = page_bounds(params);
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM status s \
            JOIN account a ON a.id = s.account_id \
@@ -145,11 +156,13 @@ pub async fn public_page(
            AND NOT EXISTS (SELECT 1 FROM instance_block b WHERE b.domain = a.domain \
                            AND b.severity IN ('suspend', 'silence')) \
            AND ($1::text IS NULL OR s.id < $1) \
-           AND (NOT $2 OR s.local) \
-         ORDER BY s.id DESC LIMIT $3"
+           AND ($2::text IS NULL OR s.id > $2) \
+           AND (NOT $3 OR s.local) \
+         ORDER BY s.id {order} LIMIT $4"
     );
     let rows = sqlx::query_as::<_, StatusRow>(&sql)
-        .bind(params.max_id.map(|id| id.to_string()))
+        .bind(max_id)
+        .bind(lower_id)
         .bind(local_only)
         .bind(size.as_i64() + 1)
         .fetch_all(pool)
@@ -168,16 +181,19 @@ pub async fn account_page(
     params: PageParams,
 ) -> Result<StatusPage, sqlx::Error> {
     let size = PageSize::default_max(params.limit);
+    let (max_id, lower_id, order) = page_bounds(params);
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM status s \
          WHERE s.account_id = $1 AND s.deleted_at IS NULL \
            AND s.visibility IN ('public', 'unlisted') \
            AND ($2::text IS NULL OR s.id < $2) \
-         ORDER BY s.id DESC LIMIT $3"
+           AND ($3::text IS NULL OR s.id > $3) \
+         ORDER BY s.id {order} LIMIT $4"
     );
     let rows = sqlx::query_as::<_, StatusRow>(&sql)
         .bind(account_id)
-        .bind(params.max_id.map(|id| id.to_string()))
+        .bind(max_id)
+        .bind(lower_id)
         .bind(size.as_i64() + 1)
         .fetch_all(pool)
         .await?;
@@ -194,6 +210,7 @@ pub async fn home_page(
     params: PageParams,
 ) -> Result<StatusPage, sqlx::Error> {
     let size = PageSize::default_max(params.limit);
+    let (max_id, lower_id, order) = page_bounds(params);
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM timeline_entry e \
            JOIN status s ON s.id = e.status_id \
@@ -203,23 +220,26 @@ pub async fn home_page(
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
             AND ($2::text IS NULL OR s.id < $2) \
+            AND ($3::text IS NULL OR s.id > $3) \
          UNION \
          SELECT {STATUS_COLUMNS} FROM status s \
            JOIN account a ON a.id = s.account_id \
           WHERE s.account_id IN ( \
                   SELECT f.target_account_id FROM follow f \
                     JOIN account a2 ON a2.id = f.target_account_id \
-                   WHERE f.account_id = $1 AND a2.followers_count >= $4) \
+                   WHERE f.account_id = $1 AND a2.followers_count >= $5) \
             AND s.deleted_at IS NULL AND s.visibility <> 'direct' \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
             AND ($2::text IS NULL OR s.id < $2) \
-         ORDER BY id DESC LIMIT $3"
+            AND ($3::text IS NULL OR s.id > $3) \
+         ORDER BY id {order} LIMIT $4"
     );
     let rows = sqlx::query_as::<_, StatusRow>(&sql)
         .bind(account_id)
-        .bind(params.max_id.map(|id| id.to_string()))
+        .bind(max_id)
+        .bind(lower_id)
         .bind(size.as_i64() + 1)
         .bind(BIG_ACCOUNT_THRESHOLD)
         .fetch_all(pool)

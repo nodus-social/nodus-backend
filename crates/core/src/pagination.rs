@@ -118,19 +118,22 @@ impl PageParams {
         }
     }
 
+    /// The exclusive lower bound (`id > bound`), when `since_id` or `min_id` is set.
+    #[must_use]
+    pub fn lower_bound(self) -> Option<Id> {
+        self.since_id.or(self.min_id)
+    }
+
     /// The exclusive bound to filter on, and whether it is an upper bound.
     ///
-    /// `since_id` and `max_id` are both upper bounds; the difference is only how many
-    /// rows the limit is applied to (from the top vs. the newest `limit`).
+    /// `max_id` is an upper bound (`id < max_id`); `since_id` and `min_id` are lower
+    /// bounds (`id > bound`).
     #[must_use]
     pub fn bound(self) -> Option<(Id, bool)> {
         if let Some(id) = self.max_id {
             return Some((id, true));
         }
-        if let Some(id) = self.since_id {
-            return Some((id, true));
-        }
-        self.min_id.map(|id| (id, false))
+        self.lower_bound().map(|id| (id, false))
     }
 
     /// The `Link: <…>; rel="next"` a client uses to continue, or `None` on the last
@@ -218,5 +221,14 @@ mod tests {
             Some((id, false))
         );
         assert_eq!(PageParams::new().bound(), None);
+    }
+
+    #[test]
+    fn since_id_is_a_lower_bound() {
+        let id = Id::new();
+        assert_eq!(
+            PageParams::new().with_since_id(Some(id)).bound(),
+            Some((id, false))
+        );
     }
 }

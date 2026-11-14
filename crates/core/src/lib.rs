@@ -13,5 +13,5 @@ pub mod visibility;
 
 pub use content::ContentFormat;
 pub use id::Id;
-pub use pagination::{PageParams, PageSize};
+pub use pagination::{PageOrder, PageParams, PageSize};
 pub use visibility::Visibility;
