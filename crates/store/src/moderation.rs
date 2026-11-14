@@ -10,7 +10,7 @@ use sqlx::{FromRow, PgPool};
 
 use nodus_server_core::Id;
 
-use crate::accounts::AccountRow;
+use crate::accounts::{AccountRow, ACCOUNT_COLUMNS, ACCOUNT_COLUMNS_ALIASED};
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ReportRow {
@@ -260,17 +260,18 @@ pub async fn admin_accounts(
     pending: bool,
     limit: i64,
 ) -> Result<Vec<AdminAccountRow>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT a.*, c.email::text AS email FROM account a \
+    let sql = format!(
+        "SELECT {ACCOUNT_COLUMNS_ALIASED}, c.email::text AS email FROM account a \
          LEFT JOIN account_credential c ON c.account_id = a.id \
          WHERE ($1 = false OR a.local) AND ($2 = false OR (a.local AND NOT a.approved)) \
-         ORDER BY a.created_at DESC LIMIT $3",
-    )
-    .bind(local)
-    .bind(pending)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
+         ORDER BY a.created_at DESC LIMIT $3"
+    );
+    sqlx::query_as(&sql)
+        .bind(local)
+        .bind(pending)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,19 +301,16 @@ pub async fn apply_action(
     account_id: &str,
     action: Action,
 ) -> Result<Option<AccountRow>, sqlx::Error> {
-    let sql = match action {
+    let set_clause = match action {
         Action::Approve | Action::Enable => {
-            "UPDATE account SET approved = true, silenced_at = NULL, suspended_at = NULL \
-             WHERE id = $1 RETURNING *"
+            "approved = true, silenced_at = NULL, suspended_at = NULL"
         }
-        Action::Reject => "UPDATE account SET approved = false WHERE id = $1 RETURNING *",
-        Action::Silence => {
-            "UPDATE account SET silenced_at = now(), suspended_at = NULL \
-             WHERE id = $1 RETURNING *"
-        }
-        Action::Suspend => "UPDATE account SET suspended_at = now() WHERE id = $1 RETURNING *",
+        Action::Reject => "approved = false",
+        Action::Silence => "silenced_at = now(), suspended_at = NULL",
+        Action::Suspend => "suspended_at = now()",
     };
-    sqlx::query_as::<_, AccountRow>(sql)
+    let sql = format!("UPDATE account SET {set_clause} WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}");
+    sqlx::query_as::<_, AccountRow>(&sql)
         .bind(account_id)
         .fetch_optional(pool)
         .await

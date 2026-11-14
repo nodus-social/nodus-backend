@@ -52,13 +52,13 @@ pub struct AccountRow {
     pub created_at: DateTime<Utc>,
 }
 
-const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS username, a.domain::text AS domain, \
+pub(crate) const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS username, a.domain::text AS domain, \
      a.display_name, a.note, a.avatar_ref, a.header_ref, a.fields, a.locked, a.bot, a.local, a.uri, \
      a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.approved, \
      a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
      a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.created_at";
 
-const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
+pub(crate) const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
      display_name, note, avatar_ref, header_ref, fields, locked, bot, local, uri, \
      inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, approved, \
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \

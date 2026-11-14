@@ -236,6 +236,32 @@ async fn process_upload(
     plan: Vec<VariantSpec>,
     lossless: bool,
 ) {
+    process_upload_in(
+        pool,
+        id,
+        source,
+        source_digest,
+        source_content_type,
+        kind,
+        plan,
+        lossless,
+        &variants_dir(),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_upload_in(
+    pool: PgPool,
+    id: String,
+    source: PathBuf,
+    source_digest: String,
+    source_content_type: String,
+    kind: Kind,
+    plan: Vec<VariantSpec>,
+    lossless: bool,
+    variant_dir: &std::path::Path,
+) {
     if let Err(error) = media::set_processing(&pool, &id, "processing", 5, None).await {
         tracing::error!(%error, %id, "could not mark media processing");
         return;
@@ -250,7 +276,7 @@ async fn process_upload(
         match nodus_server_media::process::render_one(&source, kind, spec).await {
             Ok(rendered) => {
                 let digest = hex(&Sha256::digest(&rendered.bytes));
-                let path = variants_dir().join(&digest);
+                let path = variant_dir.join(&digest);
                 if let Err(error) = tokio::fs::write(&path, &rendered.bytes).await {
                     fail(&pool, &id, &error.to_string()).await;
                     return;
@@ -258,6 +284,7 @@ async fn process_upload(
                 rows.push(VariantRow {
                     media_id: id.clone(),
                     layer: spec.layer.as_str().to_owned(),
+                    max_edge: i64::from(spec.max_edge),
                     object_key: nodus_server_media::object_key(&source_digest, &digest, spec.layer),
                     content_type: if spec.layer == Layer::Lossless {
                         source_content_type.clone()
@@ -421,4 +448,130 @@ async fn variant_response(variant: VariantRow, layer: Layer) -> ApiResult<Respon
         Body::from(bytes),
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodus_server_store::accounts::{self, NewAccount};
+
+    #[sqlx::test(migrations = "../store/migrations")]
+    async fn process_upload_succeeds_for_720p_video_with_multiple_compressed_renditions(
+        pool: PgPool,
+    ) {
+        let dir = std::env::temp_dir().join(format!("nodus-api-video-test-{}", Id::new()));
+        let variant_dir = dir.join("variants");
+        tokio::fs::create_dir_all(&variant_dir).await.unwrap();
+
+        let source = dir.join("source_video");
+        let ffmpeg_bin =
+            std::env::var_os("NODUS_FFMPEG").map_or_else(|| PathBuf::from("ffmpeg"), PathBuf::from);
+        let status = tokio::process::Command::new(ffmpeg_bin)
+            .arg("-v")
+            .arg("error")
+            .arg("-f")
+            .arg("lavfi")
+            .arg("-i")
+            .arg("color=c=blue:size=1280x720:rate=1:duration=1")
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-f")
+            .arg("mp4")
+            .arg(&source)
+            .status()
+            .await
+            .expect("ffmpeg must run");
+        assert!(status.success(), "ffmpeg failed to synthesize 720p mp4");
+
+        let bytes = tokio::fs::read(&source).await.unwrap();
+        let source_digest = hex(&Sha256::digest(&bytes));
+        let account = accounts::insert(
+            &pool,
+            &NewAccount {
+                username: &format!("vidtest_{}", Id::new()),
+                display_name: "Video Test",
+                note: "",
+                bot: false,
+                locked: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let media_id = Id::new().to_string();
+        media::insert(
+            &pool,
+            &MediaRow {
+                id: media_id.clone(),
+                account_id: account.id.clone(),
+                status_id: None,
+                digest: source_digest.clone(),
+                content_type: "video/mp4".to_owned(),
+                size: i64::try_from(bytes.len()).unwrap(),
+                width: Some(1280),
+                height: Some(720),
+                blurhash: None,
+                description: String::new(),
+                sensitive: false,
+                lossless: false,
+                processing_state: "pending".to_owned(),
+                processing_progress: 0,
+                processing_error: None,
+                original_pruned: false,
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let plan =
+            plan_with_permissions(Kind::Video, 1280, 720, false, LosslessPermissions::none())
+                .unwrap();
+        assert_eq!(plan.len(), 3);
+
+        process_upload_in(
+            pool.clone(),
+            media_id.clone(),
+            source.clone(),
+            source_digest,
+            "video/mp4".to_owned(),
+            Kind::Video,
+            plan,
+            false,
+            &variant_dir,
+        )
+        .await;
+
+        let row = media::by_id(&pool, &media_id)
+            .await
+            .unwrap()
+            .expect("media row");
+        assert_eq!(
+            row.processing_state, "ready",
+            "processing failed: {:?}",
+            row.processing_error
+        );
+        assert_eq!(row.processing_progress, 100);
+        assert_eq!(row.processing_error, None);
+
+        let variants = media::variants(&pool, &media_id).await.unwrap();
+        assert_eq!(variants.len(), 3);
+        let compressed: Vec<i64> = variants
+            .iter()
+            .filter(|v| v.layer == "compressed")
+            .map(|v| v.max_edge)
+            .collect();
+        assert_eq!(compressed, vec![360, 720]);
+        for variant in &variants {
+            assert!(variant_dir.join(&variant.digest).exists());
+        }
+
+        let best = media::variant(&pool, &media_id, "compressed")
+            .await
+            .unwrap()
+            .expect("best compressed");
+        assert_eq!(best.max_edge, 720);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }

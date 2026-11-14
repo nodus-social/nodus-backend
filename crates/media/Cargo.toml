@@ -12,6 +12,7 @@ thiserror.workspace = true
 blurhash = "0.2.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 tokio = { workspace = true }
+ulid = { workspace = true }
 
 [lints]
 workspace = true
