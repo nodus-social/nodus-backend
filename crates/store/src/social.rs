@@ -589,12 +589,14 @@ pub async fn relations(
     account_id: &str,
     kind: &str,
 ) -> Result<Vec<crate::accounts::AccountRow>, sqlx::Error> {
-    sqlx::query_as::<_, crate::accounts::AccountRow>(
-        "SELECT a.* FROM account a JOIN account_relation r ON r.target_account_id = a.id \
+    let sql = format!(
+        "SELECT {} FROM account a JOIN account_relation r ON r.target_account_id = a.id \
          WHERE r.account_id = $1 AND r.kind = $2 ORDER BY r.created_at DESC",
-    )
-    .bind(account_id)
-    .bind(kind)
-    .fetch_all(pool)
-    .await
+        crate::accounts::ACCOUNT_COLUMNS_ALIASED
+    );
+    sqlx::query_as::<_, crate::accounts::AccountRow>(&sql)
+        .bind(account_id)
+        .bind(kind)
+        .fetch_all(pool)
+        .await
 }
