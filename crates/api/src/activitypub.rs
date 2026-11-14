@@ -658,6 +658,7 @@ fn actor_document(state: &AppState, account: &AccountRow) -> Actor {
         outbox: Some(format!("{actor}/outbox")),
         inbox: Some(format!("{actor}/inbox")),
         shared_inbox: Some(state.instance().url("/inbox")),
+        public_key_id: Some(format!("{actor}#main-key")),
         public_key_pem: account.public_key_pem.clone(),
         published: Some(
             account

@@ -174,6 +174,7 @@ pub async fn set_preview(
 pub struct VariantRow {
     pub media_id: String,
     pub layer: String,
+    pub max_edge: i64,
     pub object_key: String,
     pub content_type: String,
     pub digest: String,
@@ -184,8 +185,8 @@ pub struct VariantRow {
     pub created_at: DateTime<Utc>,
 }
 
-const VARIANT_COLUMNS: &str = "media_id, layer, object_key, content_type, digest, size, width, \
-     height, expires_at, created_at";
+const VARIANT_COLUMNS: &str = "media_id, layer, max_edge, object_key, content_type, digest, size, \
+     width, height, expires_at, created_at";
 
 /// Replaces every generated variant for one attachment.
 pub async fn replace_variants(
@@ -200,11 +201,13 @@ pub async fn replace_variants(
         .await?;
     for variant in variants {
         sqlx::query(
-            "INSERT INTO media_variant (media_id, layer, object_key, content_type, digest, size, \
-             width, height, expires_at, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            "INSERT INTO media_variant (media_id, layer, max_edge, object_key, content_type, \
+             digest, size, width, height, expires_at, created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
         )
         .bind(&variant.media_id)
         .bind(&variant.layer)
+        .bind(variant.max_edge)
         .bind(&variant.object_key)
         .bind(&variant.content_type)
         .bind(&variant.digest)
@@ -219,14 +222,16 @@ pub async fn replace_variants(
     tx.commit().await
 }
 
-/// One variant by layer.
+/// One variant by layer (picking the highest-resolution rendition when a layer has several).
 pub async fn variant(
     pool: &PgPool,
     media_id: &str,
     layer: &str,
 ) -> Result<Option<VariantRow>, sqlx::Error> {
-    let sql =
-        format!("SELECT {VARIANT_COLUMNS} FROM media_variant WHERE media_id = $1 AND layer = $2");
+    let sql = format!(
+        "SELECT {VARIANT_COLUMNS} FROM media_variant \
+         WHERE media_id = $1 AND layer = $2 ORDER BY max_edge DESC LIMIT 1"
+    );
     sqlx::query_as::<_, VariantRow>(&sql)
         .bind(media_id)
         .bind(layer)
@@ -236,8 +241,9 @@ pub async fn variant(
 
 /// All variants for one attachment.
 pub async fn variants(pool: &PgPool, media_id: &str) -> Result<Vec<VariantRow>, sqlx::Error> {
-    let sql =
-        format!("SELECT {VARIANT_COLUMNS} FROM media_variant WHERE media_id = $1 ORDER BY layer");
+    let sql = format!(
+        "SELECT {VARIANT_COLUMNS} FROM media_variant WHERE media_id = $1 ORDER BY layer, max_edge"
+    );
     sqlx::query_as::<_, VariantRow>(&sql)
         .bind(media_id)
         .fetch_all(pool)
@@ -313,4 +319,143 @@ pub async fn original_digest_referenced(pool: &PgPool, digest: &str) -> Result<b
     .fetch_one(pool)
     .await?;
     Ok(row.0 > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::accounts::{self, NewAccount};
+    use nodus_server_core::Id;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn replace_variants_supports_multiple_compressed_video_renditions(pool: PgPool) {
+        let pool = &pool;
+
+        let username = format!("media_test_{}", Id::new());
+        let account = accounts::insert(
+            pool,
+            &NewAccount {
+                username: &username,
+                display_name: "Media Test",
+                note: "",
+                bot: false,
+                locked: false,
+            },
+        )
+        .await
+        .expect("insert account");
+
+        let media_id = Id::new().to_string();
+        let now = Utc::now();
+        insert(
+            pool,
+            &MediaRow {
+                id: media_id.clone(),
+                account_id: account.id.clone(),
+                status_id: None,
+                digest: format!("digest-{media_id}"),
+                content_type: "video/mp4".to_owned(),
+                size: 1024,
+                width: Some(1280),
+                height: Some(720),
+                blurhash: None,
+                description: String::new(),
+                sensitive: false,
+                lossless: false,
+                processing_state: "processing".to_owned(),
+                processing_progress: 50,
+                processing_error: None,
+                original_pruned: false,
+                created_at: now,
+            },
+        )
+        .await
+        .expect("insert media");
+
+        let rows = vec![
+            VariantRow {
+                media_id: media_id.clone(),
+                layer: "preview".to_owned(),
+                max_edge: 1280,
+                object_key: format!("media/{media_id}/preview/p"),
+                content_type: "video/webm".to_owned(),
+                digest: "digest-preview".to_owned(),
+                size: 100,
+                width: None,
+                height: None,
+                expires_at: None,
+                created_at: now,
+            },
+            VariantRow {
+                media_id: media_id.clone(),
+                layer: "compressed".to_owned(),
+                max_edge: 360,
+                object_key: format!("media/{media_id}/compressed/360"),
+                content_type: "video/webm".to_owned(),
+                digest: "digest-360".to_owned(),
+                size: 200,
+                width: None,
+                height: None,
+                expires_at: Some(now + chrono::Duration::hours(72)),
+                created_at: now,
+            },
+            VariantRow {
+                media_id: media_id.clone(),
+                layer: "compressed".to_owned(),
+                max_edge: 720,
+                object_key: format!("media/{media_id}/compressed/720"),
+                content_type: "video/webm".to_owned(),
+                digest: "digest-720".to_owned(),
+                size: 400,
+                width: None,
+                height: None,
+                expires_at: Some(now + chrono::Duration::hours(72)),
+                created_at: now,
+            },
+            VariantRow {
+                media_id: media_id.clone(),
+                layer: "compressed".to_owned(),
+                max_edge: 1080,
+                object_key: format!("media/{media_id}/compressed/1080"),
+                content_type: "video/webm".to_owned(),
+                digest: "digest-1080".to_owned(),
+                size: 800,
+                width: None,
+                height: None,
+                expires_at: Some(now + chrono::Duration::hours(72)),
+                created_at: now,
+            },
+            VariantRow {
+                media_id: media_id.clone(),
+                layer: "lossless".to_owned(),
+                max_edge: i64::from(u32::MAX),
+                object_key: format!("media/{media_id}/lossless/orig"),
+                content_type: "video/mp4".to_owned(),
+                digest: "digest-lossless".to_owned(),
+                size: 1024,
+                width: None,
+                height: None,
+                expires_at: None,
+                created_at: now,
+            },
+        ];
+
+        replace_variants(pool, &media_id, &rows)
+            .await
+            .expect("replace_variants should allow multiple compressed renditions");
+
+        let stored = variants(pool, &media_id).await.expect("variants");
+        assert_eq!(stored.len(), 5);
+        let best_compressed = variant(pool, &media_id, "compressed")
+            .await
+            .expect("variant")
+            .expect("compressed variant");
+        assert_eq!(best_compressed.max_edge, 1080);
+        assert_eq!(best_compressed.digest, "digest-1080");
+
+        let _ = sqlx::query("DELETE FROM account WHERE id = $1")
+            .bind(&account.id)
+            .execute(pool)
+            .await;
+    }
 }

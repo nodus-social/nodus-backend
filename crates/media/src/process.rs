@@ -46,7 +46,7 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
         Format::Webm => "webm",
         Format::Original => return Err(Error::Unsupported),
     };
-    let output = temporary_path(source, spec.layer, extension);
+    let output = temporary_path(source, spec, extension);
     let mut command = Command::new(ffmpeg());
     command
         .arg("-v")
@@ -57,16 +57,15 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
     if spec.format == Format::Webp {
         command
             .arg("-vf")
-            .arg(format!(
-                "scale='min({edge},iw)':'min({edge},ih)':force_original_aspect_ratio=decrease",
-                edge = spec.max_edge
-            ))
+            .arg(webp_scale_filter(spec.max_edge))
             .arg("-c:v")
             .arg(if kind == Kind::AnimatedImage {
                 "libwebp_anim"
             } else {
                 "libwebp"
             })
+            .arg("-lossless")
+            .arg(if spec.lossless { "1" } else { "0" })
             .arg("-quality")
             .arg(spec.quality.to_string());
         if kind == Kind::AnimatedImage {
@@ -92,29 +91,32 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
             .arg("1")
             .arg("-an");
     }
-    command
-        .arg("-f")
-        .arg(extension)
-        .arg(&output)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let result = command.output().await.map_err(io)?;
-    if !result.status.success() {
-        let _ = tokio::fs::remove_file(&output).await;
-        let message = String::from_utf8_lossy(&result.stderr);
-        return Err(Error::Process(message.trim().to_owned()));
-    }
-    let bytes = tokio::fs::read(&output).await.map_err(io)?;
-    let _ = tokio::fs::remove_file(&output).await;
-    if bytes.is_empty() {
-        return Err(Error::Process("encoder produced an empty file".to_owned()));
-    }
+    command.arg("-f").arg(extension).arg(&output);
+    let bytes = run_ffmpeg(command, &output).await?;
     Ok(Rendered {
         spec: *spec,
         bytes,
         content_type: content_type(spec.format),
     })
+}
+
+async fn run_ffmpeg(mut command: Command, output: &Path) -> Result<Vec<u8>, Error> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let result = command.output().await.map_err(io)?;
+    if !result.status.success() {
+        let _ = tokio::fs::remove_file(output).await;
+        let message = String::from_utf8_lossy(&result.stderr);
+        return Err(Error::Process(message.trim().to_owned()));
+    }
+    let bytes = tokio::fs::read(output).await.map_err(io)?;
+    let _ = tokio::fs::remove_file(output).await;
+    if bytes.is_empty() {
+        return Err(Error::Process("encoder produced an empty file".to_owned()));
+    }
+    Ok(bytes)
 }
 
 #[expect(
@@ -123,6 +125,40 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
     reason = "the scaled dimensions are bounded by the source dimensions"
 )]
 async fn render_still(source: &Path, spec: &VariantSpec) -> Result<Rendered, Error> {
+    if !spec.lossless {
+        if !(1..=100).contains(&spec.quality) {
+            return Err(Error::Quality);
+        }
+        tokio::fs::metadata(source).await.map_err(io)?;
+        let output = temporary_path(source, spec, "webp");
+        let mut command = Command::new(ffmpeg());
+        command
+            .arg("-v")
+            .arg("error")
+            .arg("-y")
+            .arg("-i")
+            .arg(source)
+            .arg("-vf")
+            .arg(webp_scale_filter(spec.max_edge))
+            .arg("-c:v")
+            .arg("libwebp")
+            .arg("-lossless")
+            .arg("0")
+            .arg("-quality")
+            .arg(spec.quality.to_string())
+            .arg("-frames:v")
+            .arg("1")
+            .arg("-f")
+            .arg("webp")
+            .arg(&output);
+        let bytes = run_ffmpeg(command, &output).await?;
+        return Ok(Rendered {
+            spec: *spec,
+            bytes,
+            content_type: "image/webp",
+        });
+    }
+
     let bytes = tokio::fs::read(source).await.map_err(io)?;
     let image = image::load_from_memory(&bytes).map_err(|_| Error::Image)?;
     let (width, height) = (image.width(), image.height());
@@ -166,6 +202,10 @@ async fn render_still(source: &Path, spec: &VariantSpec) -> Result<Rendered, Err
     })
 }
 
+fn webp_scale_filter(edge: u32) -> String {
+    format!("scale='min({edge},iw)':'min({edge},ih)':force_original_aspect_ratio=decrease")
+}
+
 fn scale_filter(edge: u32) -> String {
     format!(
         "scale=w='min(iw,{edge})':h='min(ih,{edge})':force_original_aspect_ratio=decrease:force_divisible_by=2"
@@ -188,9 +228,15 @@ fn content_type(format: Format) -> &'static str {
     }
 }
 
-fn temporary_path(source: &Path, layer: Layer, extension: &str) -> PathBuf {
+fn temporary_path(source: &Path, spec: &VariantSpec, extension: &str) -> PathBuf {
     let mut name = source.as_os_str().to_os_string();
-    name.push(format!(".{}.{}", layer.as_str(), extension));
+    name.push(format!(
+        ".{}.{}.{}.{}",
+        spec.layer.as_str(),
+        spec.max_edge,
+        ulid::Ulid::new(),
+        extension
+    ));
     PathBuf::from(name)
 }
 
@@ -260,5 +306,192 @@ mod tests {
         assert!(filter.contains("min(iw,1280)"));
         assert!(filter.contains("min(ih,1280)"));
         assert!(filter.contains("force_original_aspect_ratio=decrease"));
+    }
+
+    fn has_webp_chunk(bytes: &[u8], chunk: [u8; 4]) -> bool {
+        if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+            return false;
+        }
+        let mut offset = 12;
+        while offset + 8 <= bytes.len() {
+            if bytes[offset..offset + 4] == chunk {
+                return true;
+            }
+            let size = u32::from_le_bytes([
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+                bytes[offset + 7],
+            ]) as usize;
+            let padded = size + (size & 1);
+            offset = offset.saturating_add(8).saturating_add(padded);
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn render_still_uses_lossy_webp_with_quality_when_not_lossless() {
+        let path = std::env::temp_dir().join(format!(
+            "nodus-media-quality-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut img = image::RgbImage::new(256, 256);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            let r = u8::try_from((x * 37 + y * 13 + ((x ^ y) * 7)) % 256).unwrap();
+            let g = u8::try_from((x * 19 + y * 53 + ((x.wrapping_mul(y)) % 251)) % 256).unwrap();
+            let b = u8::try_from((x * 71 + y * 29 + ((x + y * 3) * 11)) % 256).unwrap();
+            *pixel = image::Rgb([r, g, b]);
+        }
+        img.save(&path).unwrap();
+
+        let low_quality = VariantSpec {
+            layer: Layer::Preview,
+            format: Format::Webp,
+            max_edge: 256,
+            quality: 20,
+            lossless: false,
+            retain: true,
+        };
+        let high_quality = VariantSpec {
+            layer: Layer::Compressed,
+            format: Format::Webp,
+            max_edge: 256,
+            quality: 88,
+            lossless: false,
+            retain: true,
+        };
+        let lossless = VariantSpec {
+            layer: Layer::Preview,
+            format: Format::Webp,
+            max_edge: 256,
+            quality: 100,
+            lossless: true,
+            retain: true,
+        };
+
+        let low = render_still(&path, &low_quality).await.unwrap();
+        let high = render_still(&path, &high_quality).await.unwrap();
+        let loss = render_still(&path, &lossless).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+
+        assert!(
+            has_webp_chunk(&low.bytes, *b"VP8 "),
+            "expected lossy VP8 chunk for !lossless"
+        );
+        assert!(
+            !has_webp_chunk(&low.bytes, *b"VP8L"),
+            "unexpected lossless VP8L chunk for !lossless"
+        );
+        assert!(
+            has_webp_chunk(&loss.bytes, *b"VP8L"),
+            "expected lossless VP8L chunk for lossless"
+        );
+        assert!(
+            low.bytes.len() < high.bytes.len(),
+            "expected quality=20 ({}) < quality=88 ({})",
+            low.bytes.len(),
+            high.bytes.len()
+        );
+        assert!(
+            high.bytes.len() < loss.bytes.len(),
+            "expected lossy quality=88 ({}) < lossless ({})",
+            high.bytes.len(),
+            loss.bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn render_still_downscales_larger_images_in_lossy_mode() {
+        let path = std::env::temp_dir().join(format!(
+            "nodus-media-scale-{}-{}.png",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let image = image::RgbImage::from_pixel(200, 100, image::Rgb([10, 120, 200]));
+        image.save(&path).unwrap();
+        let spec = VariantSpec {
+            layer: Layer::Preview,
+            format: Format::Webp,
+            max_edge: 100,
+            quality: 82,
+            lossless: false,
+            retain: true,
+        };
+        let rendered = render_still(&path, &spec).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
+        let decoded = image::load_from_memory(&rendered.bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (100, 50));
+    }
+
+    #[test]
+    fn temporary_path_includes_max_edge_and_unique_ulid() {
+        let source = Path::new("/tmp/media/deadbeef");
+        let spec_360 = VariantSpec {
+            layer: Layer::Compressed,
+            format: Format::Webm,
+            max_edge: 360,
+            quality: 76,
+            lossless: false,
+            retain: true,
+        };
+        let spec_720 = VariantSpec {
+            max_edge: 720,
+            quality: 80,
+            ..spec_360
+        };
+
+        let first = temporary_path(source, &spec_360, "webm");
+        let second = temporary_path(source, &spec_720, "webm");
+        let third = temporary_path(source, &spec_720, "webm");
+
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        let first_str = first.to_string_lossy();
+        let second_str = second.to_string_lossy();
+        assert!(first_str.starts_with("/tmp/media/deadbeef.compressed.360."));
+        assert!(first_str.ends_with(".webm"));
+        assert!(second_str.starts_with("/tmp/media/deadbeef.compressed.720."));
+        assert!(second_str.ends_with(".webm"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_render_one_calls_on_same_source_do_not_collide() {
+        let path = std::env::temp_dir().join(format!(
+            "nodus-media-concurrent-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let image = image::RgbImage::from_pixel(160, 120, image::Rgb([50, 90, 130]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        tokio::fs::write(&path, png).await.unwrap();
+
+        let spec_a = VariantSpec {
+            layer: Layer::Compressed,
+            format: Format::Webp,
+            max_edge: 120,
+            quality: 80,
+            lossless: false,
+            retain: true,
+        };
+        let spec_b = VariantSpec {
+            max_edge: 120,
+            quality: 80,
+            ..spec_a
+        };
+
+        let (res_a, res_b) = tokio::join!(
+            render_one(&path, Kind::Image, &spec_a),
+            render_one(&path, Kind::Image, &spec_b),
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+        assert!(res_a.is_ok(), "first concurrent render failed: {res_a:?}");
+        assert!(res_b.is_ok(), "second concurrent render failed: {res_b:?}");
     }
 }
