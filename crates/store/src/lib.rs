@@ -15,6 +15,7 @@ pub mod filters;
 pub mod jobs;
 pub mod lists;
 pub mod media;
+pub mod miauth;
 pub mod moderation;
 pub mod social;
 pub mod statuses;

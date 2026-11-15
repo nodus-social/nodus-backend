@@ -238,8 +238,11 @@ pub async fn unreblog(
     Path(id): Path<String>,
 ) -> ApiResult<Json<StatusDto>> {
     auth.require_scope("write:statuses")?;
-    let original = visible_status(&state, Some(&auth), &id).await?;
-    sqlx_query_unreblog(&state, &auth, &id).await?;
+    let _ = visible_status(&state, Some(&auth), &id).await?;
+    let original =
+        nodus_server_store::statuses::unreblog(state.store().pool(), &auth.0.account.id, &id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("Record not found"))?;
     Ok(Json(dto(&state, &original, Some(&auth)).await?))
 }
 
@@ -385,14 +388,13 @@ async fn can_view(state: &AppState, auth: Option<&Auth>, row: &StatusRow) -> Api
         return Ok(true);
     }
     if row.visibility == "direct" {
-        let mentioned: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM status_mention WHERE status_id = $1 AND account_id = $2)",
+        return nodus_server_store::statuses::is_mentioned(
+            state.store().pool(),
+            &row.id,
+            &auth.0.account.id,
         )
-        .bind(&row.id)
-        .bind(&auth.0.account.id)
-        .fetch_one(state.store().pool())
-        .await?;
-        return Ok(mentioned);
+        .await
+        .map_err(Into::into);
     }
     nodus_server_store::social::relationship(
         state.store().pool(),
@@ -500,23 +502,4 @@ fn escape(text: &str) -> String {
         }
     }
     out
-}
-
-async fn sqlx_query_unreblog(state: &AppState, auth: &Auth, id: &str) -> ApiResult<()> {
-    sqlx::query(
-        "DELETE FROM status WHERE reblog_of_id = $1 AND account_id = $2 AND deleted_at IS NULL",
-    )
-    .bind(id)
-    .bind(&auth.0.account.id)
-    .execute(state.store().pool())
-    .await?;
-    sqlx::query(
-        "UPDATE status SET reblogs_count = \
-             (SELECT count(*) FROM status WHERE reblog_of_id = $1 AND deleted_at IS NULL) \
-         WHERE id = $1",
-    )
-    .bind(id)
-    .execute(state.store().pool())
-    .await?;
-    Ok(())
 }

@@ -1952,6 +1952,7 @@ dependencies = [
  "leptos",
  "nodus-auth",
  "nodus-server-core",
+ "nodus-server-federation",
  "nodus-server-media",
  "nodus-server-sdk",
  "nodus-server-store",
