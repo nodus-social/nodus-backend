@@ -19,13 +19,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use nodus_server_core::PageParams;
+use nodus_server_federation::{prepare, verify_prepared};
 use nodus_server_sdk::activitypub::ActivityPub;
 use nodus_server_sdk::activitypub::{
     Activity, ActivityKind, ActivityObject, Actor, Attachment, Collection, CollectionPage, Note,
     Webfinger,
 };
-use nodus_server_sdk::federation::signature::crypto::{body_digest, RsaVerifier};
-use nodus_server_sdk::federation::signature::{HttpSignature, Verifier};
 use nodus_server_store::accounts::{self, AccountRow};
 use nodus_server_store::statuses::{self, StatusRow};
 
@@ -296,33 +295,31 @@ async fn verify_signature(
     uri: &axum::http::Uri,
     body: &[u8],
 ) -> ApiResult<()> {
-    let raw = headers
-        .get("signature")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::unauthorized("Missing HTTP signature"))?;
-    let signature =
-        HttpSignature::parse(raw).map_err(|error| ApiError::unauthorized(error.to_string()))?;
-    if let Some(digest) = headers.get("digest").and_then(|value| value.to_str().ok()) {
-        if digest != body_digest(body) {
-            return Err(ApiError::unauthorized("Body digest does not match"));
-        }
-    }
-    if let Some(date) = headers.get("date").and_then(|value| value.to_str().ok()) {
-        let parsed = chrono::DateTime::parse_from_rfc2822(date)
-            .map_err(|_| ApiError::unauthorized("Invalid Date header"))?;
-        if (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
-            .num_minutes()
-            .abs()
-            > 5
-        {
-            return Err(ApiError::unauthorized("Signature is stale"));
-        }
-    }
-    let key_actor = signature
+    let header_pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    let prepared = prepare("POST", uri.path(), &header_pairs, body, chrono::Utc::now())
+        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
+    let key_actor = prepared
+        .params
         .key_id
         .split('#')
         .next()
-        .unwrap_or(&signature.key_id);
+        .unwrap_or(&prepared.params.key_id);
+    if let Some(pem) = accounts::by_uri(state.store().pool(), key_actor)
+        .await?
+        .and_then(|account| account.public_key_pem)
+    {
+        if verify_prepared(&prepared, &pem).is_ok() {
+            return Ok(());
+        }
+    }
     let actor = ActivityPub::new()
         .actor_url(key_actor)
         .await
@@ -330,30 +327,7 @@ async fn verify_signature(
     let pem = actor
         .public_key_pem
         .ok_or_else(|| ApiError::unauthorized("Actor has no public key"))?;
-    let signing = signature
-        .signing_string(|name| {
-            if name == "(request-target)" {
-                Some(format!("post {}", uri.path()))
-            } else {
-                headers
-                    .get(name)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned)
-            }
-        })
-        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
-    RsaVerifier::from_public_key_pem(&pem)
-        .and_then(|verifier| {
-            verifier.verify(
-                &signature.key_id,
-                &signature.algorithm,
-                signing.as_bytes(),
-                &signature.signature,
-            )
-        })
-        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
-    let _ = state;
-    Ok(())
+    verify_prepared(&prepared, &pem).map_err(|error| ApiError::unauthorized(error.to_string()))
 }
 
 async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()> {

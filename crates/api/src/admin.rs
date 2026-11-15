@@ -347,12 +347,7 @@ async fn account_action(
         &json!({}),
     )
     .await?;
-    let email = sqlx::query_scalar::<_, String>(
-        "SELECT email::text FROM account_credential WHERE account_id = $1",
-    )
-    .bind(&id)
-    .fetch_optional(state.store().pool())
-    .await?;
+    let email = moderation::account_email(state.store().pool(), &id).await?;
     Ok(Json(admin_account_dto(
         &state,
         moderation::AdminAccountRow { account, email },

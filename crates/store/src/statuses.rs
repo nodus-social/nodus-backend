@@ -530,6 +530,50 @@ pub async fn reblog(
     Ok(Some(row))
 }
 
+/// Removes `account_id`'s boost of `original_id`, refreshes `reblogs_count`, and returns
+/// the updated original status if it still exists.
+pub async fn unreblog(
+    pool: &PgPool,
+    account_id: &str,
+    original_id: &str,
+) -> Result<Option<StatusRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM status WHERE reblog_of_id = $1 AND account_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(original_id)
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    let sql = format!(
+        "UPDATE status SET reblogs_count = \
+             (SELECT count(*) FROM status WHERE reblog_of_id = $1 AND deleted_at IS NULL) \
+         WHERE id = $1 AND deleted_at IS NULL \
+         RETURNING {STATUS_COLUMNS_SIMPLE}"
+    );
+    let row = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(original_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Returns whether `account_id` is mentioned in `status_id`.
+pub async fn is_mentioned(
+    pool: &PgPool,
+    status_id: &str,
+    account_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM status_mention WHERE status_id = $1 AND account_id = $2)",
+    )
+    .bind(status_id)
+    .bind(account_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Ancestors and descendants of a status, oldest first.
 pub async fn context(
     pool: &PgPool,
