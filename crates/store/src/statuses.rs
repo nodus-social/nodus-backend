@@ -117,16 +117,22 @@ pub async fn upsert_remote(
         .await
 }
 
-/// Soft-deletes a remote status by URI.
-pub async fn delete_remote(pool: &PgPool, uri: &str) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query("UPDATE status SET deleted_at = now() WHERE uri = $1 AND deleted_at IS NULL")
-            .bind(uri)
-            .execute(pool)
-            .await?
-            .rows_affected()
-            == 1,
+/// Soft-deletes a remote status by URI, scoped to its owning account.
+pub async fn delete_remote(
+    pool: &PgPool,
+    uri: &str,
+    account_id: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE status SET deleted_at = now() \
+         WHERE uri = $1 AND account_id = $2 AND deleted_at IS NULL",
     )
+    .bind(uri)
+    .bind(account_id)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        == 1)
 }
 
 fn page_bounds(params: PageParams) -> (Option<String>, Option<String>, &'static str) {

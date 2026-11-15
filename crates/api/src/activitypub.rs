@@ -5,16 +5,18 @@
 //! policy stay in `nodus-server-store`; this module only maps rows to protocol
 //! documents and protocol requests to store calls.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::SecondsFormat;
+use rsa::RsaPrivateKey;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::OsRng;
-use rsa::RsaPrivateKey;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -275,11 +277,7 @@ async fn accept_activity(
             .await?
             .ok_or_else(|| ApiError::not_found("No such account"))?;
     }
-    verify_signature(state, headers, uri, body).await?;
-    let value: Value = serde_json::from_slice(body)
-        .map_err(|_| ApiError::unprocessable("The activity is not JSON"))?;
-    let activity =
-        Activity::from_json(&value).map_err(|error| ApiError::unprocessable(error.to_string()))?;
+    let activity = verify_signature(state, headers, uri, body).await?;
     ingest_activity(state, &activity).await?;
     tracing::info!(
         kind = %activity.kind.as_str(),
@@ -294,40 +292,72 @@ async fn verify_signature(
     headers: &HeaderMap,
     uri: &axum::http::Uri,
     body: &[u8],
-) -> ApiResult<()> {
-    let header_pairs: Vec<(String, String)> = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_owned(), value.to_owned()))
-        })
-        .collect();
+) -> ApiResult<Activity> {
+    let mut header_pairs = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        let value = value
+            .to_str()
+            .map_err(|_| ApiError::unauthorized("invalid header encoding"))?;
+        header_pairs.push((name.as_str().to_owned(), value.to_owned()));
+    }
     let prepared = prepare("POST", uri.path(), &header_pairs, body, chrono::Utc::now())
         .map_err(|error| ApiError::unauthorized(error.to_string()))?;
+
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|_| ApiError::unprocessable("The activity is not JSON"))?;
+    let activity =
+        Activity::from_json(&value).map_err(|error| ApiError::unprocessable(error.to_string()))?;
+
     let key_actor = prepared
         .params
         .key_id
         .split('#')
         .next()
         .unwrap_or(&prepared.params.key_id);
+    if key_actor.is_empty() || key_actor != activity.actor {
+        return Err(ApiError::unauthorized(
+            "signing key does not match activity actor",
+        ));
+    }
+
+    let parsed_actor = validate_remote_url(key_actor)
+        .map_err(|_| ApiError::unauthorized("signing key actor URL is invalid"))?;
+    let domain = parsed_actor
+        .host_str()
+        .ok_or_else(|| ApiError::unauthorized("signing key actor URL has no host"))?;
+    ensure_domain_allowed(state, domain).await?;
+
     if let Some(pem) = accounts::by_uri(state.store().pool(), key_actor)
         .await?
         .and_then(|account| account.public_key_pem)
     {
         if verify_prepared(&prepared, &pem).is_ok() {
-            return Ok(());
+            return Ok(activity);
         }
     }
     let actor = ActivityPub::new()
         .actor_url(key_actor)
         .await
         .map_err(|error| ApiError::unauthorized(error.to_string()))?;
+    if actor.id != key_actor {
+        return Err(ApiError::unauthorized(
+            "fetched actor id does not match signing key",
+        ));
+    }
+    if let Some(public_key_id) = actor.public_key_id.as_deref() {
+        if public_key_id != prepared.params.key_id {
+            return Err(ApiError::unauthorized(
+                "signing key id does not match actor public key",
+            ));
+        }
+    }
     let pem = actor
         .public_key_pem
+        .clone()
         .ok_or_else(|| ApiError::unauthorized("Actor has no public key"))?;
-    verify_prepared(&prepared, &pem).map_err(|error| ApiError::unauthorized(error.to_string()))
+    verify_prepared(&prepared, &pem).map_err(|error| ApiError::unauthorized(error.to_string()))?;
+    let _ = upsert_remote_actor(state, key_actor, domain, &actor).await?;
+    Ok(activity)
 }
 
 async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()> {
@@ -340,6 +370,11 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
         }
         ActivityKind::Undo => {
             if let ActivityObject::Activity(inner) = &activity.object {
+                if inner.actor != activity.actor {
+                    return Err(ApiError::forbidden(
+                        "undo actor does not match inner activity actor",
+                    ));
+                }
                 if inner.kind == ActivityKind::Follow {
                     if let Some(target) = activity_target_id(inner) {
                         unfollow_local(state, &remote, target).await?;
@@ -355,8 +390,13 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
             }
         }
         ActivityKind::Delete => {
-            if let Some(id) = activity_target_id(activity) {
-                statuses::delete_remote(state.store().pool(), id).await?;
+            if let Some(id) = delete_target_id(activity) {
+                if validate_remote_url(id).is_err() || !same_origin(id, &activity.actor) {
+                    return Err(ApiError::forbidden(
+                        "cannot delete object from another origin",
+                    ));
+                }
+                statuses::delete_remote(state.store().pool(), id, &remote.id).await?;
             }
         }
         _ => {}
@@ -371,21 +411,34 @@ fn activity_target_id(activity: &Activity) -> Option<&str> {
     }
 }
 
+fn delete_target_id(activity: &Activity) -> Option<&str> {
+    match &activity.object {
+        ActivityObject::Id(id) => Some(id),
+        ActivityObject::Value(value) => value.get("id").and_then(Value::as_str),
+        ActivityObject::Activity(_) => None,
+    }
+}
+
+pub(crate) async fn ensure_domain_allowed(state: &AppState, domain: &str) -> ApiResult<()> {
+    if nodus_server_store::moderation::blocked_domain(state.store().pool(), domain)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::forbidden("domain is blocked"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn ensure_remote_actor(
     state: &AppState,
     actor_url: &str,
 ) -> ApiResult<AccountRow> {
-    let domain = url::Url::parse(actor_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .unwrap_or_default();
-    if domain.is_empty()
-        || nodus_server_store::moderation::blocked_domain(state.store().pool(), &domain)
-            .await?
-            .is_some()
-    {
-        return Err(ApiError::forbidden("domain is blocked"));
-    }
+    let parsed = validate_remote_url(actor_url)
+        .map_err(|_| ApiError::unprocessable("actor URL must be a public HTTPS URL"))?;
+    let domain = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::unprocessable("actor URL has no host"))?;
+    ensure_domain_allowed(state, domain).await?;
     if let Some(row) = accounts::by_uri(state.store().pool(), actor_url).await? {
         return Ok(row);
     }
@@ -393,7 +446,125 @@ pub(crate) async fn ensure_remote_actor(
         .actor_url(actor_url)
         .await
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;
-    upsert_remote_actor(state, actor_url, &domain, &actor).await
+    if actor.id != actor_url {
+        return Err(ApiError::unprocessable(
+            "actor document id does not match requested actor URL",
+        ));
+    }
+    upsert_remote_actor(state, actor_url, domain, &actor).await
+}
+
+pub(crate) fn validate_remote_url(raw: &str) -> ApiResult<url::Url> {
+    let parsed = url::Url::parse(raw).map_err(|_| ApiError::unprocessable("URL must be valid"))?;
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ApiError::unprocessable("URL must be a public HTTPS URL"));
+    }
+    match parsed.host() {
+        Some(ref host) if check_url_host(host) => Ok(parsed),
+        _ => Err(ApiError::unprocessable(
+            "URL host is not a publicly routable destination",
+        )),
+    }
+}
+
+pub(crate) fn validate_remote_host(host: &str) -> ApiResult<()> {
+    if host.is_empty()
+        || host.contains(|c: char| {
+            matches!(c, '/' | '\\' | '?' | '#' | ':' | '@') || c.is_whitespace()
+        })
+    {
+        return Err(ApiError::unprocessable("domain must be a valid hostname"));
+    }
+    let parsed = url::Host::parse(host)
+        .map_err(|_| ApiError::unprocessable("domain must be a valid hostname"))?;
+    let allowed = match parsed {
+        url::Host::Domain(ref domain) => !is_disallowed_domain(domain),
+        url::Host::Ipv4(v4) => !is_disallowed_ipv4(v4),
+        url::Host::Ipv6(v6) => !is_disallowed_ipv6(v6),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiError::unprocessable(
+            "domain is not a publicly routable destination",
+        ))
+    }
+}
+
+pub(crate) fn same_origin(left: &str, right: &str) -> bool {
+    let (Ok(a), Ok(b)) = (url::Url::parse(left), url::Url::parse(right)) else {
+        return false;
+    };
+    a.origin().is_tuple() && a.origin() == b.origin()
+}
+
+fn check_url_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(domain) => !is_disallowed_domain(domain),
+        url::Host::Ipv4(v4) => !is_disallowed_ipv4(*v4),
+        url::Host::Ipv6(v6) => !is_disallowed_ipv6(*v6),
+    }
+}
+
+fn is_disallowed_domain(domain: &str) -> bool {
+    let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if d.is_empty() {
+        return true;
+    }
+    ["localhost", "local", "internal", "localdomain", "home.arpa"]
+        .iter()
+        .any(|reserved| {
+            d == *reserved
+                || d.strip_suffix(reserved)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
+}
+
+fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || octets[0] == 0
+        || (octets[0] == 100 && (octets[1] & 0xc0) == 64)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 240
+}
+
+fn is_disallowed_ipv6(v6: Ipv6Addr) -> bool {
+    if let Some(v4) = v6.to_ipv4() {
+        if is_disallowed_ipv4(v4) {
+            return true;
+        }
+    }
+    let segments = v6.segments();
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0
+    {
+        let octets = v6.octets();
+        let v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+        if is_disallowed_ipv4(v4) {
+            return true;
+        }
+    }
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || segments[0] == 0x0100
 }
 
 async fn upsert_remote_actor(
@@ -461,6 +632,29 @@ pub(crate) async fn ingest_note(
 ) -> ApiResult<()> {
     let note =
         Note::from_json(value).map_err(|error| ApiError::unprocessable(error.to_string()))?;
+    let actor_uri = remote
+        .uri
+        .as_deref()
+        .ok_or_else(|| ApiError::unprocessable("remote actor has no URI"))?;
+    if validate_remote_url(&note.id).is_err() || !same_origin(&note.id, actor_uri) {
+        return Err(ApiError::forbidden(
+            "note id does not belong to actor origin",
+        ));
+    }
+    if let Some(attributed_to) = note.attributed_to.as_deref() {
+        if attributed_to != actor_uri {
+            return Err(ApiError::forbidden(
+                "note attributedTo does not match actor",
+            ));
+        }
+    }
+    if let Some(existing) = statuses::by_uri(state.store().pool(), &note.id).await? {
+        if existing.account_id != remote.id {
+            return Err(ApiError::forbidden(
+                "cannot overwrite status owned by another actor",
+            ));
+        }
+    }
     let parent = match &note.in_reply_to {
         Some(uri) => statuses::by_uri(state.store().pool(), uri).await?,
         None => None,
