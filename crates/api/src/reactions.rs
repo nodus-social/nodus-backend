@@ -12,9 +12,10 @@ use serde_json::{json, Value};
 use nodus_server_sdk::misskey::Reaction;
 use nodus_server_store::statuses::{self, ReactionCount};
 
-use crate::auth::Auth;
+use crate::auth::{Auth, MaybeAuth};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::statuses::visible_status;
 
 #[derive(Debug, Deserialize)]
 pub struct ReactionBody {
@@ -29,9 +30,7 @@ pub async fn set(
     Json(body): Json<ReactionBody>,
 ) -> ApiResult<Json<Value>> {
     auth.require_scope("write")?;
-    let status = statuses::by_id(state.store().pool(), &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    let status = visible_status(&state, Some(&auth), &id).await?;
     let reaction = Reaction::parse(&body.reaction)
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;
     statuses::set_reaction(
@@ -51,9 +50,7 @@ pub async fn remove(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     auth.require_scope("write")?;
-    let status = statuses::by_id(state.store().pool(), &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    let status = visible_status(&state, Some(&auth), &id).await?;
     statuses::remove_reaction(state.store().pool(), &status.id, &auth.0.account.id).await?;
     Ok(Json(json!({ "ok": true })))
 }
@@ -61,11 +58,10 @@ pub async fn remove(
 /// `GET /api/v1/statuses/{id}/reactions`
 pub async fn list(
     State(state): State<AppState>,
+    MaybeAuth(auth): MaybeAuth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<ReactionCount>>> {
-    let status = statuses::by_id(state.store().pool(), &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    let status = visible_status(&state, auth.as_ref(), &id).await?;
     Ok(Json(
         statuses::reactions(state.store().pool(), &status.id).await?,
     ))

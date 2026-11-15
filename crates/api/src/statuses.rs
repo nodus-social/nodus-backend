@@ -366,44 +366,67 @@ fn apply_flags(dto: &mut StatusDto, flags: ViewerFlags) {
     dto.bookmarked = flags.bookmarked;
 }
 
-async fn visible_status(state: &AppState, auth: Option<&Auth>, id: &str) -> ApiResult<StatusRow> {
+pub(crate) async fn visible_status(
+    state: &AppState,
+    auth: Option<&Auth>,
+    id: &str,
+) -> ApiResult<StatusRow> {
+    visible_status_for_viewer(state, auth.map(|a| a.0.account.id.as_str()), id).await
+}
+
+pub(crate) async fn visible_status_for_viewer(
+    state: &AppState,
+    viewer_id: Option<&str>,
+    id: &str,
+) -> ApiResult<StatusRow> {
     let row = nodus_server_store::statuses::by_id(state.store().pool(), id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    if can_view(state, auth, &row).await? {
+    if can_view_for_viewer(state, viewer_id, &row).await? {
         Ok(row)
     } else {
         Err(ApiError::not_found("Record not found"))
     }
 }
 
-async fn can_view(state: &AppState, auth: Option<&Auth>, row: &StatusRow) -> ApiResult<bool> {
+pub(crate) async fn can_view(
+    state: &AppState,
+    auth: Option<&Auth>,
+    row: &StatusRow,
+) -> ApiResult<bool> {
+    can_view_for_viewer(state, auth.map(|a| a.0.account.id.as_str()), row).await
+}
+
+pub(crate) async fn can_view_for_viewer(
+    state: &AppState,
+    viewer_id: Option<&str>,
+    row: &StatusRow,
+) -> ApiResult<bool> {
     if row.visibility == "public" || row.visibility == "unlisted" {
         return Ok(true);
     }
-    let Some(auth) = auth else {
+    let Some(viewer_id) = viewer_id else {
         return Ok(false);
     };
-    if row.account_id == auth.0.account.id {
+    if row.account_id == viewer_id {
         return Ok(true);
     }
     if row.visibility == "direct" {
         return nodus_server_store::statuses::is_mentioned(
             state.store().pool(),
             &row.id,
-            &auth.0.account.id,
+            viewer_id,
         )
         .await
         .map_err(Into::into);
     }
-    nodus_server_store::social::relationship(
-        state.store().pool(),
-        &auth.0.account.id,
-        &row.account_id,
-    )
-    .await
-    .map(|relationship| relationship.following)
-    .map_err(Into::into)
+    if row.visibility != "private" {
+        return Ok(false);
+    }
+    nodus_server_store::social::relationship(state.store().pool(), viewer_id, &row.account_id)
+        .await
+        .map(|relationship| relationship.following)
+        .map_err(Into::into)
 }
 
 async fn validate_media(state: &AppState, auth: &Auth, ids: &[String]) -> ApiResult<Vec<String>> {
