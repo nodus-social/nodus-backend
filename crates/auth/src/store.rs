@@ -125,36 +125,78 @@ impl PgAuthStore {
         email: &str,
         password_hash: &str,
     ) -> Result<(), Error> {
+        Self::create_credential_with(&self.pool, account_id, email, password_hash).await
+    }
+
+    /// Attaches a password credential to an existing local account using the given executor.
+    pub async fn create_credential_with<'e>(
+        executor: impl sqlx::PgExecutor<'e>,
+        account_id: &str,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<(), Error> {
         sqlx::query(
             "INSERT INTO account_credential (account_id, email, password_hash) VALUES ($1, $2, $3)",
         )
         .bind(account_id)
         .bind(email)
         .bind(password_hash)
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
     /// Whether an email already has a login.
     pub async fn has_credential(&self, email: &str) -> Result<bool, Error> {
+        Self::has_credential_with(&self.pool, email).await
+    }
+
+    /// Whether an email already has a login, queried on the given executor.
+    pub async fn has_credential_with<'e>(
+        executor: impl sqlx::PgExecutor<'e>,
+        email: &str,
+    ) -> Result<bool, Error> {
         let exists: bool =
             sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM account_credential WHERE email = $1)")
                 .bind(email)
-                .fetch_one(&self.pool)
+                .fetch_one(executor)
                 .await?;
         Ok(exists)
     }
 
     /// Whether an account already has a password login.
     pub async fn has_credential_for_account(&self, account_id: &str) -> Result<bool, Error> {
+        Self::has_credential_for_account_with(&self.pool, account_id).await
+    }
+
+    /// Whether an account already has a password login, queried on the given executor.
+    pub async fn has_credential_for_account_with<'e>(
+        executor: impl sqlx::PgExecutor<'e>,
+        account_id: &str,
+    ) -> Result<bool, Error> {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM account_credential WHERE account_id = $1)",
         )
         .bind(account_id)
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await?;
         Ok(exists)
+    }
+
+    /// Deletes expired browser sessions and returns the number of rows removed.
+    pub async fn delete_expired_sessions(&self) -> Result<u64, Error> {
+        let result = sqlx::query("DELETE FROM auth_session WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Deletes expired `OAuth` authorization codes and returns the number of rows removed.
+    pub async fn delete_expired_codes(&self) -> Result<u64, Error> {
+        let result = sqlx::query("DELETE FROM oauth_code WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 
