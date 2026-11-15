@@ -2004,11 +2004,13 @@ name = "nodus-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "http-body-util",
  "nodus-auth",
  "nodus-server-api",
  "nodus-server-core",
  "nodus-server-store",
+ "sqlx",
  "tokio",
  "tower",
  "tower-http",

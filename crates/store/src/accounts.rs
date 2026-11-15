@@ -183,15 +183,15 @@ pub async fn upsert_remote(
 }
 
 /// A local account by username (`@alice`, without the domain).
-pub async fn local_by_username(
-    pool: &PgPool,
+pub async fn local_by_username<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     username: &str,
 ) -> Result<Option<AccountRow>, sqlx::Error> {
     let sql =
         format!("SELECT {ACCOUNT_COLUMNS} FROM account WHERE domain IS NULL AND username = $1");
     sqlx::query_as::<_, AccountRow>(&sql)
         .bind(username)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
@@ -206,7 +206,10 @@ pub struct NewAccount<'a> {
 }
 
 /// Creates a local account.
-pub async fn insert(pool: &PgPool, new: &NewAccount<'_>) -> Result<AccountRow, sqlx::Error> {
+pub async fn insert<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    new: &NewAccount<'_>,
+) -> Result<AccountRow, sqlx::Error> {
     let id = Id::new().to_string();
     let sql = format!(
         "INSERT INTO account (id, username, display_name, note, bot, locked, local) \
@@ -219,7 +222,7 @@ pub async fn insert(pool: &PgPool, new: &NewAccount<'_>) -> Result<AccountRow, s
         .bind(new.note)
         .bind(new.bot)
         .bind(new.locked)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
 }
 
@@ -293,11 +296,15 @@ pub async fn set_media_preferences(
 }
 
 /// Grant or revoke administrator access.
-pub async fn set_admin(pool: &PgPool, id: &str, admin: bool) -> Result<bool, sqlx::Error> {
+pub async fn set_admin<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    id: &str,
+    admin: bool,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("UPDATE account SET admin = $2 WHERE id = $1")
         .bind(id)
         .bind(admin)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() == 1)
 }

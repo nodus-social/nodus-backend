@@ -13,12 +13,14 @@ nodus-auth = { workspace = true }
 nodus-server-api = { workspace = true }
 nodus-server-core = { workspace = true }
 nodus-server-store = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
 http-body-util = "0.1"
 tower = { workspace = true }
 

@@ -139,3 +139,11 @@ pub async fn consume_session(pool: &PgPool, session_id: &str) -> Result<SessionC
         Ok(SessionCheck::Unknown)
     }
 }
+
+/// Deletes expired `MiAuth` sessions and returns the number of rows removed.
+pub async fn delete_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM miauth_session WHERE expires_at < now()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
