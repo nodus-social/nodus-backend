@@ -91,6 +91,7 @@ pub async fn upsert_remote(
     pool: &PgPool,
     new: &NewRemoteStatus<'_>,
 ) -> Result<StatusRow, sqlx::Error> {
+    let mut tx = pool.begin().await?;
     let sql = format!(
         "INSERT INTO status (id, account_id, uri, content, content_html, spoiler_text, \
              visibility, sensitive, in_reply_to_id, in_reply_to_account_id, local, created_at) \
@@ -100,7 +101,7 @@ pub async fn upsert_remote(
              sensitive = EXCLUDED.sensitive, edited_at = now() \
          RETURNING {STATUS_COLUMNS_SIMPLE}"
     );
-    sqlx::query_as::<_, StatusRow>(&sql)
+    let row = sqlx::query_as::<_, StatusRow>(&sql)
         .bind(new.id)
         .bind(new.account_id)
         .bind(new.uri)
@@ -111,20 +112,38 @@ pub async fn upsert_remote(
         .bind(new.in_reply_to_id)
         .bind(new.in_reply_to_account_id)
         .bind(new.created_at)
-        .fetch_one(pool)
-        .await
+        .fetch_one(&mut *tx)
+        .await?;
+    if let Some(parent_id) = new.in_reply_to_id {
+        refresh_replies_count(&mut tx, parent_id).await?;
+    }
+    tx.commit().await?;
+    Ok(row)
 }
 
 /// Soft-deletes a remote status by URI.
 pub async fn delete_remote(pool: &PgPool, uri: &str) -> Result<bool, sqlx::Error> {
-    Ok(
-        sqlx::query("UPDATE status SET deleted_at = now() WHERE uri = $1 AND deleted_at IS NULL")
-            .bind(uri)
-            .execute(pool)
-            .await?
-            .rows_affected()
-            == 1,
+    let mut tx = pool.begin().await?;
+    let deleted: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "UPDATE status SET deleted_at = now() \
+          WHERE uri = $1 AND deleted_at IS NULL \
+          RETURNING id, in_reply_to_id, reblog_of_id",
     )
+    .bind(uri)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status_id, in_reply_to_id, reblog_of_id)) = deleted else {
+        return Ok(false);
+    };
+    cleanup_deleted_status(
+        &mut tx,
+        &status_id,
+        in_reply_to_id.as_deref(),
+        reblog_of_id.as_deref(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 fn page_bounds(params: PageParams) -> (Option<String>, Option<String>, &'static str) {
@@ -266,24 +285,76 @@ pub struct NewStatus<'a> {
     pub language: Option<&'a str>,
 }
 
-/// Inserts a local status and returns it exactly as a timeline would.
-/// Soft-deletes a status owned by `account_id`.
+#[derive(FromRow)]
+struct DeletedOwned {
+    in_reply_to_id: Option<String>,
+    reblog_of_id: Option<String>,
+    content: String,
+    content_source: Option<String>,
+}
+
+/// Soft-deletes a status owned by `account_id`, removes its timeline entries, and
+/// updates `statuses_count`, `replies_count`, and `reblogs_count` in one transaction.
 pub async fn delete_owned(
     pool: &PgPool,
     status_id: &str,
     account_id: &str,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE status SET deleted_at = now()          WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL",
+    let mut tx = pool.begin().await?;
+    let deleted = sqlx::query_as::<_, DeletedOwned>(
+        "UPDATE status SET deleted_at = now() \
+          WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL \
+          RETURNING in_reply_to_id, reblog_of_id, content, content_source",
     )
     .bind(status_id)
     .bind(account_id)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(result.rows_affected() == 1)
+    let Some(deleted) = deleted else {
+        return Ok(false);
+    };
+    cleanup_deleted_status(
+        &mut tx,
+        status_id,
+        deleted.in_reply_to_id.as_deref(),
+        deleted.reblog_of_id.as_deref(),
+    )
+    .await?;
+    // `statuses::reblog` does not increment `account.statuses_count`, whereas `statuses::create`
+    // does (including Misskey notes/renotes, which always carry `content_source`).
+    let counts_toward_statuses_count = deleted.reblog_of_id.is_none()
+        || deleted.content_source.is_some()
+        || !deleted.content.is_empty();
+    if counts_toward_statuses_count {
+        sqlx::query(
+            "UPDATE account SET statuses_count = GREATEST(0, statuses_count - 1) WHERE id = $1",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
+/// Inserts a local status and returns it exactly as a timeline would.
 pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row = insert_row(&mut tx, new).await?;
+    if let Some(parent_id) = new.in_reply_to_id {
+        refresh_replies_count(&mut tx, parent_id).await?;
+    }
+    if let Some(original_id) = new.reblog_of_id {
+        refresh_reblogs_count(&mut tx, original_id).await?;
+    }
+    tx.commit().await?;
+    Ok(row)
+}
+
+async fn insert_row(
+    conn: &mut sqlx::PgConnection,
+    new: &NewStatus<'_>,
+) -> Result<StatusRow, sqlx::Error> {
     let sql = format!(
         "INSERT INTO status (id, account_id, content, content_html, content_source, \
                              content_format, spoiler_text, visibility, sensitive, \
@@ -306,8 +377,89 @@ pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sql
         .bind(new.in_reply_to_account_id)
         .bind(new.reblog_of_id)
         .bind(new.language)
-        .fetch_one(pool)
+        .fetch_one(conn)
         .await
+}
+
+async fn refresh_replies_count(
+    conn: &mut sqlx::PgConnection,
+    parent_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE status SET replies_count = \
+             (SELECT count(*) FROM status WHERE in_reply_to_id = $1 AND deleted_at IS NULL) \
+         WHERE id = $1",
+    )
+    .bind(parent_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn refresh_reblogs_count(
+    conn: &mut sqlx::PgConnection,
+    original_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE status SET reblogs_count = \
+             (SELECT count(*) FROM status WHERE reblog_of_id = $1 AND deleted_at IS NULL) \
+         WHERE id = $1",
+    )
+    .bind(original_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn fan_out_home(
+    conn: &mut sqlx::PgConnection,
+    account_id: &str,
+    status_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO timeline_entry (account_id, status_id, kind) \
+         SELECT $1, $2, 'home' \
+         UNION SELECT account_id, $2, 'home' FROM follow \
+                WHERE target_account_id = $1 AND state = 'accepted' \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(status_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+async fn cleanup_deleted_status(
+    conn: &mut sqlx::PgConnection,
+    status_id: &str,
+    in_reply_to_id: Option<&str>,
+    reblog_of_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM timeline_entry WHERE status_id = $1")
+        .bind(status_id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query(
+        "DELETE FROM timeline_entry \
+          WHERE status_id IN (SELECT id FROM status WHERE reblog_of_id = $1)",
+    )
+    .bind(status_id)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "UPDATE status SET deleted_at = now() WHERE reblog_of_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(status_id)
+    .execute(&mut *conn)
+    .await?;
+    if let Some(parent_id) = in_reply_to_id {
+        refresh_replies_count(&mut *conn, parent_id).await?;
+    }
+    if let Some(original_id) = reblog_of_id {
+        refresh_reblogs_count(&mut *conn, original_id).await?;
+    }
+    Ok(())
 }
 
 /// `RETURNING` cannot carry the `s.` alias the page queries use.
@@ -403,30 +555,7 @@ pub async fn create(
     tags: &[String],
 ) -> Result<StatusRow, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let sql = format!(
-        "INSERT INTO status (id, account_id, content, content_html, content_source, \
-                             content_format, spoiler_text, visibility, sensitive, \
-                             in_reply_to_id, in_reply_to_account_id, reblog_of_id, \
-                             language, local) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, true) \
-         RETURNING {STATUS_COLUMNS_SIMPLE}"
-    );
-    let row = sqlx::query_as::<_, StatusRow>(&sql)
-        .bind(new.id)
-        .bind(new.account_id)
-        .bind(new.content)
-        .bind(new.content_html)
-        .bind(new.content_source)
-        .bind(new.content_format)
-        .bind(new.spoiler_text)
-        .bind(new.visibility)
-        .bind(new.sensitive)
-        .bind(new.in_reply_to_id)
-        .bind(new.in_reply_to_account_id)
-        .bind(new.reblog_of_id)
-        .bind(new.language)
-        .fetch_one(&mut *tx)
-        .await?;
+    let row = insert_row(&mut tx, new).await?;
 
     if !media_ids.is_empty() {
         sqlx::query(
@@ -458,17 +587,9 @@ pub async fn create(
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query(
-        "INSERT INTO timeline_entry (account_id, status_id, kind) \
-         SELECT $1, $2, 'home' \
-         UNION SELECT account_id, $2, 'home' FROM follow \
-                WHERE target_account_id = $1 AND state = 'accepted' \
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(new.account_id)
-    .bind(new.id)
-    .execute(&mut *tx)
-    .await?;
+    if new.visibility != "direct" {
+        fan_out_home(&mut tx, new.account_id, new.id).await?;
+    }
     sqlx::query(
         "UPDATE account SET statuses_count = statuses_count + 1, last_status_at = now() \
          WHERE id = $1",
@@ -476,6 +597,12 @@ pub async fn create(
     .bind(new.account_id)
     .execute(&mut *tx)
     .await?;
+    if let Some(parent_id) = new.in_reply_to_id {
+        refresh_replies_count(&mut tx, parent_id).await?;
+    }
+    if let Some(original_id) = new.reblog_of_id {
+        refresh_reblogs_count(&mut tx, original_id).await?;
+    }
     tx.commit().await?;
     Ok(row)
 }
@@ -486,14 +613,46 @@ pub async fn reblog(
     account_id: &str,
     original_id: &str,
 ) -> Result<Option<StatusRow>, sqlx::Error> {
-    let Some(original) = by_id(pool, original_id).await? else {
+    Ok(reblog_status(pool, account_id, original_id)
+        .await?
+        .map(|(row, _created)| row))
+}
+
+/// Copies a status into the booster's timeline, returning the active reblog row and
+/// whether it was newly created (`false` when an active reblog already existed).
+pub async fn reblog_status(
+    pool: &PgPool,
+    account_id: &str,
+    original_id: &str,
+) -> Result<Option<(StatusRow, bool)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let visibility: Option<String> = sqlx::query_scalar(
+        "SELECT visibility FROM status WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(original_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(visibility) = visibility else {
         return Ok(None);
     };
-    if original.visibility == "direct" {
+    if visibility == "direct" {
         return Ok(None);
     }
+    let existing_sql = format!(
+        "SELECT {STATUS_COLUMNS_SIMPLE} FROM status \
+          WHERE reblog_of_id = $1 AND account_id = $2 AND deleted_at IS NULL \
+          LIMIT 1"
+    );
+    if let Some(existing) = sqlx::query_as::<_, StatusRow>(&existing_sql)
+        .bind(original_id)
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        tx.commit().await?;
+        return Ok(Some((existing, false)));
+    }
     let id = nodus_server_core::Id::new().to_string();
-    let mut tx = pool.begin().await?;
     let sql = format!(
         "INSERT INTO status (id, account_id, content, content_html, content_format, \
                              visibility, reblog_of_id, local) \
@@ -503,31 +662,33 @@ pub async fn reblog(
     let row = sqlx::query_as::<_, StatusRow>(&sql)
         .bind(&id)
         .bind(account_id)
-        .bind(&original.visibility)
+        .bind(&visibility)
         .bind(original_id)
         .fetch_one(&mut *tx)
         .await?;
+    refresh_reblogs_count(&mut tx, original_id).await?;
+    fan_out_home(&mut tx, account_id, &id).await?;
+    tx.commit().await?;
+    Ok(Some((row, true)))
+}
+
+/// Removes an account's active reblog of `original_id` and updates `reblogs_count`.
+pub async fn unreblog(
+    pool: &PgPool,
+    account_id: &str,
+    original_id: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
     sqlx::query(
-        "UPDATE status SET reblogs_count = \
-             (SELECT count(*) FROM status WHERE reblog_of_id = $1 AND deleted_at IS NULL) \
-         WHERE id = $1",
+        "DELETE FROM status WHERE reblog_of_id = $1 AND account_id = $2 AND deleted_at IS NULL",
     )
     .bind(original_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "INSERT INTO timeline_entry (account_id, status_id, kind) \
-         SELECT $1, $2, 'home' \
-         UNION SELECT account_id, $2, 'home' FROM follow \
-                WHERE target_account_id = $1 AND state = 'accepted' \
-         ON CONFLICT DO NOTHING",
-    )
     .bind(account_id)
-    .bind(&id)
     .execute(&mut *tx)
     .await?;
+    refresh_reblogs_count(&mut tx, original_id).await?;
     tx.commit().await?;
-    Ok(Some(row))
+    Ok(())
 }
 
 /// Ancestors and descendants of a status, oldest first.
@@ -539,6 +700,7 @@ pub async fn context(
         "WITH RECURSIVE chain AS ( \
              SELECT {STATUS_COLUMNS} FROM status s WHERE s.id = \
                  (SELECT in_reply_to_id FROM status WHERE id = $1) \
+               AND s.deleted_at IS NULL \
              UNION ALL \
              SELECT {STATUS_COLUMNS} FROM status s \
                JOIN chain c ON s.id = c.in_reply_to_id \
