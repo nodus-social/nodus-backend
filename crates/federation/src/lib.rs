@@ -7,17 +7,22 @@
 //! caller owns the network and the cache policy, so a hostile server cannot make this
 //! code fetch anything.
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use std::collections::HashSet;
+
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Duration, Utc};
+use rsa::RsaPublicKey;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
-use rsa::RsaPublicKey;
 use sha2::{Digest as _, Sha256};
 
 /// Tolerated clock skew, applied symmetrically.
 pub const MAX_CLOCK_SKEW: Duration = Duration::minutes(12);
+
+/// Header names that every incoming ActivityPub inbox HTTP signature must cover.
+pub const REQUIRED_SIGNED_HEADERS: [&str; 4] = ["(request-target)", "host", "date", "digest"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
@@ -67,7 +72,14 @@ pub fn parse_header(raw: &str) -> Result<SignatureParams, VerifyError> {
         match name {
             "keyId" => key_id = Some(value.to_owned()),
             "algorithm" => algorithm = Some(value.to_owned()),
-            "headers" => headers = Some(value.split_whitespace().map(str::to_owned).collect()),
+            "headers" => {
+                headers = Some(
+                    value
+                        .split_whitespace()
+                        .map(str::to_ascii_lowercase)
+                        .collect(),
+                );
+            }
             "signature" => {
                 signature = Some(
                     BASE64
@@ -169,35 +181,14 @@ pub fn prepare(
     body: &[u8],
     now: DateTime<Utc>,
 ) -> Result<PreparedRequest, VerifyError> {
-    let header = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("signature"))
-        .map(|(_, value)| value.clone())
-        .ok_or(VerifyError::MissingSignature)?;
+    let header = single_header(headers, "signature")?.ok_or(VerifyError::MissingSignature)?;
     let params = parse_header(&header)?;
 
     if params.algorithm != "rsa-sha256" {
         return Err(VerifyError::UnsupportedAlgorithm(params.algorithm));
     }
 
-    let get = |name: &str| {
-        headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.clone())
-    };
-
-    if let Some(digest) = get("digest") {
-        verify_digest(body, &digest)?;
-    } else if params
-        .headers
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case("digest"))
-    {
-        return Err(VerifyError::MissingDigest);
-    }
-
-    let date = get("date").ok_or(VerifyError::StaleDate)?;
+    let date = single_header(headers, "date")?.ok_or(VerifyError::StaleDate)?;
     let signed_at = DateTime::parse_from_rfc2822(&date)
         .map_err(|_| VerifyError::StaleDate)?
         .with_timezone(&Utc);
@@ -205,11 +196,57 @@ pub fn prepare(
         return Err(VerifyError::StaleDate);
     }
 
-    let signing = signing_string(&params, method, path, get)?;
+    let digest = single_header(headers, "digest")?.ok_or(VerifyError::MissingDigest)?;
+    verify_digest(body, &digest)?;
+
+    validate_required_headers(&params.headers)?;
+
+    let host = single_header(headers, "host")?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(VerifyError::Malformed("missing signed header"))?;
+    let signing = signing_string(&params, method, path, |name| {
+        if name == "host" {
+            Some(host.clone())
+        } else {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        }
+    })?;
     Ok(PreparedRequest {
         params,
         signing_string: signing,
     })
+}
+
+fn single_header(headers: &[(String, String)], name: &str) -> Result<Option<String>, VerifyError> {
+    let mut matches = headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone());
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(VerifyError::Malformed("duplicate request header"));
+    }
+    Ok(first)
+}
+
+fn validate_required_headers(headers: &[String]) -> Result<(), VerifyError> {
+    let mut seen = HashSet::with_capacity(headers.len());
+    for header in headers {
+        if !seen.insert(header.to_ascii_lowercase()) {
+            return Err(VerifyError::Malformed("duplicate signed header"));
+        }
+    }
+    for required in REQUIRED_SIGNED_HEADERS {
+        if !seen.contains(required) {
+            return Err(VerifyError::Malformed(
+                "signature is missing required header",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Verifies a [`PreparedRequest`] against the actor's PEM-encoded RSA public key.
@@ -249,11 +286,11 @@ pub fn digest_header(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::RsaPrivateKey;
     use rsa::pkcs1v15::SigningKey;
     use rsa::pkcs8::{EncodePublicKey as _, LineEnding};
     use rsa::rand_core::OsRng;
     use rsa::signature::{SignatureEncoding as _, Signer as _};
-    use rsa::RsaPrivateKey;
 
     /// 1024 bits keeps the debug-build tests fast; the verification path is identical.
     fn key_pair() -> (RsaPrivateKey, String) {
@@ -464,5 +501,57 @@ mod tests {
         let prepared = prepare("POST", "/inbox", &headers, body, now).expect("prepare");
         assert_eq!(prepared.params.key_id, "https://a/b#main-key");
         assert!(verify_prepared(&prepared, &pem).is_ok());
+    }
+
+    #[test]
+    fn prepare_rejects_omitted_digest_and_missing_required_headers() {
+        let body = br#"{"type":"Create"}"#;
+        let digest = digest_header(body);
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let now = DateTime::parse_from_rfc2822(date)
+            .expect("date")
+            .with_timezone(&Utc);
+
+        let no_digest_headers = [
+            ("host".to_owned(), "us.test".to_owned()),
+            ("date".to_owned(), date.to_owned()),
+            (
+                "signature".to_owned(),
+                "keyId=\"https://a/b#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date\",signature=\"AAAA\""
+                    .to_owned(),
+            ),
+        ];
+        assert!(matches!(
+            prepare("POST", "/inbox", &no_digest_headers, body, now),
+            Err(VerifyError::MissingDigest)
+        ));
+
+        for incomplete in [
+            "(request-target)",
+            "host date digest",
+            "(request-target) date digest",
+            "(request-target) host digest",
+            "(request-target) host date",
+            "(request-target) host date digest date",
+        ] {
+            let headers = [
+                ("host".to_owned(), "us.test".to_owned()),
+                ("date".to_owned(), date.to_owned()),
+                ("digest".to_owned(), digest.clone()),
+                (
+                    "signature".to_owned(),
+                    format!(
+                        "keyId=\"https://a/b#main-key\",algorithm=\"rsa-sha256\",headers=\"{incomplete}\",signature=\"AAAA\""
+                    ),
+                ),
+            ];
+            assert!(
+                matches!(
+                    prepare("POST", "/inbox", &headers, body, now),
+                    Err(VerifyError::Malformed(_))
+                ),
+                "expected Malformed for headers={incomplete}"
+            );
+        }
     }
 }
