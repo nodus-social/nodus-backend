@@ -8,6 +8,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use nodus_auth::domain::{is_safe_redirect_uri, is_valid_scope};
 use nodus_server_core::Id;
 
 use crate::error::{ApiError, ApiResult};
@@ -68,7 +69,7 @@ pub async fn register(
         return Err(ApiError::unprocessable("redirect_uris is required"));
     }
     for redirect in &redirects {
-        if url::Url::parse(redirect).is_err() {
+        if !is_safe_redirect_uri(redirect) {
             return Err(ApiError::unprocessable(format!(
                 "invalid redirect_uri: {redirect}"
             )));
@@ -83,6 +84,11 @@ pub async fn register(
         .collect();
     if scopes.is_empty() {
         return Err(ApiError::unprocessable("scopes must not be empty"));
+    }
+    for scope in &scopes {
+        if !is_valid_scope(scope) {
+            return Err(ApiError::unprocessable(format!("invalid scope: {scope}")));
+        }
     }
 
     let id = Id::new().to_string();

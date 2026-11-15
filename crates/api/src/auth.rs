@@ -30,6 +30,14 @@ impl Auth {
             )))
         }
     }
+
+    /// Requires both an administrator account and the given admin scope.
+    pub fn require_admin(&self, scope: &str) -> Result<(), ApiError> {
+        if !self.0.account.admin {
+            return Err(ApiError::forbidden("Administrator access is required"));
+        }
+        self.require_scope(scope)
+    }
 }
 
 impl FromRequestParts<AppState> for Auth {

@@ -55,15 +55,25 @@ async fn lists(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<
     Ok(Json(rows.into_iter().map(ListDto::from).collect()))
 }
 
+fn validate_list_form(form: &ListForm) -> ApiResult<&str> {
+    let title = form.title.trim();
+    if title.is_empty() {
+        return Err(ApiError::unprocessable("title is required"));
+    }
+    if !matches!(form.replies_policy.as_str(), "followed" | "list" | "none") {
+        return Err(ApiError::unprocessable(
+            "replies_policy must be followed, list, or none",
+        ));
+    }
+    Ok(title)
+}
+
 async fn create(
     State(state): State<AppState>,
     auth: Auth,
     Form(form): Form<ListForm>,
 ) -> ApiResult<Json<ListDto>> {
-    let title = form.title.trim();
-    if title.is_empty() {
-        return Err(ApiError::unprocessable("title is required"));
-    }
+    let title = validate_list_form(&form)?;
     let row = nodus_server_store::lists::create(
         state.store().pool(),
         &auth.0.account.id,
@@ -92,10 +102,7 @@ async fn update(
     Path(id): Path<String>,
     Form(form): Form<ListForm>,
 ) -> ApiResult<Json<ListDto>> {
-    let title = form.title.trim();
-    if title.is_empty() {
-        return Err(ApiError::unprocessable("title is required"));
-    }
+    let title = validate_list_form(&form)?;
     let row = nodus_server_store::lists::update(
         state.store().pool(),
         &auth.0.account.id,

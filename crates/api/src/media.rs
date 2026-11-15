@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use nodus_server_core::id::Id;
+use nodus_server_core::limits::{IMAGE_SIZE_LIMIT, VIDEO_SIZE_LIMIT};
 use nodus_server_media::{
     expires_in, plan_with_permissions, CachePolicy, Kind, Layer, LosslessPermissions, VariantSpec,
 };
@@ -122,12 +123,6 @@ pub async fn upload(
     if bytes.is_empty() {
         return Err(ApiError::unprocessable("The upload is empty"));
     }
-    if bytes.len() > MAX_UPLOAD {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "The upload is too large",
-        ));
-    }
     if !(content_type.starts_with("image/")
         || content_type.starts_with("video/")
         || content_type.starts_with("audio/"))
@@ -139,6 +134,17 @@ pub async fn upload(
     }
 
     let kind = Kind::from_content_type(&content_type);
+    let size_limit = if kind == Kind::Video {
+        VIDEO_SIZE_LIMIT
+    } else {
+        IMAGE_SIZE_LIMIT
+    };
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > size_limit {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "The upload is too large",
+        ));
+    }
     let permissions = LosslessPermissions {
         images: auth.0.account.lossless_images_allowed,
         videos: auth.0.account.lossless_videos_allowed,

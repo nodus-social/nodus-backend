@@ -70,20 +70,12 @@ impl From<alerts::AlertRow> for AlertDto {
     }
 }
 
-fn administrator(auth: &Auth) -> ApiResult<()> {
-    if auth.0.account.admin {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden("Administrator access is required"))
-    }
-}
-
 async fn list(
     State(state): State<AppState>,
     auth: Auth,
     Query(query): Query<AlertQuery>,
 ) -> ApiResult<Json<Vec<AlertDto>>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:read")?;
     let rows = alerts::recent(state.store().pool(), query.limit, query.unacknowledged).await?;
     Ok(Json(rows.into_iter().map(AlertDto::from).collect()))
 }
@@ -93,7 +85,7 @@ async fn acknowledge(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<AlertDto>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     let changed = alerts::acknowledge(state.store().pool(), &id, &auth.0.account.id).await?;
     if !changed {
         return Err(ApiError::not_found(
@@ -114,7 +106,7 @@ async fn set_lossless(
     Path(id): Path<String>,
     Json(body): Json<LosslessBody>,
 ) -> ApiResult<StatusCode> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     let changed = nodus_server_store::accounts::set_lossless_permissions(
         state.store().pool(),
         &id,
@@ -172,7 +164,7 @@ async fn reports(
     auth: Auth,
     Query(query): Query<StateQuery>,
 ) -> ApiResult<Json<Vec<ReportDto>>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:read")?;
     let rows = moderation::reports(
         state.store().pool(),
         &query.state,
@@ -191,7 +183,7 @@ async fn resolve_report(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ReportDto>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     let row = moderation::set_report_state(state.store().pool(), &id, "resolved")
         .await?
         .ok_or_else(|| ApiError::not_found("report does not exist"))?;
@@ -212,7 +204,7 @@ async fn reopen_report(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ReportDto>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     let row = moderation::set_report_state(state.store().pool(), &id, "open")
         .await?
         .ok_or_else(|| ApiError::not_found("report does not exist"))?;
@@ -276,7 +268,7 @@ async fn accounts(
     auth: Auth,
     Query(query): Query<AccountQuery>,
 ) -> ApiResult<Json<Vec<AdminAccountDto>>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:read")?;
     let rows = moderation::admin_accounts(
         state.store().pool(),
         query.local,
@@ -304,7 +296,7 @@ async fn pending_accounts(
     auth: Auth,
     Query(query): Query<PendingQuery>,
 ) -> ApiResult<Json<Vec<AdminAccountDto>>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:read")?;
     let pending = query.status.as_deref() == Some("pending");
     let rows = moderation::admin_accounts(
         state.store().pool(),
@@ -332,7 +324,7 @@ async fn account_action(
     Path(id): Path<String>,
     Form(form): Form<ActionForm>,
 ) -> ApiResult<Json<AdminAccountDto>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     let action = Action::parse(&form.kind)
         .ok_or_else(|| ApiError::unprocessable("unknown moderation action"))?;
     let account = moderation::apply_action(state.store().pool(), &id, action)
@@ -369,7 +361,7 @@ async fn domain_blocks(
     State(state): State<AppState>,
     auth: Auth,
 ) -> ApiResult<Json<Vec<DomainBlockDto>>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:read")?;
     let rows = moderation::blocks(state.store().pool(), i64::from(PAGE_MAX)).await?;
     Ok(Json(
         rows.into_iter()
@@ -410,9 +402,14 @@ async fn create_domain_block(
     auth: Auth,
     Form(form): Form<DomainForm>,
 ) -> ApiResult<Json<DomainBlockDto>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     if form.domain.trim().is_empty() {
         return Err(ApiError::unprocessable("domain is required"));
+    }
+    if !matches!(form.severity.as_str(), "silence" | "suspend") {
+        return Err(ApiError::unprocessable(
+            "severity must be silence or suspend",
+        ));
     }
     let row = moderation::create_block(
         state.store().pool(),
@@ -451,7 +448,7 @@ async fn delete_domain_block(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     if !moderation::delete_block(state.store().pool(), &id).await? {
         return Err(ApiError::not_found("domain block does not exist"));
     }
@@ -477,7 +474,7 @@ async fn domain_allows(
     State(state): State<AppState>,
     auth: Auth,
 ) -> ApiResult<Json<Vec<DomainAllowDto>>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:read")?;
     let rows = moderation::allows(state.store().pool(), i64::from(PAGE_MAX)).await?;
     Ok(Json(
         rows.into_iter()
@@ -494,7 +491,7 @@ async fn create_domain_allow(
     auth: Auth,
     Form(form): Form<DomainForm>,
 ) -> ApiResult<Json<DomainAllowDto>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     if form.domain.trim().is_empty() {
         return Err(ApiError::unprocessable("domain is required"));
     }
@@ -519,7 +516,7 @@ async fn delete_domain_allow(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    administrator(&auth)?;
+    auth.require_admin("admin:write")?;
     if !moderation::delete_allow(state.store().pool(), &id).await? {
         return Err(ApiError::not_found("domain allow does not exist"));
     }
@@ -552,7 +549,7 @@ async fn measures(
     auth: Auth,
     Json(body): Json<MeasuresRequest>,
 ) -> ApiResult<Json<Vec<MeasureDto>>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:read")?;
     let start = NaiveDate::parse_from_str(&body.start_at, "%Y-%m-%d")
         .map_err(|_| ApiError::unprocessable("start_at must be YYYY-MM-DD"))?;
     let end = NaiveDate::parse_from_str(&body.end_at, "%Y-%m-%d")
@@ -589,7 +586,7 @@ struct AuditDto {
 }
 
 async fn audit_log(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<AuditDto>>> {
-    administrator(&auth)?;
+    auth.require_admin("admin:read")?;
     let rows = moderation::audit_page(state.store().pool(), 100).await?;
     Ok(Json(
         rows.into_iter()
@@ -626,9 +623,15 @@ async fn create_report(
     auth: Auth,
     Form(form): Form<NewReportForm>,
 ) -> ApiResult<Json<ReportDto>> {
+    if form.account_id.trim().is_empty() {
+        return Err(ApiError::unprocessable("account_id is required"));
+    }
     if auth.0.account.id == form.account_id {
         return Err(ApiError::unprocessable("you cannot report yourself"));
     }
+    nodus_server_store::accounts::by_id(state.store().pool(), &form.account_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("account does not exist"))?;
     let status_ids: Vec<String> = form
         .status_ids
         .as_deref()

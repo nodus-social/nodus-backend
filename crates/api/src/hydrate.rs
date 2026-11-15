@@ -1,16 +1,20 @@
 //! On-demand hydration of remote profiles and posts into the local store.
 
-use axum::extract::{Query, State};
-use axum::routing::get;
 use axum::Json;
 use axum::Router;
+use axum::extract::{Query, State};
+use axum::routing::get;
 use serde::Deserialize;
 use serde_json::json;
 
 use nodus_server_sdk::activitypub::ActivityPub;
 use nodus_server_store::accounts::{self, AccountRow};
 
-use crate::activitypub::{ensure_remote_actor, ingest_note};
+use crate::activitypub::{
+    ensure_domain_allowed, ensure_remote_actor, ingest_note, same_origin, validate_remote_host,
+    validate_remote_url,
+};
+use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -31,25 +35,31 @@ fn default_limit() -> usize {
 }
 
 async fn account(
+    auth: Auth,
     State(state): State<AppState>,
     Query(query): Query<AccountQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    auth.require_scope("read")?;
     let acct = query.acct.trim().trim_start_matches('@');
     if acct.is_empty() || query.limit == 0 || query.limit > 40 {
         return Err(ApiError::unprocessable(
             "acct must be a handle and limit must be within 1..=40",
         ));
     }
-    let (_, domain) = acct
+    let (username, domain) = acct
         .split_once('@')
         .unwrap_or((acct, &state.instance().domain));
+    if username.is_empty() || username.contains(char::is_whitespace) {
+        return Err(ApiError::unprocessable("acct must be a valid handle"));
+    }
     let local = domain.eq_ignore_ascii_case(&state.instance().domain);
     let account = if local {
-        let username = acct.split('@').next().unwrap_or(acct);
         accounts::local_by_username(state.store().pool(), username)
             .await?
             .ok_or_else(|| ApiError::not_found("account does not exist"))?
     } else {
+        validate_remote_host(domain)?;
+        ensure_domain_allowed(&state, domain).await?;
         let client = ActivityPub::new();
         let url = client
             .webfinger(acct)
@@ -65,14 +75,27 @@ async fn account(
 }
 
 async fn status(
+    auth: Auth,
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    auth.require_scope("read")?;
+    let parsed = validate_remote_url(&query.url)?;
+    let domain = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::unprocessable("url has no host"))?;
+    ensure_domain_allowed(&state, domain).await?;
+
     let client = ActivityPub::new();
     let note = client
         .note(&query.url)
         .await
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;
+    if !same_origin(&note.id, &query.url) {
+        return Err(ApiError::forbidden(
+            "note id does not belong to requested origin",
+        ));
+    }
     let actor_url = note
         .attributed_to
         .as_deref()
@@ -103,10 +126,21 @@ async fn hydrate_outbox(
         .uri
         .as_deref()
         .ok_or_else(|| ApiError::unprocessable("account has no canonical URI"))?;
+    let parsed = validate_remote_url(uri)?;
+    if let Some(domain) = parsed.host_str() {
+        ensure_domain_allowed(state, domain).await?;
+    }
     let actor = client
         .actor_url(uri)
         .await
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;
+    if let Some(outbox_url) = actor.outbox.as_deref() {
+        if validate_remote_url(outbox_url).is_err() || !same_origin(outbox_url, uri) {
+            return Err(ApiError::forbidden(
+                "actor outbox does not belong to actor origin",
+            ));
+        }
+    }
     let page = client
         .outbox(&actor)
         .await

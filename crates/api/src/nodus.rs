@@ -35,6 +35,35 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/nodus/sync/snapshot", get(snapshot))
 }
 
+enum AuthorizedCollection<'a> {
+    Local,
+    Home(&'a str),
+}
+
+fn authorize_collection<'a>(
+    collection: &'a str,
+    viewer_id: &str,
+) -> ApiResult<AuthorizedCollection<'a>> {
+    if collection.trim().is_empty() {
+        return Err(ApiError::unprocessable("collection is required"));
+    }
+    if collection == "timeline:local" {
+        return Ok(AuthorizedCollection::Local);
+    }
+    if let Some(actor) = collection.strip_prefix("timeline:") {
+        if actor.is_empty() {
+            return Err(ApiError::unprocessable("unknown collection"));
+        }
+        if actor != viewer_id {
+            return Err(ApiError::forbidden(
+                "cannot access another account's collection",
+            ));
+        }
+        return Ok(AuthorizedCollection::Home(actor));
+    }
+    Err(ApiError::unprocessable("unknown collection"))
+}
+
 #[derive(Debug, Deserialize)]
 struct EventsQuery {
     collection: String,
@@ -44,12 +73,10 @@ struct EventsQuery {
 
 async fn events_stream(
     State(state): State<AppState>,
-    _auth: Auth,
+    auth: Auth,
     axum::extract::Query(query): axum::extract::Query<EventsQuery>,
 ) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<SseEvent, Infallible>>>> {
-    if query.collection.trim().is_empty() {
-        return Err(ApiError::unprocessable("collection is required"));
-    }
+    authorize_collection(&query.collection, &auth.0.account.id)?;
     let pool = state.store().pool().clone();
     let collection = query.collection;
     let mut last = match query.last_event_id {
@@ -89,7 +116,7 @@ async fn capabilities() -> Json<Capabilities> {
 
 async fn batch(
     State(state): State<AppState>,
-    _auth: Auth,
+    auth: Auth,
     Json(calls): Json<Vec<BatchCall>>,
 ) -> ApiResult<Json<BatchResponse>> {
     if calls.len() > 20 {
@@ -112,21 +139,23 @@ async fn batch(
                 None => (None, Some("account not found".to_owned())),
             },
             Verb::Status { id } => match statuses::by_id(state.store().pool(), &id).await? {
-                Some(row) => match accounts::by_id(state.store().pool(), &row.account_id).await? {
-                    Some(account) => (
-                        Some(
-                            serde_json::to_value(crate::dto::StatusDto::from_row(
-                                &row,
-                                &account,
-                                state.instance(),
-                            ))
-                            .map_err(|error| serialise_error(&error))?,
+                Some(row) if crate::statuses::can_view(&state, Some(&auth), &row).await? => {
+                    match accounts::by_id(state.store().pool(), &row.account_id).await? {
+                        Some(account) => (
+                            Some(
+                                serde_json::to_value(crate::dto::StatusDto::from_row(
+                                    &row,
+                                    &account,
+                                    state.instance(),
+                                ))
+                                .map_err(|error| serialise_error(&error))?,
+                            ),
+                            None,
                         ),
-                        None,
-                    ),
-                    None => (None, Some("status author not found".to_owned())),
-                },
-                None => (None, Some("status not found".to_owned())),
+                        None => (None, Some("status author not found".to_owned())),
+                    }
+                }
+                _ => (None, Some("status not found".to_owned())),
             },
             Verb::Timeline {
                 name,
@@ -189,12 +218,10 @@ struct RootQuery {
 
 async fn root(
     State(state): State<AppState>,
-    _auth: Auth,
+    auth: Auth,
     axum::extract::Query(query): axum::extract::Query<RootQuery>,
 ) -> ApiResult<Json<SyncRoot>> {
-    if query.collection.trim().is_empty() {
-        return Err(ApiError::unprocessable("collection is required"));
-    }
+    authorize_collection(&query.collection, &auth.0.account.id)?;
     let hash = events::root(state.store().pool(), &query.collection)
         .await?
         .unwrap_or_default();
@@ -217,9 +244,10 @@ struct SnapshotQuery {
 
 async fn snapshot(
     State(state): State<AppState>,
-    _auth: Auth,
+    auth: Auth,
     axum::extract::Query(query): axum::extract::Query<SnapshotQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let collection = authorize_collection(&query.collection, &auth.0.account.id)?;
     let root = events::root(state.store().pool(), &query.collection)
         .await?
         .unwrap_or_default();
@@ -232,12 +260,13 @@ async fn snapshot(
                 .map_err(|_| ApiError::unprocessable("max_id is not an id"))?,
         );
     }
-    let page = if query.collection == "timeline:local" {
-        statuses::public_page(state.store().pool(), params, true).await?
-    } else if let Some(actor) = query.collection.strip_prefix("timeline:") {
-        statuses::home_page(state.store().pool(), actor, params).await?
-    } else {
-        return Err(ApiError::unprocessable("unknown collection"));
+    let page = match collection {
+        AuthorizedCollection::Local => {
+            statuses::public_page(state.store().pool(), params, true).await?
+        }
+        AuthorizedCollection::Home(actor) => {
+            statuses::home_page(state.store().pool(), actor, params).await?
+        }
     };
     let mut items = Vec::with_capacity(page.items.len());
     for row in &page.items {
@@ -270,12 +299,13 @@ struct DiffBody {
 
 async fn diff(
     State(state): State<AppState>,
-    _auth: Auth,
+    auth: Auth,
     Json(body): Json<DiffBody>,
 ) -> ApiResult<Json<SyncDiff>> {
     if body.collection.trim().is_empty() || body.since.trim().is_empty() {
         return Err(ApiError::unprocessable("collection and since are required"));
     }
+    authorize_collection(&body.collection, &auth.0.account.id)?;
     let to = events::root(state.store().pool(), &body.collection)
         .await?
         .unwrap_or_default();

@@ -15,18 +15,33 @@ pub struct MiauthSession {
     pub expires_at: DateTime<Utc>,
 }
 
-/// Creates or refreshes a pending `MiAuth` session.
-pub async fn upsert_session(
+/// Outcome of approving a `MiAuth` session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproveStatus {
+    Approved,
+    NotFound,
+    AdminRequired,
+}
+
+/// Outcome of polling/consuming a `MiAuth` session.
+#[derive(Debug, Clone)]
+pub enum SessionCheck {
+    Ready(MiauthSession),
+    Pending,
+    Unknown,
+}
+
+/// Creates a new pending `MiAuth` session. Returns `false` if the session id already exists.
+pub async fn create_session(
     pool: &PgPool,
     session_id: &str,
     app_name: &str,
     callback: Option<&str>,
     scopes: &[String],
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "INSERT INTO miauth_session (id, app_name, callback, scopes) VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (id) DO UPDATE SET app_name = EXCLUDED.app_name, \
-             callback = EXCLUDED.callback, scopes = EXCLUDED.scopes",
+         ON CONFLICT (id) DO NOTHING",
     )
     .bind(session_id)
     .bind(app_name)
@@ -34,28 +49,38 @@ pub async fn upsert_session(
     .bind(scopes)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
-/// Approves an unexpired `MiAuth` session and issues its bearer token atomically.
-///
-/// Returns `Ok(false)` when the session does not exist or has already expired.
+/// Approves an unexpired, unapproved `MiAuth` session and issues its bearer token atomically.
 pub async fn approve_session(
     pool: &PgPool,
     session_id: &str,
     account_id: &str,
+    is_admin: bool,
     token: &str,
     token_hash: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<ApproveStatus, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let row: Option<(Vec<String>,)> =
-        sqlx::query_as("SELECT scopes FROM miauth_session WHERE id = $1 AND expires_at > now()")
-            .bind(session_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let row: Option<(Vec<String>,)> = sqlx::query_as(
+        "SELECT scopes FROM miauth_session \
+         WHERE id = $1 AND expires_at > now() AND token IS NULL \
+         FOR UPDATE",
+    )
+    .bind(session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some((scopes,)) = row else {
-        return Ok(false);
+        return Ok(ApproveStatus::NotFound);
     };
+
+    if !is_admin
+        && scopes
+            .iter()
+            .any(|scope| scope == "admin" || scope.starts_with("admin:"))
+    {
+        return Ok(ApproveStatus::AdminRequired);
+    }
 
     sqlx::query(
         "INSERT INTO oauth_app (id, client_id, client_secret_hash, name, redirect_uris, scopes) \
@@ -86,18 +111,39 @@ pub async fn approve_session(
         .await?;
 
     tx.commit().await?;
-    Ok(true)
+    Ok(ApproveStatus::Approved)
 }
 
-/// Reads the approval status of a `MiAuth` session.
-pub async fn session_status(
-    pool: &PgPool,
-    session_id: &str,
-) -> Result<Option<MiauthSession>, sqlx::Error> {
-    sqlx::query_as::<_, MiauthSession>(
-        "SELECT token, account_id, expires_at FROM miauth_session WHERE id = $1",
+/// Atomically consumes an approved `MiAuth` session so its token can only be retrieved once.
+pub async fn consume_session(pool: &PgPool, session_id: &str) -> Result<SessionCheck, sqlx::Error> {
+    let row = sqlx::query_as::<_, MiauthSession>(
+        "DELETE FROM miauth_session \
+         WHERE id = $1 AND token IS NOT NULL \
+         RETURNING token, account_id, expires_at",
     )
     .bind(session_id)
     .fetch_optional(pool)
-    .await
+    .await?;
+    if let Some(session) = row {
+        return Ok(SessionCheck::Ready(session));
+    }
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM miauth_session WHERE id = $1 AND expires_at > now())",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    if pending {
+        Ok(SessionCheck::Pending)
+    } else {
+        Ok(SessionCheck::Unknown)
+    }
+}
+
+/// Deletes expired `MiAuth` sessions and returns the number of rows removed.
+pub async fn delete_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM miauth_session WHERE expires_at < now()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }

@@ -16,6 +16,8 @@ use url::Url;
 pub const AUTHORIZATION_CODE: &str = "authorization_code";
 /// The only PKCE method accepted.
 pub const S256: &str = "S256";
+/// Cookie holding the per-browser CSRF nonce.
+pub const CSRF_COOKIE: &str = "nodus_csrf";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum Error {
@@ -76,17 +78,113 @@ impl AuthorizeRequest {
 
 /// Checks a registered redirect against the exact URI the client asked for.
 pub fn redirect_allowed(registered: &[String], requested: &str) -> bool {
-    registered.iter().any(|uri| uri == requested)
+    is_safe_redirect_uri(requested) && registered.iter().any(|uri| uri == requested)
+}
+
+/// Whether `uri` is a safe OAuth redirect URI (`http`, `https` with host, or Mastodon OOB).
+#[must_use]
+pub fn is_safe_redirect_uri(uri: &str) -> bool {
+    if uri == "urn:ietf:wg:oauth:2.0:oob" {
+        return true;
+    }
+    is_safe_http_url(uri)
+}
+
+/// Whether `uri` is an `http` or `https` URL with a host.
+#[must_use]
+pub fn is_safe_http_url(uri: &str) -> bool {
+    let Ok(url) = Url::parse(uri) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https") && url.has_host()
+}
+
+/// Whether `scope` grants or refers to administrator privileges.
+#[must_use]
+pub fn is_admin_scope(scope: &str) -> bool {
+    scope == "admin" || scope.starts_with("admin:")
+}
+
+/// Whether `scope` is a syntactically valid Mastodon OAuth scope.
+#[must_use]
+pub fn is_valid_scope(scope: &str) -> bool {
+    if matches!(
+        scope,
+        "read" | "write" | "follow" | "push" | "admin" | "admin:read" | "admin:write"
+    ) {
+        return true;
+    }
+    let Some(rest) = scope
+        .strip_prefix("admin:read:")
+        .or_else(|| scope.strip_prefix("admin:write:"))
+        .or_else(|| scope.strip_prefix("read:"))
+        .or_else(|| scope.strip_prefix("write:"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.split(':').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
 }
 
 /// Appends `code`/`state` (or an OAuth error) to the client's redirect URI.
 pub fn redirect_with(uri: &str, code: &str, state: Option<&str>) -> Result<String, Error> {
+    if !is_safe_redirect_uri(uri) {
+        return Err(Error::RedirectUri);
+    }
     let mut url = Url::parse(uri).map_err(|_| Error::RedirectUri)?;
     url.query_pairs_mut().append_pair("code", code);
     if let Some(state) = state {
         url.query_pairs_mut().append_pair("state", state);
     }
     Ok(url.into())
+}
+
+/// Constant-time byte slice comparison.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Derives the expected CSRF form token for `nonce` and an optional authenticated session secret.
+#[must_use]
+pub fn csrf_token(nonce: &str, session_secret: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nodus-csrf-v1:");
+    if let Some(secret) = session_secret {
+        hasher.update(secret.as_bytes());
+    }
+    hasher.update(b":");
+    hasher.update(nonce.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Verifies a submitted CSRF form token against the `nodus_csrf` cookie and optional session secret.
+#[must_use]
+pub fn verify_csrf(
+    cookie_nonce: Option<&str>,
+    submitted_token: Option<&str>,
+    session_secret: Option<&str>,
+) -> bool {
+    let (Some(nonce), Some(submitted)) = (cookie_nonce, submitted_token) else {
+        return false;
+    };
+    if nonce.is_empty() || submitted.is_empty() {
+        return false;
+    }
+    let expected = csrf_token(nonce, session_secret);
+    constant_time_eq(expected.as_bytes(), submitted.as_bytes())
 }
 
 /// A random, URL-safe opaque token. Only its hash is stored.

@@ -301,6 +301,46 @@ pub async fn expired_originals(pool: &PgPool) -> Result<Vec<String>, sqlx::Error
     Ok(rows.into_iter().map(|(digest,)| digest).collect())
 }
 
+/// Digests removed when pruning expired unattached media uploads.
+#[derive(Debug, Clone, Default)]
+pub struct PrunedUnattached {
+    pub original_digests: Vec<String>,
+    pub variant_digests: Vec<String>,
+}
+
+/// Deletes unattached media uploads older than 24 hours along with their variants,
+/// returning the original and variant digests that may now be unreferenced on disk.
+pub async fn delete_expired_unattached(pool: &PgPool) -> Result<PrunedUnattached, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_attachment \
+         WHERE status_id IS NULL AND created_at < now() - interval '24 hours' \
+         LIMIT 200 \
+         FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if ids.is_empty() {
+        tx.commit().await?;
+        return Ok(PrunedUnattached::default());
+    }
+    let variant_digests: Vec<String> =
+        sqlx::query_scalar("DELETE FROM media_variant WHERE media_id = ANY($1) RETURNING digest")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+    let original_digests: Vec<String> =
+        sqlx::query_scalar("DELETE FROM media_attachment WHERE id = ANY($1) RETURNING digest")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+    tx.commit().await?;
+    Ok(PrunedUnattached {
+        original_digests,
+        variant_digests,
+    })
+}
+
 /// Whether any variant row still uses this content digest.
 pub async fn variant_digest_referenced(pool: &PgPool, digest: &str) -> Result<bool, sqlx::Error> {
     let row: (i64,) = sqlx::query_as("SELECT count(*) FROM media_variant WHERE digest = $1")

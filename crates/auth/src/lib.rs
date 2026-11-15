@@ -4,7 +4,7 @@
 //! clients expect. Storage is behind [`AuthStore`]; the service never opens a second
 //! database abstraction of its own.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use argon2::Argon2;
@@ -20,9 +20,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::domain::{
-    opaque_token, redirect_allowed, redirect_with, token_hash, verify_pkce, AuthorizeRequest,
+    constant_time_eq, csrf_token, is_admin_scope, is_safe_redirect_uri, opaque_token,
+    redirect_allowed, redirect_with, token_hash, verify_csrf, verify_pkce, AuthorizeRequest,
+    CSRF_COOKIE,
 };
-use crate::store::{AuthStore, PgAuthStore, SessionAccount};
+use crate::store::{AuthStore, Credential, PgAuthStore, SessionAccount};
 
 pub mod domain;
 pub mod store;
@@ -40,6 +42,56 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
 pub const SESSION_COOKIE: &str = "nodus_auth";
 const SESSION_DAYS: i64 = 30;
 const CODE_MINUTES: i64 = 5;
+
+static DUMMY_PASSWORD_HASH: LazyLock<String> = LazyLock::new(|| {
+    hash_password("nodus-dummy-timing-oracle-guard").expect("dummy password hash")
+});
+
+/// Builds the per-browser CSRF nonce cookie.
+#[must_use]
+pub fn csrf_cookie(nonce: String, secure: bool) -> Cookie<'static> {
+    let mut cookie = Cookie::new(CSRF_COOKIE, nonce);
+    cookie.set_path("/");
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Lax);
+    cookie.set_secure(secure);
+    cookie
+}
+
+/// Returns `(jar, csrf_form_token)` reusing an existing `nodus_csrf` cookie or minting one.
+pub fn ensure_csrf(
+    jar: CookieJar,
+    session_secret: Option<&str>,
+    secure: bool,
+) -> (CookieJar, String) {
+    let existing = jar
+        .get(CSRF_COOKIE)
+        .map(Cookie::value)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if let Some(nonce) = existing {
+        let token = csrf_token(&nonce, session_secret);
+        (jar, token)
+    } else {
+        let nonce = opaque_token();
+        let token = csrf_token(&nonce, session_secret);
+        (jar.add(csrf_cookie(nonce, secure)), token)
+    }
+}
+
+/// Checks a submitted form CSRF token against the `nodus_csrf` cookie and optional session secret.
+#[must_use]
+pub fn has_valid_csrf(
+    jar: &CookieJar,
+    submitted_token: Option<&str>,
+    session_secret: Option<&str>,
+) -> bool {
+    verify_csrf(
+        jar.get(CSRF_COOKIE).map(Cookie::value),
+        submitted_token,
+        session_secret,
+    )
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -79,7 +131,7 @@ pub fn router<S: AuthStore>(state: AppState<S>) -> Router {
     Router::new()
         .route("/", get(|| async { Redirect::to("/auth/login") }))
         .route("/auth/login", get(login_page::<S>).post(login_submit::<S>))
-        .route("/auth/logout", get(logout::<S>))
+        .route("/auth/logout", post(logout::<S>))
         .route("/auth/session", get(session::<S>))
         .route(
             "/.well-known/oauth-authorization-server",
@@ -101,18 +153,38 @@ struct LoginForm {
     email: String,
     password: String,
     return_to: Option<String>,
+    #[serde(default)]
+    csrf_token: String,
 }
 
 async fn login_page<S: AuthStore>(
-    State(_state): State<AppState<S>>,
+    State(state): State<AppState<S>>,
     Query(query): Query<LoginQuery>,
     jar: CookieJar,
-) -> Html<String> {
-    Html(render_login(
-        query.return_to.as_deref(),
-        jar.get(SESSION_COOKIE).is_some(),
-        None,
-    ))
+) -> (CookieJar, Html<String>) {
+    let signed_in = jar.get(SESSION_COOKIE).is_some();
+    let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    (
+        jar,
+        Html(render_login(
+            query.return_to.as_deref(),
+            signed_in,
+            None,
+            &csrf_token,
+        )),
+    )
+}
+
+fn verify_login_password(credential: Option<&Credential>, password: &str) -> bool {
+    let hash_str = credential.map_or(DUMMY_PASSWORD_HASH.as_str(), |cred| {
+        cred.password_hash.as_str()
+    });
+    let parsed = PasswordHash::new(hash_str)
+        .unwrap_or_else(|_| PasswordHash::new(DUMMY_PASSWORD_HASH.as_str()).expect("dummy hash"));
+    let verified = Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok();
+    credential.is_some() && verified
 }
 
 async fn login_submit<S: AuthStore>(
@@ -120,39 +192,31 @@ async fn login_submit<S: AuthStore>(
     jar: CookieJar,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let Some(credential) = state
+    if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    let credential = state
         .store
         .credential_by_email(form.email.trim())
         .await
         .ok()
-        .flatten()
-    else {
-        return Html(render_login(
-            form.return_to.as_deref(),
-            false,
-            Some("Wrong email or password."),
-        ))
-        .into_response();
-    };
-    let Ok(parsed) = PasswordHash::new(&credential.password_hash) else {
-        return Html(render_login(
-            form.return_to.as_deref(),
-            false,
-            Some("Wrong email or password."),
-        ))
-        .into_response();
-    };
-    if Argon2::default()
-        .verify_password(form.password.as_bytes(), &parsed)
-        .is_err()
-    {
-        return Html(render_login(
-            form.return_to.as_deref(),
-            false,
-            Some("Wrong email or password."),
-        ))
-        .into_response();
+        .flatten();
+    if !verify_login_password(credential.as_ref(), &form.password) {
+        let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+        return (
+            jar,
+            Html(render_login(
+                form.return_to.as_deref(),
+                false,
+                Some("Wrong email or password."),
+                &csrf_token,
+            )),
+        )
+            .into_response();
     }
+    let Some(credential) = credential else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "credential missing").into_response();
+    };
 
     let session = opaque_token();
     let expiry = Utc::now() + Duration::days(SESSION_DAYS);
@@ -169,8 +233,9 @@ async fn login_submit<S: AuthStore>(
             .into_response();
     }
     let cookie = session_cookie(session, expiry, state.config.secure_cookies);
+    let rotated_csrf = csrf_cookie(opaque_token(), state.config.secure_cookies);
     let target = safe_return_to(form.return_to.as_deref()).unwrap_or("/");
-    (jar.add(cookie), Redirect::to(target)).into_response()
+    (jar.add(cookie).add(rotated_csrf), Redirect::to(target)).into_response()
 }
 
 async fn logout<S: AuthStore>(State(state): State<AppState<S>>, jar: CookieJar) -> Response {
@@ -183,7 +248,14 @@ async fn logout<S: AuthStore>(State(state): State<AppState<S>>, jar: CookieJar) 
     let mut removal = Cookie::new(SESSION_COOKIE, "");
     removal.set_path("/");
     removal.set_max_age(Some(time::Duration::ZERO));
-    (jar.remove(removal), Redirect::to("/auth/login")).into_response()
+    let mut csrf_removal = Cookie::new(CSRF_COOKIE, "");
+    csrf_removal.set_path("/");
+    csrf_removal.set_max_age(Some(time::Duration::ZERO));
+    (
+        jar.remove(removal).remove(csrf_removal),
+        Redirect::to("/auth/login"),
+    )
+        .into_response()
 }
 
 async fn session<S: AuthStore>(
@@ -216,6 +288,18 @@ async fn authorize<S: AuthStore>(
     if !redirect_allowed(&app.redirect_uris, &request.redirect_uri) {
         return (StatusCode::BAD_REQUEST, "redirect_uri is not registered").into_response();
     }
+    if request.scopes.is_empty()
+        || !request
+            .scopes
+            .iter()
+            .all(|scope| app.scopes.contains(scope))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "requested scope is not allowed for this client",
+        )
+            .into_response();
+    }
     let Some(account) = current_account(&state, &jar).await else {
         let return_to = format!("/oauth/authorize?{raw}");
         let url = format!(
@@ -224,7 +308,24 @@ async fn authorize<S: AuthStore>(
         );
         return Redirect::to(&url).into_response();
     };
-    Html(render_consent(&app.name, &request, &account)).into_response()
+    if !account.admin && request.scopes.iter().any(|scope| is_admin_scope(scope)) {
+        return (
+            StatusCode::FORBIDDEN,
+            "admin scope requires an administrator account",
+        )
+            .into_response();
+    }
+    let session_secret = jar
+        .get(SESSION_COOKIE)
+        .map(Cookie::value)
+        .map(str::to_owned);
+    let (jar, csrf_token) =
+        ensure_csrf(jar, session_secret.as_deref(), state.config.secure_cookies);
+    (
+        jar,
+        Html(render_consent(&app.name, &request, &account, &csrf_token)),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +336,8 @@ struct ConsentForm {
     state: Option<String>,
     code_challenge: String,
     decision: String,
+    #[serde(default)]
+    csrf_token: String,
 }
 
 async fn consent<S: AuthStore>(
@@ -245,22 +348,46 @@ async fn consent<S: AuthStore>(
     let Some(account) = current_account(&state, &jar).await else {
         return Redirect::to("/auth/login").into_response();
     };
+    let session_secret = jar.get(SESSION_COOKIE).map(Cookie::value);
+    if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), session_secret) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
     let Ok(Some(app)) = state.store.client_app(&form.client_id).await else {
         return (StatusCode::BAD_REQUEST, "unknown client").into_response();
     };
     if !redirect_allowed(&app.redirect_uris, &form.redirect_uri) {
         return (StatusCode::BAD_REQUEST, "redirect_uri is not registered").into_response();
     }
+    let scopes: Vec<String> = form.scopes.split_whitespace().map(str::to_owned).collect();
+    if scopes.is_empty() || !scopes.iter().all(|scope| app.scopes.contains(scope)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "requested scope is not allowed for this client",
+        )
+            .into_response();
+    }
+    if !account.admin && scopes.iter().any(|scope| is_admin_scope(scope)) {
+        return (
+            StatusCode::FORBIDDEN,
+            "admin scope requires an administrator account",
+        )
+            .into_response();
+    }
     if form.decision != "allow" {
+        if !is_safe_redirect_uri(&form.redirect_uri) {
+            return (StatusCode::BAD_REQUEST, "bad redirect_uri").into_response();
+        }
         let Ok(mut url) = url::Url::parse(&form.redirect_uri) else {
             return (StatusCode::BAD_REQUEST, "bad redirect_uri").into_response();
         };
         url.query_pairs_mut().append_pair("error", "access_denied");
+        if let Some(state_val) = form.state.as_deref().filter(|s| !s.is_empty()) {
+            url.query_pairs_mut().append_pair("state", state_val);
+        }
         return Redirect::to(url.as_str()).into_response();
     }
 
     let code = opaque_token();
-    let scopes: Vec<String> = form.scopes.split_whitespace().map(str::to_owned).collect();
     let expires = Utc::now() + Duration::minutes(CODE_MINUTES);
     if state
         .store
@@ -323,14 +450,18 @@ async fn token<S: AuthStore>(
     let Ok(Some(app)) = state.store.client_app(&form.client_id).await else {
         return oauth_error("invalid_client");
     };
-    if let Some(secret) = form
+    let Some(secret) = form
         .client_secret
         .as_deref()
         .filter(|value| !value.is_empty())
-    {
-        if token_hash(secret) != app.client_secret_hash {
-            return oauth_error("invalid_client");
-        }
+    else {
+        return oauth_error("invalid_client");
+    };
+    if !constant_time_eq(
+        token_hash(secret).as_bytes(),
+        app.client_secret_hash.as_bytes(),
+    ) {
+        return oauth_error("invalid_client");
     }
     let Ok(Some(stored)) = state.store.consume_code(&token_hash(code)).await else {
         return oauth_error("invalid_grant");
@@ -340,6 +471,12 @@ async fn token<S: AuthStore>(
     }
     if verify_pkce(verifier, &stored.code_challenge).is_err() {
         return oauth_error("invalid_grant");
+    }
+    if stored.scopes.is_empty() || !stored.scopes.iter().all(|scope| app.scopes.contains(scope)) {
+        return oauth_error("invalid_scope");
+    }
+    if !stored.account_admin && stored.scopes.iter().any(|scope| is_admin_scope(scope)) {
+        return oauth_error("access_denied");
     }
     let access_token = opaque_token();
     if state
@@ -390,7 +527,7 @@ async fn metadata<S: AuthStore>(State(state): State<AppState<S>>) -> Json<serde_
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
         "scopes_supported": ["read", "write", "follow", "push"]
     }))
 }
@@ -477,9 +614,15 @@ fn shell(title: &str, content: impl IntoView + 'static) -> String {
     format!("<!DOCTYPE html>{body}")
 }
 
-fn render_login(return_to: Option<&str>, signed_in: bool, error: Option<&str>) -> String {
+fn render_login(
+    return_to: Option<&str>,
+    signed_in: bool,
+    error: Option<&str>,
+    csrf_token: &str,
+) -> String {
     let return_to = return_to.unwrap_or("/").to_owned();
     let error = error.map(str::to_owned);
+    let csrf_token = csrf_token.to_owned();
     shell(
         "Sign in · Nodus",
         view! {
@@ -488,6 +631,7 @@ fn render_login(return_to: Option<&str>, signed_in: bool, error: Option<&str>) -
             {signed_in.then(|| view! { <p>"You are already signed in."</p> })}
             <form method="post" action="/auth/login">
                 <input type="hidden" name="return_to" value=return_to/>
+                <input type="hidden" name="csrf_token" value=csrf_token/>
                 <label for="email">"Email"</label>
                 <input id="email" name="email" type="email" autocomplete="username" required/>
                 <label for="password">"Password"</label>
@@ -499,9 +643,15 @@ fn render_login(return_to: Option<&str>, signed_in: bool, error: Option<&str>) -
     )
 }
 
-fn render_consent(app_name: &str, request: &AuthorizeRequest, account: &SessionAccount) -> String {
+fn render_consent(
+    app_name: &str,
+    request: &AuthorizeRequest,
+    account: &SessionAccount,
+    csrf_token: &str,
+) -> String {
     let scopes = request.scopes.join(" ");
     let state = request.state.clone().unwrap_or_default();
+    let csrf_token = csrf_token.to_owned();
     shell(
         "Authorize · Nodus",
         view! {
@@ -514,6 +664,7 @@ fn render_consent(app_name: &str, request: &AuthorizeRequest, account: &SessionA
                 <input type="hidden" name="scopes" value=scopes/>
                 <input type="hidden" name="state" value=state/>
                 <input type="hidden" name="code_challenge" value=request.code_challenge.clone()/>
+                <input type="hidden" name="csrf_token" value=csrf_token/>
                 <div class="actions">
                     <button class="secondary" type="submit" name="decision" value="deny">"Deny"</button>
                     <button type="submit" name="decision" value="allow">"Allow"</button>
@@ -549,9 +700,17 @@ mod tests {
 
     #[test]
     fn login_page_escapes_the_return_target() {
-        let html = render_login(Some("/ok"), false, None);
+        let html = render_login(Some("/ok"), false, None, "csrf-sample");
         assert!(html.contains("name=\"return_to\" value=\"/ok\""));
+        assert!(html.contains("name=\"csrf_token\" value=\"csrf-sample\""));
         assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn verify_login_password_parses_dummy_hash_without_oracle() {
+        assert!(!verify_login_password(None, "anything"));
+        let parsed = PasswordHash::new(DUMMY_PASSWORD_HASH.as_str()).expect("valid dummy hash");
+        assert_eq!(parsed.algorithm.as_str(), "argon2id");
     }
 
     #[test]
