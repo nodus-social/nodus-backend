@@ -406,6 +406,11 @@ async fn create_domain_block(
     if form.domain.trim().is_empty() {
         return Err(ApiError::unprocessable("domain is required"));
     }
+    if !matches!(form.severity.as_str(), "silence" | "suspend") {
+        return Err(ApiError::unprocessable(
+            "severity must be silence or suspend",
+        ));
+    }
     let row = moderation::create_block(
         state.store().pool(),
         &NewDomainBlock {
@@ -618,9 +623,15 @@ async fn create_report(
     auth: Auth,
     Form(form): Form<NewReportForm>,
 ) -> ApiResult<Json<ReportDto>> {
+    if form.account_id.trim().is_empty() {
+        return Err(ApiError::unprocessable("account_id is required"));
+    }
     if auth.0.account.id == form.account_id {
         return Err(ApiError::unprocessable("you cannot report yourself"));
     }
+    nodus_server_store::accounts::by_id(state.store().pool(), &form.account_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("account does not exist"))?;
     let status_ids: Vec<String> = form
         .status_ids
         .as_deref()
