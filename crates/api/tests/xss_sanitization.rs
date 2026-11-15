@@ -77,6 +77,9 @@ async fn create_admin_token(pool: &PgPool) -> String {
     )
     .await
     .expect("insert account");
+    accounts::set_admin(pool, &account.id, true)
+        .await
+        .expect("promote admin");
 
     let app_id = Id::new().to_string();
     let client_id = format!("pgtest-client-{app_id}");

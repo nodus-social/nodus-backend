@@ -70,7 +70,7 @@ async fn list_all(
     State(state): State<AppState>,
     auth: Auth,
 ) -> ApiResult<Json<Vec<AnnouncementDto>>> {
-    auth.require_scope("admin:read")?;
+    auth.require_admin("admin:read")?;
     let rows = announcements::list_all(state.store().pool(), 100).await?;
     Ok(Json(rows.into_iter().map(dto).collect()))
 }
@@ -144,7 +144,7 @@ async fn create(
     auth: Auth,
     Form(form): Form<AnnouncementForm>,
 ) -> ApiResult<Json<AnnouncementDto>> {
-    auth.require_scope("admin:write")?;
+    auth.require_admin("admin:write")?;
     let entry = entry(&form)?;
     let row = announcements::create(state.store().pool(), &entry.as_new()).await?;
     Ok(Json(dto(row)))
@@ -156,7 +156,7 @@ async fn update(
     Path(id): Path<String>,
     Form(form): Form<AnnouncementForm>,
 ) -> ApiResult<Json<AnnouncementDto>> {
-    auth.require_scope("admin:write")?;
+    auth.require_admin("admin:write")?;
     let entry = entry(&form)?;
     let row = announcements::update(state.store().pool(), &id, &entry.as_new())
         .await?
@@ -169,7 +169,7 @@ async fn remove(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    auth.require_scope("admin:write")?;
+    auth.require_admin("admin:write")?;
     if !announcements::delete(state.store().pool(), &id).await? {
         return Err(ApiError::not_found("announcement does not exist"));
     }

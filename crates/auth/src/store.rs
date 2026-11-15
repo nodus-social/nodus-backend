@@ -40,6 +40,7 @@ pub struct SessionAccount {
     pub account_id: String,
     pub username: String,
     pub display_name: String,
+    pub admin: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,7 @@ pub struct AuthorizationCode {
     pub id: String,
     pub app_id: String,
     pub account_id: String,
+    pub account_admin: bool,
     pub redirect_uri: String,
     pub scopes: Vec<String>,
     pub code_challenge: String,
@@ -215,21 +217,22 @@ impl AuthStore for PgAuthStore {
     }
 
     async fn session_account(&self, token_hash: &str) -> Result<Option<SessionAccount>, Error> {
-        let row = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT a.id, a.username::text, a.display_name \
+        let row = sqlx::query_as::<_, (String, String, String, bool)>(
+            "SELECT a.id, a.username::text, a.display_name, a.admin \
              FROM auth_session s JOIN account a ON a.id = s.account_id \
-             WHERE s.token_hash = $1 AND s.expires_at > now() AND a.suspended_at IS NULL",
+             WHERE s.token_hash = $1 AND s.expires_at > now() AND a.suspended_at IS NULL AND a.approved",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(
-            row.map(|(account_id, username, display_name)| SessionAccount {
+        Ok(row.map(
+            |(account_id, username, display_name, admin)| SessionAccount {
                 account_id,
                 username,
                 display_name,
-            }),
-        )
+                admin,
+            },
+        ))
     }
 
     async fn delete_session(&self, token_hash: &str) -> Result<(), Error> {
@@ -268,22 +271,27 @@ impl AuthStore for PgAuthStore {
     }
 
     async fn consume_code(&self, code_hash: &str) -> Result<Option<AuthorizationCode>, Error> {
-        let row = sqlx::query_as::<_, (String, String, String, String, Vec<String>, String)>(
-            "UPDATE oauth_code SET consumed_at = now() \
-             WHERE code_hash = $1 AND consumed_at IS NULL AND expires_at > now() \
-             RETURNING id, app_id, account_id, redirect_uri, scopes, code_challenge",
+        let row = sqlx::query_as::<_, (String, String, String, bool, String, Vec<String>, String)>(
+            "UPDATE oauth_code c SET consumed_at = now() \
+             FROM account a \
+             WHERE c.code_hash = $1 AND c.consumed_at IS NULL AND c.expires_at > now() \
+               AND a.id = c.account_id AND a.suspended_at IS NULL AND a.approved \
+             RETURNING c.id, c.app_id, c.account_id, a.admin, c.redirect_uri, c.scopes, c.code_challenge",
         )
         .bind(code_hash)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(
-            |(id, app_id, account_id, redirect_uri, scopes, code_challenge)| AuthorizationCode {
-                id,
-                app_id,
-                account_id,
-                redirect_uri,
-                scopes,
-                code_challenge,
+            |(id, app_id, account_id, account_admin, redirect_uri, scopes, code_challenge)| {
+                AuthorizationCode {
+                    id,
+                    app_id,
+                    account_id,
+                    account_admin,
+                    redirect_uri,
+                    scopes,
+                    code_challenge,
+                }
             },
         ))
     }

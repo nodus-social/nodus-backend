@@ -97,9 +97,10 @@ async fn create_account(pool: &PgPool, label: &str, admin: bool) -> (String, Str
     (row.id, username)
 }
 
-async fn create_token(pool: &PgPool, account_id: &str) -> String {
+async fn create_token_with_scopes(pool: &PgPool, account_id: &str, scopes: &[&str]) -> String {
     let app_id = Id::new().to_string();
     let client_id = format!("pgtest-client-{app_id}");
+    let owned_scopes: Vec<String> = scopes.iter().map(|s| (*s).to_owned()).collect();
     apps::register(
         pool,
         &app_id,
@@ -108,7 +109,7 @@ async fn create_token(pool: &PgPool, account_id: &str) -> String {
         "pgtest",
         None,
         &["urn:ietf:wg:oauth:2.0:oob".to_owned()],
-        &["read".to_owned(), "write".to_owned()],
+        &owned_scopes,
     )
     .await
     .expect("register app");
@@ -123,12 +124,16 @@ async fn create_token(pool: &PgPool, account_id: &str) -> String {
     .bind(&app_id)
     .bind(account_id)
     .bind(&digest)
-    .bind(&["read".to_owned(), "write".to_owned()][..])
+    .bind(&owned_scopes)
     .execute(pool)
     .await
     .expect("insert oauth token");
 
     token
+}
+
+async fn create_token(pool: &PgPool, account_id: &str) -> String {
+    create_token_with_scopes(pool, account_id, &["read", "write"]).await
 }
 
 async fn send(state: &AppState, request: Request<Body>) -> (StatusCode, String) {
@@ -347,7 +352,13 @@ async fn miauth_flow_persists_session_issues_token_and_authenticates() {
             )
             .await
             .expect("create browser session");
-        let cookie_header = format!("{}={session_secret}", nodus_auth::SESSION_COOKIE);
+        let csrf_nonce = opaque_token();
+        let csrf_token = nodus_auth::domain::csrf_token(&csrf_nonce, Some(&session_secret));
+        let cookie_header = format!(
+            "{}={session_secret}; {}={csrf_nonce}",
+            nodus_auth::SESSION_COOKIE,
+            nodus_auth::domain::CSRF_COOKIE
+        );
         let miauth_session = Id::new().to_string();
 
         // Unknown session returns 404 on approve and ok=false on check.
@@ -358,7 +369,7 @@ async fn miauth_flow_persists_session_issues_token_and_authenticates() {
                 .uri("/miauth/nonexistent-session")
                 .header(header::COOKIE, &cookie_header)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("name=Missing"))
+                .body(Body::from(format!("name=Missing&csrf_token={csrf_token}")))
                 .expect("request"),
         )
         .await;
@@ -401,7 +412,7 @@ async fn miauth_flow_persists_session_issues_token_and_authenticates() {
                 .uri(format!("/miauth/{miauth_session}"))
                 .header(header::COOKIE, &cookie_header)
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from("name=MyClient"))
+                .body(Body::from(format!("name=MyClient&csrf_token={csrf_token}")))
                 .expect("request"),
         )
         .await;
@@ -445,7 +456,8 @@ async fn admin_account_action_returns_credential_email() {
     run_db_test(|store, state| async move {
         let pool = store.pool();
         let (admin_id, _) = create_account(pool, "admin", true).await;
-        let admin_token = create_token(pool, &admin_id).await;
+        let admin_token =
+            create_token_with_scopes(pool, &admin_id, &["admin:read", "admin:write"]).await;
 
         let (target_id, _) = create_account(pool, "target", false).await;
         PgAuthStore::new(pool.clone())
