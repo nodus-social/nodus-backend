@@ -15,6 +15,7 @@ pub mod auth;
 pub mod dto;
 pub mod error;
 pub mod filters;
+pub mod html;
 pub mod hydrate;
 pub mod lists;
 pub mod mastodon;
