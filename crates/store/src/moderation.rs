@@ -316,6 +316,16 @@ pub async fn apply_action(
         .await
 }
 
+/// Returns the credential email for an account, if it has a local login.
+pub async fn account_email(pool: &PgPool, account_id: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT email::text FROM account_credential WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct MeasureRow {
     pub date: NaiveDate,

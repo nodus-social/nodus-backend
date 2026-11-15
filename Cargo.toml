@@ -10,12 +10,13 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/nodus-social/nodus-backend"
 
 [workspace.dependencies]
+ammonia = "4"
 nodus-server-core = { path = "crates/core" }
 nodus-server-store = { path = "crates/store" }
 nodus-server-media = { path = "crates/media" }
 nodus-server-api = { path = "crates/api" }
 nodus-server-federation = { path = "crates/federation" }
-nodus-server-worker = { path = "crates/worker" }
+nodus-auth = { path = "crates/auth" }
 nodus-server-sdk = { path = "../server-sdk/crates/server", features = ["activitypub", "misskey", "nodus", "native", "federation", "crypto"] }
 
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }

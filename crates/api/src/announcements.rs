@@ -97,9 +97,29 @@ fn when(raw: Option<&str>, field: &str) -> ApiResult<Option<DateTime<Utc>>> {
         .map_err(|_| ApiError::unprocessable(format!("{field} must be an RFC 3339 timestamp")))
 }
 
-fn entry(form: &AnnouncementForm) -> ApiResult<NewAnnouncement<'_>> {
-    let content = form.content.trim();
-    if content.is_empty() {
+struct ValidatedAnnouncement {
+    content: String,
+    published: bool,
+    all_day: bool,
+    starts_at: Option<DateTime<Utc>>,
+    ends_at: Option<DateTime<Utc>>,
+}
+
+impl ValidatedAnnouncement {
+    fn as_new(&self) -> NewAnnouncement<'_> {
+        NewAnnouncement {
+            content: &self.content,
+            published: self.published,
+            all_day: self.all_day,
+            starts_at: self.starts_at,
+            ends_at: self.ends_at,
+        }
+    }
+}
+
+fn entry(form: &AnnouncementForm) -> ApiResult<ValidatedAnnouncement> {
+    let raw = form.content.trim();
+    if raw.is_empty() {
         return Err(ApiError::unprocessable("content is required"));
     }
     let starts_at = when(form.starts_at.as_deref(), "starts_at")?;
@@ -110,8 +130,8 @@ fn entry(form: &AnnouncementForm) -> ApiResult<NewAnnouncement<'_>> {
     {
         return Err(ApiError::unprocessable("ends_at must be after starts_at"));
     }
-    Ok(NewAnnouncement {
-        content,
+    Ok(ValidatedAnnouncement {
+        content: crate::html::sanitize_html(raw),
         published: form.published,
         all_day: form.all_day,
         starts_at,
@@ -126,7 +146,7 @@ async fn create(
 ) -> ApiResult<Json<AnnouncementDto>> {
     auth.require_scope("admin:write")?;
     let entry = entry(&form)?;
-    let row = announcements::create(state.store().pool(), &entry).await?;
+    let row = announcements::create(state.store().pool(), &entry.as_new()).await?;
     Ok(Json(dto(row)))
 }
 
@@ -138,7 +158,7 @@ async fn update(
 ) -> ApiResult<Json<AnnouncementDto>> {
     auth.require_scope("admin:write")?;
     let entry = entry(&form)?;
-    let row = announcements::update(state.store().pool(), &id, &entry)
+    let row = announcements::update(state.store().pool(), &id, &entry.as_new())
         .await?
         .ok_or_else(|| ApiError::not_found("announcement does not exist"))?;
     Ok(Json(dto(row)))

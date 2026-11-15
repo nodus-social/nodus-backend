@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 axum = { workspace = true }
-nodus-auth = { path = "../auth" }
+nodus-auth = { workspace = true }
 nodus-server-api = { workspace = true }
 nodus-server-core = { workspace = true }
 nodus-server-store = { workspace = true }

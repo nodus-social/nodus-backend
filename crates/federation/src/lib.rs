@@ -110,10 +110,6 @@ pub fn signing_string(
     for name in &params.headers {
         let value = if name == "(request-target)" {
             format!("{} {}", method.to_lowercase(), path)
-        } else if name == "(created)" || name == "(expires)" {
-            // Mastodon sends these on outgoing requests and requires them on some
-            // incoming ones; they arrive as headers with the parentheses stripped.
-            lookup(name).ok_or(VerifyError::Malformed("missing signed header"))?
         } else {
             lookup(name).ok_or(VerifyError::Malformed("missing signed header"))?
         };
@@ -155,12 +151,25 @@ pub struct SignedRequest<'a> {
     pub now: DateTime<Utc>,
 }
 
-/// Verifies digest, date window and signature in the order the failures matter:
-/// a wrong digest means the body is not the one that was signed, so checking it first
-/// keeps a forged body from ever reaching a signature check.
-pub fn verify(request: &SignedRequest<'_>) -> Result<SignatureParams, VerifyError> {
-    let header = request
-        .headers
+/// A request whose signature header, body digest, date window, and signed header list
+/// have been validated and are ready for cryptographic verification against an actor key.
+#[derive(Debug, Clone)]
+pub struct PreparedRequest {
+    pub params: SignatureParams,
+    pub signing_string: String,
+}
+
+/// Validates digest, date window, and signed headers without parsing a public key or
+/// performing network I/O, so callers can reject forged or stale requests before fetching
+/// an actor's key.
+pub fn prepare(
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    now: DateTime<Utc>,
+) -> Result<PreparedRequest, VerifyError> {
+    let header = headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("signature"))
         .map(|(_, value)| value.clone())
@@ -172,16 +181,19 @@ pub fn verify(request: &SignedRequest<'_>) -> Result<SignatureParams, VerifyErro
     }
 
     let get = |name: &str| {
-        request
-            .headers
+        headers
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.clone())
     };
 
     if let Some(digest) = get("digest") {
-        verify_digest(request.body, &digest)?;
-    } else if params.headers.iter().any(|name| name == "digest") {
+        verify_digest(body, &digest)?;
+    } else if params
+        .headers
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("digest"))
+    {
         return Err(VerifyError::MissingDigest);
     }
 
@@ -189,21 +201,43 @@ pub fn verify(request: &SignedRequest<'_>) -> Result<SignatureParams, VerifyErro
     let signed_at = DateTime::parse_from_rfc2822(&date)
         .map_err(|_| VerifyError::StaleDate)?
         .with_timezone(&Utc);
-    if (request.now - signed_at).num_seconds().abs() > MAX_CLOCK_SKEW.num_seconds() {
+    if (now - signed_at).num_seconds().abs() > MAX_CLOCK_SKEW.num_seconds() {
         return Err(VerifyError::StaleDate);
     }
 
-    let key = RsaPublicKey::from_public_key_pem(request.actor_key_pem)
-        .or_else(|_| rsa::pkcs1::DecodeRsaPublicKey::from_pkcs1_pem(request.actor_key_pem))
-        .map_err(|_| VerifyError::MissingKey)?;
-    let signing = signing_string(&params, request.method, request.path, get)?;
-    let signature =
-        Signature::try_from(params.signature.as_slice()).map_err(|_| VerifyError::BadSignature)?;
-    VerifyingKey::<Sha256>::new(key)
-        .verify(signing.as_bytes(), &signature)
-        .map_err(|_| VerifyError::BadSignature)?;
+    let signing = signing_string(&params, method, path, get)?;
+    Ok(PreparedRequest {
+        params,
+        signing_string: signing,
+    })
+}
 
-    Ok(params)
+/// Verifies a [`PreparedRequest`] against the actor's PEM-encoded RSA public key.
+pub fn verify_prepared(prepared: &PreparedRequest, actor_key_pem: &str) -> Result<(), VerifyError> {
+    let key = RsaPublicKey::from_public_key_pem(actor_key_pem)
+        .or_else(|_| rsa::pkcs1::DecodeRsaPublicKey::from_pkcs1_pem(actor_key_pem))
+        .map_err(|_| VerifyError::MissingKey)?;
+    let signature = Signature::try_from(prepared.params.signature.as_slice())
+        .map_err(|_| VerifyError::BadSignature)?;
+    VerifyingKey::<Sha256>::new(key)
+        .verify(prepared.signing_string.as_bytes(), &signature)
+        .map_err(|_| VerifyError::BadSignature)?;
+    Ok(())
+}
+
+/// Verifies digest, date window and signature in the order the failures matter:
+/// a wrong digest means the body is not the one that was signed, so checking it first
+/// keeps a forged body from ever reaching a signature check.
+pub fn verify(request: &SignedRequest<'_>) -> Result<SignatureParams, VerifyError> {
+    let prepared = prepare(
+        request.method,
+        request.path,
+        request.headers,
+        request.body,
+        request.now,
+    )?;
+    verify_prepared(&prepared, request.actor_key_pem)?;
+    Ok(prepared.params)
 }
 
 /// `SHA-256=` + base64, for outgoing requests.
@@ -367,5 +401,68 @@ mod tests {
             now: Utc::now(),
         };
         assert!(matches!(verify(&request), Err(VerifyError::StaleDate)));
+    }
+
+    #[test]
+    fn prepare_rejects_missing_signed_digest_before_key_lookup() {
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let now = DateTime::parse_from_rfc2822(date)
+            .expect("date")
+            .with_timezone(&Utc);
+        let headers = [
+            ("host".to_owned(), "us.test".to_owned()),
+            ("date".to_owned(), date.to_owned()),
+            (
+                "signature".to_owned(),
+                "keyId=\"https://a/b#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"AAAA\""
+                    .to_owned(),
+            ),
+        ];
+        let err = prepare("POST", "/inbox", &headers, b"{}", now).expect_err("missing digest");
+        assert!(matches!(err, VerifyError::MissingDigest));
+    }
+
+    #[test]
+    fn prepare_and_verify_prepared_validate_a_signed_request() {
+        let (private, pem) = key_pair();
+        let body = br#"{"type":"Create"}"#;
+        let digest = digest_header(body);
+        let date = "Sun, 06 Nov 1994 08:49:37 GMT";
+        let now = DateTime::parse_from_rfc2822(date)
+            .expect("date")
+            .with_timezone(&Utc);
+        let params = SignatureParams {
+            key_id: "https://a/b#main-key".to_owned(),
+            algorithm: "rsa-sha256".to_owned(),
+            headers: vec![
+                "(request-target)".to_owned(),
+                "host".to_owned(),
+                "date".to_owned(),
+                "digest".to_owned(),
+            ],
+            signature: Vec::new(),
+        };
+        let signing = signing_string(&params, "POST", "/inbox", |name| match name {
+            "host" => Some("us.test".to_owned()),
+            "date" => Some(date.to_owned()),
+            "digest" => Some(digest.clone()),
+            _ => None,
+        })
+        .expect("signing string");
+        let signed = SigningKey::<Sha256>::new(private).sign(signing.as_bytes());
+        let sig_header = format!(
+            "keyId=\"https://a/b#main-key\",algorithm=\"rsa-sha256\",headers=\"(request-target) host date digest\",signature=\"{}\"",
+            BASE64.encode(signed.to_bytes())
+        );
+        let headers = [
+            ("host".to_owned(), "us.test".to_owned()),
+            ("date".to_owned(), date.to_owned()),
+            ("digest".to_owned(), digest),
+            ("signature".to_owned(), sig_header),
+        ];
+
+        let prepared = prepare("POST", "/inbox", &headers, body, now).expect("prepare");
+        assert_eq!(prepared.params.key_id, "https://a/b#main-key");
+        assert!(verify_prepared(&prepared, &pem).is_ok());
     }
 }

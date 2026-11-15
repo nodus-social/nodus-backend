@@ -19,13 +19,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use nodus_server_core::PageParams;
+use nodus_server_federation::{prepare, verify_prepared};
 use nodus_server_sdk::activitypub::ActivityPub;
 use nodus_server_sdk::activitypub::{
     Activity, ActivityKind, ActivityObject, Actor, Attachment, Collection, CollectionPage, Note,
     Webfinger,
 };
-use nodus_server_sdk::federation::signature::crypto::{body_digest, RsaVerifier};
-use nodus_server_sdk::federation::signature::{HttpSignature, Verifier};
 use nodus_server_store::accounts::{self, AccountRow};
 use nodus_server_store::statuses::{self, StatusRow};
 
@@ -296,33 +295,31 @@ async fn verify_signature(
     uri: &axum::http::Uri,
     body: &[u8],
 ) -> ApiResult<()> {
-    let raw = headers
-        .get("signature")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::unauthorized("Missing HTTP signature"))?;
-    let signature =
-        HttpSignature::parse(raw).map_err(|error| ApiError::unauthorized(error.to_string()))?;
-    if let Some(digest) = headers.get("digest").and_then(|value| value.to_str().ok()) {
-        if digest != body_digest(body) {
-            return Err(ApiError::unauthorized("Body digest does not match"));
-        }
-    }
-    if let Some(date) = headers.get("date").and_then(|value| value.to_str().ok()) {
-        let parsed = chrono::DateTime::parse_from_rfc2822(date)
-            .map_err(|_| ApiError::unauthorized("Invalid Date header"))?;
-        if (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
-            .num_minutes()
-            .abs()
-            > 5
-        {
-            return Err(ApiError::unauthorized("Signature is stale"));
-        }
-    }
-    let key_actor = signature
+    let header_pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    let prepared = prepare("POST", uri.path(), &header_pairs, body, chrono::Utc::now())
+        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
+    let key_actor = prepared
+        .params
         .key_id
         .split('#')
         .next()
-        .unwrap_or(&signature.key_id);
+        .unwrap_or(&prepared.params.key_id);
+    if let Some(pem) = accounts::by_uri(state.store().pool(), key_actor)
+        .await?
+        .and_then(|account| account.public_key_pem)
+    {
+        if verify_prepared(&prepared, &pem).is_ok() {
+            return Ok(());
+        }
+    }
     let actor = ActivityPub::new()
         .actor_url(key_actor)
         .await
@@ -330,30 +327,7 @@ async fn verify_signature(
     let pem = actor
         .public_key_pem
         .ok_or_else(|| ApiError::unauthorized("Actor has no public key"))?;
-    let signing = signature
-        .signing_string(|name| {
-            if name == "(request-target)" {
-                Some(format!("post {}", uri.path()))
-            } else {
-                headers
-                    .get(name)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned)
-            }
-        })
-        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
-    RsaVerifier::from_public_key_pem(&pem)
-        .and_then(|verifier| {
-            verifier.verify(
-                &signature.key_id,
-                &signature.algorithm,
-                signing.as_bytes(),
-                &signature.signature,
-            )
-        })
-        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
-    let _ = state;
-    Ok(())
+    verify_prepared(&prepared, &pem).map_err(|error| ApiError::unauthorized(error.to_string()))
 }
 
 async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()> {
@@ -419,15 +393,25 @@ pub(crate) async fn ensure_remote_actor(
         .actor_url(actor_url)
         .await
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;
-    let host = domain;
+    upsert_remote_actor(state, actor_url, &domain, &actor).await
+}
+
+async fn upsert_remote_actor(
+    state: &AppState,
+    actor_url: &str,
+    domain: &str,
+    actor: &Actor,
+) -> ApiResult<AccountRow> {
+    let display_name = crate::html::escape_text(&actor.name);
+    let note = crate::html::sanitize_html(&actor.summary);
     Ok(accounts::upsert_remote(
         state.store().pool(),
         &accounts::RemoteAccount {
             uri: actor_url,
             username: &actor.username,
-            domain: &host,
-            display_name: &actor.name,
-            note: &actor.summary,
+            domain,
+            display_name: &display_name,
+            note: &note,
             avatar: actor.avatar.as_deref(),
             inbox_url: actor.inbox.as_deref(),
             shared_inbox_url: actor.shared_inbox.as_deref(),
@@ -485,15 +469,18 @@ pub(crate) async fn ingest_note(
         |_| chrono::Utc::now(),
         |date| date.with_timezone(&chrono::Utc),
     );
+    let content_html = crate::html::sanitize_html(&note.content);
+    let content = html_to_text(&content_html);
+    let spoiler_text = crate::html::escape_text(&note.summary);
     statuses::upsert_remote(
         state.store().pool(),
         &statuses::NewRemoteStatus {
             id: &nodus_server_core::Id::new().to_string(),
             account_id: &remote.id,
             uri: &note.id,
-            content: &html_to_text(&note.content),
-            content_html: &note.content,
-            spoiler_text: &note.summary,
+            content: &content,
+            content_html: &content_html,
+            spoiler_text: &spoiler_text,
             sensitive: note.sensitive,
             in_reply_to_id: parent.as_ref().map(|row| row.id.as_str()),
             in_reply_to_account_id: parent.as_ref().map(|row| row.account_id.as_str()),
@@ -726,6 +713,160 @@ fn document_response<D: Document>(document: &D) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodus_server_core::Id;
+    use nodus_server_store::Store;
+
+    async fn with_isolated_state<F, Fut>(body: F)
+    where
+        F: FnOnce(Store, AppState) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let admin = Store::connect(&url, 1).await.expect("connect to postgres");
+        let schema = format!("pgtest_{}", Id::new());
+        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+            .execute(admin.pool())
+            .await
+            .expect("create isolated test schema");
+
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let schema_url = format!("{url}{sep}options=-csearch_path%3D{schema}%2Cpublic");
+        let store = Store::connect(&schema_url, 5)
+            .await
+            .expect("connect isolated store");
+        store.migrate().await.expect("run migrations");
+
+        let state = AppState::new(
+            store.clone(),
+            crate::InstanceConfig {
+                domain: "social.test".to_owned(),
+                base_url: "https://social.test".to_owned(),
+                title: "Nodus test".to_owned(),
+                description: "A test instance".to_owned(),
+                contact_email: None,
+                api_version: "4.3.0".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+        );
+        body(store, state).await;
+
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+            .execute(admin.pool())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn ingest_note_sanitizes_html_and_escapes_summary() {
+        with_isolated_state(|store, state| async move {
+            let remote = accounts::upsert_remote(
+                store.pool(),
+                &accounts::RemoteAccount {
+                    uri: "https://remote.test/users/mallory",
+                    username: "mallory",
+                    domain: "remote.test",
+                    display_name: "Mallory",
+                    note: "",
+                    avatar: None,
+                    inbox_url: Some("https://remote.test/users/mallory/inbox"),
+                    shared_inbox_url: None,
+                    public_key_pem: None,
+                    locked: false,
+                    bot: false,
+                },
+            )
+            .await
+            .expect("upsert remote account");
+
+            let note_uri = format!("https://remote.test/notes/{}", Id::new());
+            let note_json = serde_json::json!({
+                "id": note_uri,
+                "type": "Note",
+                "published": "2026-01-01T00:00:00Z",
+                "summary": "<script>alert('cw')</script> & warning",
+                "sensitive": true,
+                "content": "<p>Hello <span class=\"h-card\"><a class=\"u-url mention\" href=\"https://social.test/@alice\">@alice</a></span></p><script>alert(1)</script><img src=x onerror=alert(2)><a href=\"javascript:alert(3)\">evil</a>"
+            });
+
+            ingest_note(&state, &remote, &note_json)
+                .await
+                .expect("ingest note");
+
+            let stored = statuses::by_uri(store.pool(), &note_uri)
+                .await
+                .expect("lookup")
+                .expect("stored status");
+
+            assert!(!stored.content_html.contains("<script"));
+            assert!(!stored.content_html.contains("alert(1)"));
+            assert!(!stored.content_html.contains("<img"));
+            assert!(!stored.content_html.contains("onerror"));
+            assert!(!stored.content_html.contains("javascript:"));
+            assert!(
+                stored.content_html.contains(
+                    r#"<span class="h-card"><a class="u-url mention" href="https://social.test/@alice" target="_blank" rel="nofollow noopener noreferrer">@alice</a></span>"#
+                ),
+                "mention formatting lost: {}",
+                stored.content_html
+            );
+            assert!(stored.content_html.contains(">evil</a>"), "unwrapped link text lost");
+            assert!(!stored.content.contains("alert(1)"));
+            assert!(!stored.spoiler_text.contains('<'));
+            assert!(stored.spoiler_text.contains("&lt;script&gt;"));
+            assert!(stored.spoiler_text.contains("&amp;"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upsert_remote_actor_sanitizes_summary_and_escapes_name() {
+        with_isolated_state(|_store, state| async move {
+            let actor_url = format!("https://remote.test/users/{}", Id::new());
+            let actor = Actor {
+                id: actor_url.clone(),
+                kind: "Person".to_owned(),
+                username: "mallory".to_owned(),
+                name: "<script>alert('name')</script> & <b>Mallory</b>".to_owned(),
+                summary: "<p>Bio <a href=\"https://remote.test/@mallory\">profile</a></p><script>alert(1)</script><img src=x onerror=alert(2)>".to_owned(),
+                url: actor_url.clone(),
+                avatar: None,
+                header: None,
+                followers: None,
+                following: None,
+                outbox: None,
+                inbox: Some(format!("{actor_url}/inbox")),
+                shared_inbox: None,
+                public_key_pem: None,
+                public_key_id: None,
+                published: None,
+                discoverable: true,
+                indexable: true,
+                manually_approves_followers: false,
+                extra: Map::default(),
+            };
+
+            let row = upsert_remote_actor(&state, &actor_url, "remote.test", &actor)
+                .await
+                .expect("upsert remote actor");
+
+            assert!(!row.display_name.contains('<'));
+            assert!(row.display_name.contains("&lt;script&gt;"));
+            assert!(row.display_name.contains("&amp;"));
+            assert!(!row.note.contains("<script"));
+            assert!(!row.note.contains("alert(1)"));
+            assert!(!row.note.contains("<img"));
+            assert!(!row.note.contains("onerror"));
+            assert!(
+                row.note.contains(
+                    r#"<p>Bio <a href="https://remote.test/@mallory" target="_blank" rel="nofollow noopener noreferrer">profile</a></p>"#
+                ),
+                "bio was: {}",
+                row.note
+            );
+        })
+        .await;
+    }
 
     #[test]
     fn webfinger_accepts_the_local_acct_form() {
