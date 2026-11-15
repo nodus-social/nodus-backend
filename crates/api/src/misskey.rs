@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::str::FromStr;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -22,6 +23,7 @@ use sha2::{Digest, Sha256};
 use nodus_server_core::id::Id;
 use nodus_server_core::limits::STATUS_MAX_CHARS;
 use nodus_server_core::pagination::{PageParams, PageSize};
+use nodus_server_core::Visibility;
 use nodus_server_sdk::misskey::api::{File, Meta, Note, NoteVisibility, User};
 use nodus_server_sdk::misskey::{Aid, Reaction};
 use nodus_server_store::accounts::{self, AccountRow, Authenticated};
@@ -125,7 +127,12 @@ async fn user_for(state: &AppState, account: &AccountRow) -> ApiResult<User> {
     })
 }
 
-async fn note_for(state: &AppState, row: &StatusRow, account: &AccountRow) -> ApiResult<Note> {
+async fn note_for(
+    state: &AppState,
+    row: &StatusRow,
+    account: &AccountRow,
+    viewer_id: Option<&str>,
+) -> ApiResult<Note> {
     let id = dialect_id(state, "status", &row.id, row.created_at).await?;
     let user_id = dialect_id(state, "account", &account.id, account.created_at).await?;
     let reactions = statuses::reactions(state.store().pool(), &row.id).await?;
@@ -140,27 +147,33 @@ async fn note_for(state: &AppState, row: &StatusRow, account: &AccountRow) -> Ap
         })
         .collect();
     let reaction_count = reaction_map.values().sum();
-    let renote = match &row.reblog_of_id {
+    let (renote_id, renote) = match &row.reblog_of_id {
         Some(renote) => match statuses::by_id(state.store().pool(), renote).await? {
-            Some(inner) => match accounts::by_id(state.store().pool(), &inner.account_id).await? {
-                Some(author) => Some(Box::new(Box::pin(note_for(state, &inner, &author)).await?)),
-                None => None,
-            },
-            None => None,
+            Some(inner)
+                if crate::statuses::can_view_for_viewer(state, viewer_id, &inner).await? =>
+            {
+                let inner_id = dialect_id(state, "status", &inner.id, inner.created_at).await?;
+                let inner_note =
+                    match accounts::by_id(state.store().pool(), &inner.account_id).await? {
+                        Some(author) => Some(Box::new(
+                            Box::pin(note_for(state, &inner, &author, viewer_id)).await?,
+                        )),
+                        None => None,
+                    };
+                (Some(inner_id), inner_note)
+            }
+            _ => (None, None),
         },
-        None => None,
-    };
-    let renote_id = match &row.reblog_of_id {
-        Some(reblog) => match statuses::by_id(state.store().pool(), reblog).await? {
-            Some(inner) => Some(dialect_id(state, "status", &inner.id, inner.created_at).await?),
-            None => None,
-        },
-        None => None,
+        None => (None, None),
     };
     let reply_id = match &row.in_reply_to_id {
         Some(reply) => match statuses::by_id(state.store().pool(), reply).await? {
-            Some(inner) => Some(dialect_id(state, "status", &inner.id, inner.created_at).await?),
-            None => None,
+            Some(inner)
+                if crate::statuses::can_view_for_viewer(state, viewer_id, &inner).await? =>
+            {
+                Some(dialect_id(state, "status", &inner.id, inner.created_at).await?)
+            }
+            _ => None,
         },
         None => None,
     };
@@ -248,13 +261,31 @@ async fn resolve_account(state: &AppState, external: &str) -> ApiResult<AccountR
         .ok_or_else(|| ApiError::not_found("No such user"))
 }
 
-async fn resolve_note(state: &AppState, external: &str) -> ApiResult<StatusRow> {
+async fn resolve_note_target(
+    state: &AppState,
+    viewer_id: &str,
+    external: &str,
+    not_found_message: &str,
+) -> ApiResult<StatusRow> {
     let local = external_ids::resolve(state.store().pool(), "status", external)
         .await?
-        .ok_or_else(|| ApiError::not_found("No such note"))?;
-    statuses::by_id(state.store().pool(), &local)
+        .ok_or_else(|| ApiError::not_found(not_found_message))?;
+    let row = statuses::by_id(state.store().pool(), &local)
         .await?
-        .ok_or_else(|| ApiError::not_found("No such note"))
+        .ok_or_else(|| ApiError::not_found(not_found_message))?;
+    if crate::statuses::can_view_for_viewer(state, Some(viewer_id), &row).await? {
+        Ok(row)
+    } else {
+        Err(ApiError::not_found(not_found_message))
+    }
+}
+
+async fn resolve_visible_note(
+    state: &AppState,
+    viewer_id: &str,
+    external: &str,
+) -> ApiResult<StatusRow> {
+    resolve_note_target(state, viewer_id, external, "No such note").await
 }
 
 async fn meta(State(state): State<AppState>) -> Json<Meta> {
@@ -344,7 +375,7 @@ async fn user_notes(
     State(state): State<AppState>,
     Json(body): Json<UserNoteBody>,
 ) -> ApiResult<Json<Vec<Note>>> {
-    let _auth = authenticate(&state, body.i.as_deref()).await?;
+    let auth = authenticate(&state, body.i.as_deref()).await?;
     let account = resolve_account(&state, &body.user_id).await?;
     let mut params = PageParams::new();
     params.limit = body.limit;
@@ -361,7 +392,7 @@ async fn user_notes(
     let page = statuses::account_page(state.store().pool(), &account.id, params).await?;
     let mut notes = Vec::with_capacity(page.items.len());
     for row in &page.items {
-        notes.push(note_for(&state, row, &account).await?);
+        notes.push(note_for(&state, row, &account, Some(&auth.account.id)).await?);
     }
     Ok(Json(notes))
 }
@@ -424,12 +455,14 @@ async fn favorite_note(
     Json(body): Json<FavoriteBody>,
 ) -> ApiResult<Json<Note>> {
     let auth = authenticate(&state, body.i.as_deref()).await?;
-    let row = resolve_note(&state, &body.note_id).await?;
+    let row = resolve_visible_note(&state, &auth.account.id, &body.note_id).await?;
     social::favourite(state.store().pool(), &auth.account.id, &row.id).await?;
     let account = accounts::by_id(state.store().pool(), &row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
-    Ok(Json(note_for(&state, &row, &account).await?))
+    Ok(Json(
+        note_for(&state, &row, &account, Some(&auth.account.id)).await?,
+    ))
 }
 
 async fn unfavorite_note(
@@ -437,12 +470,14 @@ async fn unfavorite_note(
     Json(body): Json<FavoriteBody>,
 ) -> ApiResult<Json<Note>> {
     let auth = authenticate(&state, body.i.as_deref()).await?;
-    let row = resolve_note(&state, &body.note_id).await?;
+    let row = resolve_visible_note(&state, &auth.account.id, &body.note_id).await?;
     social::unfavourite(state.store().pool(), &auth.account.id, &row.id).await?;
     let account = accounts::by_id(state.store().pool(), &row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
-    Ok(Json(note_for(&state, &row, &account).await?))
+    Ok(Json(
+        note_for(&state, &row, &account, Some(&auth.account.id)).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -478,13 +513,22 @@ async fn notifications(
         let user = user_for(&state, &from).await?;
         let note = match row.status_id.as_deref() {
             Some(id) => match statuses::by_id(state.store().pool(), id).await? {
-                Some(status) => {
+                Some(status)
+                    if crate::statuses::can_view_for_viewer(
+                        &state,
+                        Some(&auth.account.id),
+                        &status,
+                    )
+                    .await? =>
+                {
                     match accounts::by_id(state.store().pool(), &status.account_id).await? {
-                        Some(author) => Some(note_for(&state, &status, &author).await?),
+                        Some(author) => {
+                            Some(note_for(&state, &status, &author, Some(&auth.account.id)).await?)
+                        }
                         None => None,
                     }
                 }
-                None => None,
+                _ => None,
             },
             None => None,
         };
@@ -558,12 +602,19 @@ async fn timeline(
                 .map_err(|_| ApiError::unprocessable("sinceId is not a known note"))?,
         );
     }
-    let page = match timeline {
-        Timeline::Local => statuses::public_page(state.store().pool(), params, true).await?,
-        Timeline::Global => statuses::public_page(state.store().pool(), params, false).await?,
+    let (page, viewer_id) = match timeline {
+        Timeline::Local => (
+            statuses::public_page(state.store().pool(), params, true).await?,
+            None,
+        ),
+        Timeline::Global => (
+            statuses::public_page(state.store().pool(), params, false).await?,
+            None,
+        ),
         Timeline::Home => {
             let auth = authenticate(state, body.i.as_deref()).await?;
-            statuses::home_page(state.store().pool(), &auth.account.id, params).await?
+            let page = statuses::home_page(state.store().pool(), &auth.account.id, params).await?;
+            (page, Some(auth.account.id))
         }
     };
     let mut notes = Vec::with_capacity(page.items.len());
@@ -571,7 +622,7 @@ async fn timeline(
         let Some(account) = accounts::by_id(state.store().pool(), &row.account_id).await? else {
             continue;
         };
-        notes.push(note_for(state, row, &account).await?);
+        notes.push(note_for(state, row, &account, viewer_id.as_deref()).await?);
     }
     Ok(Json(notes))
 }
@@ -588,17 +639,14 @@ async fn show_note(
     State(state): State<AppState>,
     Json(body): Json<NoteBody>,
 ) -> ApiResult<Json<Note>> {
-    let _auth = authenticate(&state, body.i.as_deref()).await?;
-    let local_id = external_ids::resolve(state.store().pool(), "status", &body.note_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("No such note"))?;
-    let row = statuses::by_id(state.store().pool(), &local_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("No such note"))?;
+    let auth = authenticate(&state, body.i.as_deref()).await?;
+    let row = resolve_visible_note(&state, &auth.account.id, &body.note_id).await?;
     let account = accounts::by_id(state.store().pool(), &row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
-    Ok(Json(note_for(&state, &row, &account).await?))
+    Ok(Json(
+        note_for(&state, &row, &account, Some(&auth.account.id)).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -638,13 +686,13 @@ async fn create_note(
     let media_sensitive = attachments.iter().any(|attachment| attachment.sensitive);
     let renote_internal = match body.renote_id.as_deref() {
         Some(external) => {
-            let local = external_ids::resolve(state.store().pool(), "status", external)
-                .await?
-                .ok_or_else(|| ApiError::not_found("No such renote target"))?;
-            statuses::by_id(state.store().pool(), &local)
-                .await?
-                .ok_or_else(|| ApiError::not_found("No such renote target"))?;
-            Some(local)
+            let target =
+                resolve_note_target(&state, &auth.account.id, external, "No such renote target")
+                    .await?;
+            if !Visibility::from_str(&target.visibility).is_ok_and(Visibility::boostable) {
+                return Err(ApiError::unprocessable("This note cannot be renoted"));
+            }
+            Some(target.id)
         }
         None => None,
     };
@@ -657,13 +705,10 @@ async fn create_note(
     }
     let (reply_internal, reply_account) = match body.reply_id.as_deref() {
         Some(external) => {
-            let local = external_ids::resolve(state.store().pool(), "status", external)
-                .await?
-                .ok_or_else(|| ApiError::not_found("No such reply target"))?;
-            let reply = statuses::by_id(state.store().pool(), &local)
-                .await?
-                .ok_or_else(|| ApiError::not_found("No such reply target"))?;
-            (Some(local), Some(reply.account_id))
+            let reply =
+                resolve_note_target(&state, &auth.account.id, external, "No such reply target")
+                    .await?;
+            (Some(reply.id), Some(reply.account_id))
         }
         None => (None, None),
     };
@@ -698,17 +743,21 @@ async fn create_note(
         )
         .await?;
     }
-    events::append(
-        state.store().pool(),
-        "timeline:local",
-        "status",
-        &json!({ "status_id": row.id }),
-    )
-    .await?;
+    if row.visibility == "public" {
+        events::append(
+            state.store().pool(),
+            "timeline:local",
+            "status",
+            &json!({ "status_id": row.id }),
+        )
+        .await?;
+    }
     let account = accounts::by_id(state.store().pool(), &row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
-    Ok(Json(note_for(&state, &row, &account).await?))
+    Ok(Json(
+        note_for(&state, &row, &account, Some(&auth.account.id)).await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -785,6 +834,18 @@ async fn stream_events(state: AppState, socket: WebSocket) {
                     .unwrap_or_default();
                 for row in rows {
                     last.clone_from(&row.hash);
+                    if row.kind == "status" {
+                        if let Some(status_id) =
+                            row.payload.get("status_id").and_then(Value::as_str)
+                        {
+                            if matches!(
+                                statuses::by_id(state.store().pool(), status_id).await,
+                                Ok(Some(status)) if status.visibility != "public"
+                            ) {
+                                continue;
+                            }
+                        }
+                    }
                     let body = json!({
                         "id": row.id,
                         "type": "note",
@@ -826,12 +887,10 @@ async fn create_reaction(
     let auth = authenticate(&state, body.i.as_deref()).await?;
     let reaction = Reaction::parse(&body.reaction)
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;
-    let local_id = external_ids::resolve(state.store().pool(), "status", &body.note_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("No such note"))?;
+    let row = resolve_visible_note(&state, &auth.account.id, &body.note_id).await?;
     statuses::set_reaction(
         state.store().pool(),
-        &local_id,
+        &row.id,
         &auth.account.id,
         reaction.as_str(),
     )
@@ -852,9 +911,7 @@ async fn delete_reaction(
     Json(body): Json<DeleteReactionBody>,
 ) -> ApiResult<Json<Value>> {
     let auth = authenticate(&state, body.i.as_deref()).await?;
-    let local_id = external_ids::resolve(state.store().pool(), "status", &body.note_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("No such note"))?;
-    statuses::remove_reaction(state.store().pool(), &local_id, &auth.account.id).await?;
+    let row = resolve_visible_note(&state, &auth.account.id, &body.note_id).await?;
+    statuses::remove_reaction(state.store().pool(), &row.id, &auth.account.id).await?;
     Ok(Json(json!({})))
 }

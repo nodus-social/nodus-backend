@@ -5,12 +5,14 @@
 //! [`BIG_ACCOUNT_THRESHOLD`] are merged at read time. Both lanes are ordered by the
 //! same id and deduped, so a status that crosses the threshold never appears twice.
 
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::{FromRow, PgPool};
 
 use nodus_server_core::limits::BIG_ACCOUNT_THRESHOLD;
-use nodus_server_core::{PageOrder, PageParams, PageSize};
+use nodus_server_core::{PageOrder, PageParams, PageSize, Visibility};
 
 /// A row of `status`, as the timeline queries return it.
 #[derive(Debug, Clone, FromRow)]
@@ -216,6 +218,7 @@ pub async fn home_page(
            JOIN status s ON s.id = e.status_id \
            JOIN account a ON a.id = s.account_id \
           WHERE e.account_id = $1 AND e.kind = 'home' AND s.deleted_at IS NULL \
+            AND s.visibility <> 'direct' \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
@@ -227,7 +230,8 @@ pub async fn home_page(
           WHERE s.account_id IN ( \
                   SELECT f.target_account_id FROM follow f \
                     JOIN account a2 ON a2.id = f.target_account_id \
-                   WHERE f.account_id = $1 AND a2.followers_count >= $5) \
+                   WHERE f.account_id = $1 AND f.state = 'accepted' \
+                     AND a2.followers_count >= $5) \
             AND s.deleted_at IS NULL AND s.visibility <> 'direct' \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
@@ -391,6 +395,34 @@ fn finish(mut rows: Vec<StatusRow>, size: PageSize) -> StatusPage {
     }
 }
 
+async fn fan_out_home(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: &str,
+    status_id: &str,
+    visibility: &str,
+) -> Result<(), sqlx::Error> {
+    if !Visibility::from_str(visibility).is_ok_and(Visibility::in_home_timeline) {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO timeline_entry (account_id, status_id, kind) \
+         SELECT $1, $2, 'home' \
+         UNION SELECT f.account_id, $2, 'home' \
+                 FROM follow f \
+                 JOIN account a ON a.id = f.target_account_id \
+                WHERE f.target_account_id = $1 \
+                  AND f.state = 'accepted' \
+                  AND a.followers_count < $3 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(account_id)
+    .bind(status_id)
+    .bind(BIG_ACCOUNT_THRESHOLD)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// The complete local write: status, media attachments, mentions, tags, timeline fan-out.
 ///
 /// Fan-out is immediate here because a local follower timeline is a single indexed
@@ -458,17 +490,7 @@ pub async fn create(
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query(
-        "INSERT INTO timeline_entry (account_id, status_id, kind) \
-         SELECT $1, $2, 'home' \
-         UNION SELECT account_id, $2, 'home' FROM follow \
-                WHERE target_account_id = $1 AND state = 'accepted' \
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(new.account_id)
-    .bind(new.id)
-    .execute(&mut *tx)
-    .await?;
+    fan_out_home(&mut tx, new.account_id, new.id, new.visibility).await?;
     sqlx::query(
         "UPDATE account SET statuses_count = statuses_count + 1, last_status_at = now() \
          WHERE id = $1",
@@ -489,7 +511,7 @@ pub async fn reblog(
     let Some(original) = by_id(pool, original_id).await? else {
         return Ok(None);
     };
-    if original.visibility == "direct" {
+    if !Visibility::from_str(&original.visibility).is_ok_and(Visibility::boostable) {
         return Ok(None);
     }
     let id = nodus_server_core::Id::new().to_string();
@@ -515,17 +537,7 @@ pub async fn reblog(
     .bind(original_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "INSERT INTO timeline_entry (account_id, status_id, kind) \
-         SELECT $1, $2, 'home' \
-         UNION SELECT account_id, $2, 'home' FROM follow \
-                WHERE target_account_id = $1 AND state = 'accepted' \
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(account_id)
-    .bind(&id)
-    .execute(&mut *tx)
-    .await?;
+    fan_out_home(&mut tx, account_id, &id, &original.visibility).await?;
     tx.commit().await?;
     Ok(Some(row))
 }
