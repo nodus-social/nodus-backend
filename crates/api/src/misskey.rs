@@ -677,14 +677,14 @@ async fn create_note(
     let auth = authenticate(&state, body.i.as_deref()).await?;
     let attachments = media::by_ids(state.store().pool(), &body.file_ids).await?;
     if attachments.len() != body.file_ids.len()
-        || attachments
-            .iter()
-            .any(|attachment| attachment.account_id != auth.account.id)
+        || attachments.iter().any(|attachment| {
+            attachment.account_id != auth.account.id || attachment.status_id.is_some()
+        })
     {
         return Err(ApiError::unprocessable("Unknown file id"));
     }
     let media_sensitive = attachments.iter().any(|attachment| attachment.sensitive);
-    let renote_internal = match body.renote_id.as_deref() {
+    let renote_target = match body.renote_id.as_deref() {
         Some(external) => {
             let target =
                 resolve_note_target(&state, &auth.account.id, external, "No such renote target")
@@ -692,30 +692,32 @@ async fn create_note(
             if !Visibility::from_str(&target.visibility).is_ok_and(Visibility::boostable) {
                 return Err(ApiError::unprocessable("This note cannot be renoted"));
             }
-            Some(target.id)
+            Some(target)
         }
         None => None,
     };
     let text = body.text.unwrap_or_default();
-    if renote_internal.is_none() && text.trim().is_empty() {
+    if renote_target.is_none() && text.trim().is_empty() {
         return Err(ApiError::unprocessable("text is required"));
     }
     if text.chars().count() > usize::try_from(STATUS_MAX_CHARS).unwrap_or(usize::MAX) {
         return Err(ApiError::unprocessable("text is too long"));
     }
-    let (reply_internal, reply_account) = match body.reply_id.as_deref() {
+    let reply_target = match body.reply_id.as_deref() {
         Some(external) => {
             let reply =
                 resolve_note_target(&state, &auth.account.id, external, "No such reply target")
                     .await?;
-            (Some(reply.id), Some(reply.account_id))
+            Some(reply)
         }
-        None => (None, None),
+        None => None,
     };
+    let mention_ids = crate::statuses::resolve_mentions(&state, &text).await?;
+    let tags = crate::statuses::extract_tags(&text);
     let id = Id::new().to_string();
     let html = format!("<p>{}</p>", escape_html(&text).replace('\n', "<br>"));
     let cw = body.cw.unwrap_or_default();
-    let row = statuses::insert(
+    let row = statuses::create(
         state.store().pool(),
         &statuses::NewStatus {
             id: &id,
@@ -727,19 +729,31 @@ async fn create_note(
             spoiler_text: &cw,
             visibility: visibility_in(body.visibility),
             sensitive: body.sensitive || media_sensitive,
-            in_reply_to_id: reply_internal.as_deref(),
-            in_reply_to_account_id: reply_account.as_deref(),
-            reblog_of_id: renote_internal.as_deref(),
+            in_reply_to_id: reply_target.as_ref().map(|reply| reply.id.as_str()),
+            in_reply_to_account_id: reply_target.as_ref().map(|reply| reply.account_id.as_str()),
+            reblog_of_id: renote_target.as_ref().map(|target| target.id.as_str()),
             language: None,
         },
+        &body.file_ids,
+        &mention_ids,
+        &tags,
     )
     .await?;
-    if !body.file_ids.is_empty() {
-        media::attach(
+    crate::statuses::notify_mentions(
+        state.store().pool(),
+        &auth.account.id,
+        &row.id,
+        reply_target.as_ref().map(|reply| reply.account_id.as_str()),
+        &mention_ids,
+    )
+    .await?;
+    if let Some(target) = &renote_target {
+        social::notify(
             state.store().pool(),
-            &body.file_ids,
+            &target.account_id,
+            "reblog",
             &auth.account.id,
-            &row.id,
+            Some(&target.id),
         )
         .await?;
     }

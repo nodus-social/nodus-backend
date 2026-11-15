@@ -75,7 +75,7 @@ pub async fn create(
     }
     let media_ids = validate_media(&state, &auth, &request.media_ids).await?;
     let mention_ids = resolve_mentions(&state, text).await?;
-    let tags = tags(text);
+    let tags = extract_tags(text);
     let in_reply_to = match request.in_reply_to_id.as_deref() {
         Some(id) => {
             let parent = nodus_server_store::statuses::by_id(state.store().pool(), id)
@@ -112,26 +112,16 @@ pub async fn create(
         &tags,
     )
     .await?;
-    if let Some(parent) = &in_reply_to {
-        nodus_server_store::social::notify(
-            state.store().pool(),
-            &parent.account_id,
-            "mention",
-            &auth.0.account.id,
-            Some(&row.id),
-        )
-        .await?;
-    }
-    for mention in &mention_ids {
-        nodus_server_store::social::notify(
-            state.store().pool(),
-            mention,
-            "mention",
-            &auth.0.account.id,
-            Some(&row.id),
-        )
-        .await?;
-    }
+    notify_mentions(
+        state.store().pool(),
+        &auth.0.account.id,
+        &row.id,
+        in_reply_to
+            .as_ref()
+            .map(|parent| parent.account_id.as_str()),
+        &mention_ids,
+    )
+    .await?;
     Ok(Json(dto(&state, &row, Some(&auth)).await?))
 }
 
@@ -214,21 +204,21 @@ pub async fn reblog(
     Path(id): Path<String>,
 ) -> ApiResult<Json<StatusDto>> {
     auth.require_scope("write:statuses")?;
-    let _ = visible_status(&state, Some(&auth), &id).await?;
-    let row = nodus_server_store::statuses::reblog(state.store().pool(), &auth.0.account.id, &id)
-        .await?
-        .ok_or_else(|| ApiError::unprocessable("This status cannot be boosted"))?;
-    let original = nodus_server_store::statuses::by_id(state.store().pool(), &id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    nodus_server_store::social::notify(
-        state.store().pool(),
-        &original.account_id,
-        "reblog",
-        &auth.0.account.id,
-        Some(&id),
-    )
-    .await?;
+    let original = visible_status(&state, Some(&auth), &id).await?;
+    let (row, created) =
+        nodus_server_store::statuses::reblog_status(state.store().pool(), &auth.0.account.id, &id)
+            .await?
+            .ok_or_else(|| ApiError::unprocessable("This status cannot be boosted"))?;
+    if created {
+        nodus_server_store::social::notify(
+            state.store().pool(),
+            &original.account_id,
+            "reblog",
+            &auth.0.account.id,
+            Some(&id),
+        )
+        .await?;
+    }
     Ok(Json(dto(&state, &row, Some(&auth)).await?))
 }
 
@@ -444,7 +434,7 @@ async fn validate_media(state: &AppState, auth: &Auth, ids: &[String]) -> ApiRes
     Ok(ids.to_vec())
 }
 
-async fn resolve_mentions(state: &AppState, text: &str) -> ApiResult<Vec<String>> {
+pub(crate) async fn resolve_mentions(state: &AppState, text: &str) -> ApiResult<Vec<String>> {
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
     for word in text.split_whitespace() {
@@ -474,7 +464,7 @@ async fn resolve_mentions(state: &AppState, text: &str) -> ApiResult<Vec<String>
     Ok(ids)
 }
 
-fn tags(text: &str) -> Vec<String> {
+pub(crate) fn extract_tags(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut tags = Vec::new();
     for word in text.split_whitespace() {
@@ -491,6 +481,41 @@ fn tags(text: &str) -> Vec<String> {
         }
     }
     tags
+}
+
+pub(crate) async fn notify_mentions(
+    pool: &sqlx::PgPool,
+    from_account_id: &str,
+    status_id: &str,
+    reply_to_account_id: Option<&str>,
+    mention_ids: &[String],
+) -> ApiResult<()> {
+    let mut notified = HashSet::new();
+    if let Some(target_id) = reply_to_account_id {
+        if notified.insert(target_id) {
+            nodus_server_store::social::notify(
+                pool,
+                target_id,
+                "mention",
+                from_account_id,
+                Some(status_id),
+            )
+            .await?;
+        }
+    }
+    for mention in mention_ids {
+        if notified.insert(mention.as_str()) {
+            nodus_server_store::social::notify(
+                pool,
+                mention,
+                "mention",
+                from_account_id,
+                Some(status_id),
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 fn render(text: &str) -> String {
