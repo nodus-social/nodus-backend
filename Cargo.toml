@@ -10,6 +10,7 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/nodus-social/nodus-backend"
 
 [workspace.dependencies]
+ammonia = "4"
 nodus-server-core = { path = "crates/core" }
 nodus-server-store = { path = "crates/store" }
 nodus-server-media = { path = "crates/media" }
