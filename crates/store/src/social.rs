@@ -60,6 +60,51 @@ pub enum FollowOutcome {
     Requested,
 }
 
+fn ordered_pair<'a>(first: &'a str, second: &'a str) -> (&'a str, Option<&'a str>) {
+    match first.cmp(second) {
+        std::cmp::Ordering::Equal => (first, None),
+        std::cmp::Ordering::Less => (first, Some(second)),
+        std::cmp::Ordering::Greater => (second, Some(first)),
+    }
+}
+
+/// Locks both accounts in deterministic `id` order to prevent counter drift and deadlocks.
+async fn lock_account_pair(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    first: &str,
+    second: &str,
+) -> Result<(), sqlx::Error> {
+    let (a, b) = ordered_pair(first, second);
+    for id in std::iter::once(a).chain(b) {
+        sqlx::query("SELECT id FROM account WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Recomputes `followers_count` and `following_count` for both accounts inside `tx`.
+async fn sync_follow_counts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    first: &str,
+    second: &str,
+) -> Result<(), sqlx::Error> {
+    let (a, b) = ordered_pair(first, second);
+    for id in std::iter::once(a).chain(b) {
+        sqlx::query(
+            "UPDATE account SET \
+                 followers_count = (SELECT count(*) FROM follow WHERE target_account_id = $1 AND state = 'accepted'), \
+                 following_count = (SELECT count(*) FROM follow WHERE account_id = $1 AND state = 'accepted') \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Follows a target, or updates the reblog/notify switches when already following.
 pub async fn follow(
     pool: &PgPool,
@@ -71,9 +116,11 @@ pub async fn follow(
     if account_id == target_id {
         return Ok(FollowOutcome::Following);
     }
+    let mut tx = pool.begin().await?;
+    lock_account_pair(&mut tx, account_id, target_id).await?;
     let locked: Option<bool> = sqlx::query_scalar("SELECT locked FROM account WHERE id = $1")
         .bind(target_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
     let state = if locked.unwrap_or(false) {
         "pending"
@@ -94,7 +141,7 @@ pub async fn follow(
     .bind(state)
     .bind(reblogs)
     .bind(notify)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let resulting = inserted.map_or(state, |(value,)| {
         if value == "pending" {
@@ -104,23 +151,9 @@ pub async fn follow(
         }
     });
     if resulting == "accepted" {
-        sqlx::query(
-            "UPDATE account SET followers_count = \
-                 (SELECT count(*) FROM follow WHERE target_account_id = $1 AND state = 'accepted') \
-             WHERE id = $1",
-        )
-        .bind(target_id)
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "UPDATE account SET following_count = \
-                 (SELECT count(*) FROM follow WHERE account_id = $1 AND state = 'accepted') \
-             WHERE id = $1",
-        )
-        .bind(account_id)
-        .execute(pool)
-        .await?;
+        sync_follow_counts(&mut tx, account_id, target_id).await?;
     }
+    tx.commit().await?;
     Ok(if resulting == "pending" {
         FollowOutcome::Requested
     } else {
@@ -129,28 +162,22 @@ pub async fn follow(
 }
 
 pub async fn unfollow(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM follow WHERE account_id = $1 AND target_account_id = $2")
-        .bind(account_id)
-        .bind(target_id)
-        .execute(pool)
-        .await?;
-    sqlx::query(
-        "UPDATE account SET followers_count = \
-             (SELECT count(*) FROM follow WHERE target_account_id = $1 AND state = 'accepted') \
-         WHERE id = $1",
-    )
-    .bind(target_id)
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "UPDATE account SET following_count = \
-             (SELECT count(*) FROM follow WHERE account_id = $1 AND state = 'accepted') \
-         WHERE id = $1",
+    if account_id == target_id {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    lock_account_pair(&mut tx, account_id, target_id).await?;
+    let removed: Option<(String,)> = sqlx::query_as(
+        "DELETE FROM follow WHERE account_id = $1 AND target_account_id = $2 RETURNING state",
     )
     .bind(account_id)
-    .execute(pool)
+    .bind(target_id)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(())
+    if removed.as_ref().is_some_and(|(state,)| state == "accepted") {
+        sync_follow_counts(&mut tx, account_id, target_id).await?;
+    }
+    tx.commit().await
 }
 
 /// Accepts a pending follow request, if the target owns it.
@@ -159,34 +186,25 @@ pub async fn accept_follow(
     target_id: &str,
     requester_id: &str,
 ) -> Result<bool, sqlx::Error> {
+    if target_id == requester_id {
+        return Ok(false);
+    }
+    let mut tx = pool.begin().await?;
+    lock_account_pair(&mut tx, requester_id, target_id).await?;
     let changed = sqlx::query(
         "UPDATE follow SET state = 'accepted' \
          WHERE account_id = $1 AND target_account_id = $2 AND state = 'pending'",
     )
     .bind(requester_id)
     .bind(target_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected()
         == 1;
     if changed {
-        sqlx::query(
-            "UPDATE account SET followers_count = \
-                 (SELECT count(*) FROM follow WHERE target_account_id = $1 AND state = 'accepted') \
-             WHERE id = $1",
-        )
-        .bind(target_id)
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "UPDATE account SET following_count = \
-                 (SELECT count(*) FROM follow WHERE account_id = $1 AND state = 'accepted') \
-             WHERE id = $1",
-        )
-        .bind(requester_id)
-        .execute(pool)
-        .await?;
+        sync_follow_counts(&mut tx, requester_id, target_id).await?;
     }
+    tx.commit().await?;
     Ok(changed)
 }
 
@@ -507,6 +525,7 @@ pub async fn block(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(
         return Ok(());
     }
     let mut tx = pool.begin().await?;
+    lock_account_pair(&mut tx, account_id, target_id).await?;
     sqlx::query(
         "INSERT INTO account_relation (account_id, target_account_id, kind) \
          VALUES ($1, $2, 'block') ON CONFLICT DO NOTHING",
@@ -515,25 +534,21 @@ pub async fn block(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(
     .bind(target_id)
     .execute(&mut *tx)
     .await?;
+    let mut removed_accepted = false;
     for (from, to) in [(account_id, target_id), (target_id, account_id)] {
         let removed: Option<(String,)> = sqlx::query_as(
-            "DELETE FROM follow WHERE account_id = $1 AND target_account_id = $2 \
-             AND state = 'accepted' RETURNING account_id",
+            "DELETE FROM follow WHERE account_id = $1 AND target_account_id = $2 RETURNING state",
         )
         .bind(from)
         .bind(to)
         .fetch_optional(&mut *tx)
         .await?;
-        if removed.is_some() {
-            sqlx::query("UPDATE account SET following_count = GREATEST(0, following_count - 1) WHERE id = $1")
-                .bind(from)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("UPDATE account SET followers_count = GREATEST(0, followers_count - 1) WHERE id = $1")
-                .bind(to)
-                .execute(&mut *tx)
-                .await?;
+        if removed.as_ref().is_some_and(|(state,)| state == "accepted") {
+            removed_accepted = true;
         }
+    }
+    if removed_accepted {
+        sync_follow_counts(&mut tx, account_id, target_id).await?;
     }
     sqlx::query(
         "DELETE FROM notification WHERE (account_id = $1 AND from_account_id = $2) \
