@@ -14,8 +14,10 @@ use leptos::prelude::*;
 use serde::Deserialize;
 use serde_json::json;
 
-use nodus_auth::domain::{opaque_token, token_hash};
+use nodus_auth::domain::{is_admin_scope, is_safe_http_url, opaque_token, token_hash};
 use nodus_auth::store::{AuthStore, PgAuthStore};
+use nodus_auth::{ensure_csrf, has_valid_csrf, SESSION_COOKIE};
+use nodus_server_store::miauth::{ApproveStatus, SessionCheck};
 use nodus_server_store::{accounts, miauth};
 
 use crate::error::ApiError;
@@ -42,16 +44,47 @@ async fn start(
     Query(query): Query<StartQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let Some(account) = session_account(&state, &headers).await else {
+        return (StatusCode::UNAUTHORIZED, Html("<p>Sign in first.</p>")).into_response();
+    };
     let scopes: Vec<String> = query
         .permission
         .as_deref()
-        .unwrap_or("read write follow")
+        .unwrap_or("read,write,follow")
         .split(',')
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
         .map(str::to_owned)
         .collect();
-    if let Err(error) = miauth::upsert_session(
+    if scopes.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Html("<p>At least one permission is required.</p>"),
+        )
+            .into_response();
+    }
+    if !account.admin && scopes.iter().any(|scope| is_admin_scope(scope)) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html("<p>Administrator access is required for admin permissions.</p>"),
+        )
+            .into_response();
+    }
+    if let Some(callback) = query
+        .callback
+        .as_deref()
+        .map(str::trim)
+        .filter(|cb| !cb.is_empty())
+    {
+        if !is_safe_http_url(callback) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Html("<p>Invalid callback URL.</p>"),
+            )
+                .into_response();
+        }
+    }
+    match miauth::create_session(
         state.store().pool(),
         &session,
         &query.name,
@@ -60,11 +93,25 @@ async fn start(
     )
     .await
     {
-        return ApiError::from(error).into_response();
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Html("<p>MiAuth session already exists.</p>"),
+            )
+                .into_response();
+        }
+        Err(error) => return ApiError::from(error).into_response(),
     }
-    if session_account(&state, &headers).await.is_none() {
-        return (StatusCode::UNAUTHORIZED, Html("<p>Sign in first.</p>")).into_response();
-    }
+    let jar = CookieJar::from_headers(&headers);
+    let session_secret = jar
+        .get(SESSION_COOKIE)
+        .map(|cookie| cookie.value().to_owned());
+    let (jar, csrf_token) = ensure_csrf(
+        jar,
+        session_secret.as_deref(),
+        state.instance().base_url.starts_with("https://"),
+    );
     let permission = scopes.join(",");
     let action = format!("/miauth/{session}");
     let name = query.name;
@@ -82,6 +129,7 @@ async fn start(
                         <h1>{title}</h1>
                         <p>{scopes}</p>
                         <input type="hidden" name="name" value=name />
+                        <input type="hidden" name="csrf_token" value=csrf_token />
                         <button type="submit">"Approve"</button>
                     </form>
                 </body>
@@ -89,12 +137,14 @@ async fn start(
         }
         .to_html()
     });
-    Html(format!("<!DOCTYPE html>{body}")).into_response()
+    (jar, Html(format!("<!DOCTYPE html>{body}"))).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 struct ApproveForm {
     name: String,
+    #[serde(default)]
+    csrf_token: String,
 }
 
 async fn approve(
@@ -106,22 +156,40 @@ async fn approve(
     let Some(account) = session_account(&state, &headers).await else {
         return (StatusCode::UNAUTHORIZED, Html("<p>Sign in first.</p>")).into_response();
     };
+    let jar = CookieJar::from_headers(&headers);
+    let session_secret = jar
+        .get(SESSION_COOKIE)
+        .map(axum_extra::extract::cookie::Cookie::value);
+    if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), session_secret) {
+        return (StatusCode::FORBIDDEN, Html("<p>Invalid CSRF token.</p>")).into_response();
+    }
     let token = opaque_token();
     let hash = token_hash(&token);
-    let approved = match miauth::approve_session(
+    let status = match miauth::approve_session(
         state.store().pool(),
         &session,
         &account.account_id,
+        account.admin,
         &token,
         &hash,
     )
     .await
     {
-        Ok(approved) => approved,
+        Ok(status) => status,
         Err(error) => return ApiError::from(error).into_response(),
     };
-    if !approved {
-        return (StatusCode::NOT_FOUND, Html("<p>Unknown session.</p>")).into_response();
+    match status {
+        ApproveStatus::Approved => {}
+        ApproveStatus::NotFound => {
+            return (StatusCode::NOT_FOUND, Html("<p>Unknown session.</p>")).into_response();
+        }
+        ApproveStatus::AdminRequired => {
+            return (
+                StatusCode::FORBIDDEN,
+                Html("<p>Administrator access is required for admin permissions.</p>"),
+            )
+                .into_response();
+        }
     }
     let html = format!(
         "<p>Approved {}. You can return to the app.</p>",
@@ -131,12 +199,16 @@ async fn approve(
 }
 
 async fn check(State(state): State<AppState>, Path(session): Path<String>) -> Response {
-    let session_row = match miauth::session_status(state.store().pool(), &session).await {
-        Ok(row) => row,
+    let check_result = match miauth::consume_session(state.store().pool(), &session).await {
+        Ok(result) => result,
         Err(error) => return ApiError::from(error).into_response(),
     };
-    let Some(session_row) = session_row else {
-        return Json(json!({"ok": false, "error": "unknown session"})).into_response();
+    let session_row = match check_result {
+        SessionCheck::Ready(row) => row,
+        SessionCheck::Pending => return Json(json!({"ok": false})).into_response(),
+        SessionCheck::Unknown => {
+            return Json(json!({"ok": false, "error": "unknown session"})).into_response();
+        }
     };
     if session_row.token.is_none() || session_row.expires_at < Utc::now() {
         return Json(json!({"ok": false})).into_response();
