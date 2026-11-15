@@ -99,20 +99,25 @@ async fn list(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<F
     Ok(Json(out))
 }
 
+fn validate_filter_request(body: &FilterRequest) -> ApiResult<&str> {
+    let title = body.title.trim();
+    if title.is_empty() {
+        return Err(ApiError::unprocessable("title is required"));
+    }
+    if !matches!(body.filter_action.as_str(), "warn" | "hide") {
+        return Err(ApiError::unprocessable(
+            "filter_action must be warn or hide",
+        ));
+    }
+    Ok(title)
+}
+
 async fn create(
     State(state): State<AppState>,
     auth: Auth,
     Json(body): Json<FilterRequest>,
 ) -> ApiResult<Json<FilterDto>> {
-    let title = body.title.trim();
-    if title.is_empty() {
-        return Err(ApiError::unprocessable("title is required"));
-    }
-    if body.filter_action != "warn" && body.filter_action != "hide" {
-        return Err(ApiError::unprocessable(
-            "filter_action must be warn or hide",
-        ));
-    }
+    let title = validate_filter_request(&body)?;
     let row = nodus_server_store::filters::create(
         state.store().pool(),
         &auth.0.account.id,
@@ -153,10 +158,7 @@ async fn update(
     Path(id): Path<String>,
     Json(body): Json<FilterRequest>,
 ) -> ApiResult<Json<FilterDto>> {
-    let title = body.title.trim();
-    if title.is_empty() {
-        return Err(ApiError::unprocessable("title is required"));
-    }
+    let title = validate_filter_request(&body)?;
     let row = nodus_server_store::filters::update(
         state.store().pool(),
         &auth.0.account.id,

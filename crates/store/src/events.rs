@@ -47,7 +47,7 @@ pub async fn append(
             .fetch_one(&mut *tx)
             .await?;
     let id = ulid::Ulid::new().to_string();
-    let hash = chain_hash(previous.as_deref(), &id, kind, payload);
+    let hash = chain_hash(collection, previous.as_deref(), &id, kind, payload);
     let row = sqlx::query_as::<_, EventRow>(
         "INSERT INTO event_log (id, collection, kind, payload, previous_hash, hash) \
          VALUES ($1, $2, $3, $4, $5, $6) \
@@ -123,18 +123,81 @@ pub async fn knows(pool: &PgPool, collection: &str, hash: &str) -> Result<bool, 
     .await
 }
 
+fn write_canonical_json(value: &Value, out: &mut String) {
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(num) => {
+            if num.is_f64() && num.as_f64() == Some(0.0) {
+                out.push('0');
+            } else {
+                out.push_str(&num.to_string());
+            }
+        }
+        Value::String(text) => {
+            if let Ok(encoded) = serde_json::to_string(text) {
+                out.push_str(&encoded);
+            }
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            // RFC 8785 JCS sorts object member names by UTF-16 code units.
+            let mut entries: Vec<(&str, &Value)> =
+                map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            entries.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
+            out.push('{');
+            for (idx, (key, val)) in entries.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                if let Ok(encoded) = serde_json::to_string(key) {
+                    out.push_str(&encoded);
+                }
+                out.push(':');
+                write_canonical_json(val, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Serialises `value` using RFC 8785 JCS (lexicographically sorted keys, no insignificant whitespace).
+#[must_use]
+pub fn canonical_json(value: &Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(value, &mut out);
+    out
+}
+
 /// Recomputes one link exactly as [`append`] did.
 #[must_use]
-pub fn chain_hash(previous: Option<&str>, id: &str, kind: &str, payload: &Value) -> String {
+pub fn chain_hash(
+    collection: &str,
+    previous: Option<&str>,
+    id: &str,
+    kind: &str,
+    payload: &Value,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"nodus-sync-v1\0");
+    hasher.update(collection.as_bytes());
+    hasher.update(b"\0");
     hasher.update(previous.unwrap_or_default().as_bytes());
     hasher.update(b"\0");
     hasher.update(id.as_bytes());
     hasher.update(b"\0");
     hasher.update(kind.as_bytes());
     hasher.update(b"\0");
-    hasher.update(payload.to_string().as_bytes());
+    hasher.update(canonical_json(payload).as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -145,16 +208,55 @@ mod tests {
     #[test]
     fn a_chain_link_depends_on_its_predecessor() {
         let payload = serde_json::json!({"status_id": "1"});
-        let first = chain_hash(None, "a", "status", &payload);
-        let second = chain_hash(Some(&first), "b", "status", &payload);
+        let first = chain_hash("timeline:local", None, "a", "status", &payload);
+        let second = chain_hash("timeline:local", Some(&first), "b", "status", &payload);
         assert_ne!(first, second);
-        assert_eq!(first, chain_hash(None, "a", "status", &payload));
+        assert_eq!(
+            first,
+            chain_hash("timeline:local", None, "a", "status", &payload)
+        );
+    }
+
+    #[test]
+    fn a_chain_link_depends_on_its_collection() {
+        let payload = serde_json::json!({"status_id": "1"});
+        let local = chain_hash("timeline:local", None, "a", "status", &payload);
+        let home = chain_hash("timeline:user1", None, "a", "status", &payload);
+        assert_ne!(local, home);
     }
 
     #[test]
     fn the_payload_is_part_of_the_hash() {
-        let one = chain_hash(None, "a", "status", &serde_json::json!({"n": 1}));
-        let two = chain_hash(None, "a", "status", &serde_json::json!({"n": 2}));
+        let one = chain_hash(
+            "timeline:local",
+            None,
+            "a",
+            "status",
+            &serde_json::json!({"n": 1}),
+        );
+        let two = chain_hash(
+            "timeline:local",
+            None,
+            "a",
+            "status",
+            &serde_json::json!({"n": 2}),
+        );
         assert_ne!(one, two);
+    }
+
+    #[test]
+    fn canonical_json_sorts_keys_recursively_and_strips_whitespace() {
+        let value = serde_json::json!({
+            "z": 1,
+            "aa": 2,
+            "nested": {
+                "long_key": true,
+                "b": [3, {"yy": "x", "a": -0.0}]
+            }
+        });
+        assert_eq!(
+            canonical_json(&value),
+            r#"{"aa":2,"nested":{"b":[3,{"a":0,"yy":"x"}],"long_key":true},"z":1}"#
+        );
     }
 }
