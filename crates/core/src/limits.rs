@@ -43,3 +43,12 @@ pub const PAGE_MAX_ACCOUNTS: u32 = 80;
 
 /// Maximum characters in a media description (alt text).
 pub const MEDIA_DESCRIPTION_MAX_CHARS: usize = 1_500;
+
+/// Maximum byte length of a single account client metadata key.
+pub const CLIENT_METADATA_MAX_KEY_LEN: usize = 128;
+
+/// Maximum number of client metadata keys stored per account.
+pub const CLIENT_METADATA_MAX_KEYS: usize = 64;
+
+/// Maximum total serialized JSON bytes for an account's client metadata object.
+pub const CLIENT_METADATA_MAX_BYTES: usize = 64 * 1024;

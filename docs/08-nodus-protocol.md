@@ -212,6 +212,33 @@ Remote peers use the same protocol over signed HTTPS:
 - A sync diff is a cache/backfill optimisation. ActivityPub delivery remains the
   authority for new activities; a missed delivery is repaired by the next diff.
 
+## Account client metadata
+
+Authenticated clients can store, read, update, and clear fine-grained per-account
+preferences (such as session banners, side images, and navigation layout) in a
+universal JSON object keyed by client-chosen identifiers (for example
+`nodus-top-banner`, `nodus-left-image`, `nodus-right-image`, `nodus-nav-layout`):
+
+- `GET /api/v1/nodus/account/metadata` (requires `read:accounts`): returns
+  `{ "metadata": { ... } }` for the authenticated account. Optional `?keys=a,b`
+  (or `?key=a` / `?keys[]=a`) filters to specific keys.
+- `PATCH /api/v1/nodus/account/metadata` (requires `write:accounts`): merges
+  `{ "metadata": { "<key>": <value|null> } }` into the account's metadata (`null`
+  removes the key; unmentioned keys are preserved).
+- `PUT /api/v1/nodus/account/metadata` (requires `write:accounts`): replaces the
+  entire metadata map for the account.
+- `DELETE /api/v1/nodus/account/metadata` (requires `write:accounts`): clears all
+  metadata entries, or only those specified via `?keys=a,b`.
+- `GET /api/v1/nodus/account/metadata/{key}` (requires `read:accounts`): returns
+  `{ "key": "<key>", "value": <value> }` or `404` if absent.
+- `PUT /api/v1/nodus/account/metadata/{key}` (requires `write:accounts`): sets a
+  single non-null value `{ "value": <value> }`.
+- `DELETE /api/v1/nodus/account/metadata/{key}` (requires `write:accounts`):
+  clears a single key idempotently.
+
+Keys must be 1–128 ASCII characters matching `[A-Za-z0-9._:-]` without `..`. Each
+account may store up to 64 keys and 64 KiB of serialized JSON metadata.
+
 ## Limits and failure behaviour
 
 | Limit | Value |

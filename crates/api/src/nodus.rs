@@ -33,6 +33,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/nodus/sync/root", get(root))
         .route("/api/v1/nodus/sync/diff", post(diff))
         .route("/api/v1/nodus/sync/snapshot", get(snapshot))
+        .merge(crate::client_metadata::router())
 }
 
 enum AuthorizedCollection<'a> {

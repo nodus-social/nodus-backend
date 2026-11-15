@@ -6,10 +6,13 @@
 //! resolves its scopes.
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sqlx::{FromRow, PgPool};
 
-use nodus_server_core::limits::PAGE_MAX_ACCOUNTS;
+use nodus_server_core::client_metadata::{validate_key, ClientMetadataError};
+use nodus_server_core::limits::{
+    CLIENT_METADATA_MAX_BYTES, CLIENT_METADATA_MAX_KEYS, PAGE_MAX_ACCOUNTS,
+};
 use nodus_server_core::{Id, PageOrder, PageParams, PageSize};
 
 /// A row of `account`, with `citext` cast to `text`.
@@ -27,6 +30,7 @@ pub struct AccountRow {
     pub avatar_ref: Option<String>,
     pub header_ref: Option<String>,
     pub fields: Value,
+    pub client_metadata: Value,
     pub locked: bool,
     pub bot: bool,
     pub local: bool,
@@ -53,13 +57,13 @@ pub struct AccountRow {
 }
 
 pub(crate) const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS username, a.domain::text AS domain, \
-     a.display_name, a.note, a.avatar_ref, a.header_ref, a.fields, a.locked, a.bot, a.local, a.uri, \
+     a.display_name, a.note, a.avatar_ref, a.header_ref, a.fields, a.client_metadata, a.locked, a.bot, a.local, a.uri, \
      a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.approved, \
      a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
      a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.created_at";
 
 pub(crate) const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
-     display_name, note, avatar_ref, header_ref, fields, locked, bot, local, uri, \
+     display_name, note, avatar_ref, header_ref, fields, client_metadata, locked, bot, local, uri, \
      inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, approved, \
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \
      lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, created_at";
@@ -425,4 +429,185 @@ pub async fn search_local(
         .bind(limit)
         .fetch_all(pool)
         .await
+}
+
+/// Errors from updating or clearing per-account client metadata.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientMetadataStoreError {
+    #[error("account not found")]
+    AccountNotFound,
+    #[error(transparent)]
+    Validation(#[from] ClientMetadataError),
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+}
+
+fn validate_metadata_map(map: &Map<String, Value>) -> Result<Value, ClientMetadataStoreError> {
+    if map.len() > CLIENT_METADATA_MAX_KEYS {
+        return Err(ClientMetadataError::TooManyKeys.into());
+    }
+    let json_value = Value::Object(map.clone());
+    let serialized = serde_json::to_vec(&json_value).map_err(|error| {
+        sqlx::Error::Protocol(format!("failed to serialize client metadata: {error}"))
+    })?;
+    if serialized.len() > CLIENT_METADATA_MAX_BYTES {
+        return Err(ClientMetadataError::PayloadTooLarge.into());
+    }
+    Ok(json_value)
+}
+
+/// Reads all client metadata entries for an account.
+pub async fn client_metadata_all(
+    pool: &PgPool,
+    account_id: &str,
+) -> Result<Option<Map<String, Value>>, sqlx::Error> {
+    let raw: Option<Value> =
+        sqlx::query_scalar("SELECT client_metadata FROM account WHERE id = $1")
+            .bind(account_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(raw.map(|value| match value {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    }))
+}
+
+/// Reads a requested subset of client metadata keys for an account.
+pub async fn client_metadata_get_keys(
+    pool: &PgPool,
+    account_id: &str,
+    keys: &[String],
+) -> Result<Option<Map<String, Value>>, sqlx::Error> {
+    let Some(all) = client_metadata_all(pool, account_id).await? else {
+        return Ok(None);
+    };
+    let mut filtered = Map::new();
+    for key in keys {
+        if let Some(value) = all.get(key).filter(|value| !value.is_null()) {
+            filtered.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Some(filtered))
+}
+
+/// Reads a single client metadata key for an account.
+pub async fn client_metadata_get_key(
+    pool: &PgPool,
+    account_id: &str,
+    key: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    let value: Option<Option<Value>> =
+        sqlx::query_scalar("SELECT client_metadata -> $2 FROM account WHERE id = $1")
+            .bind(account_id)
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
+    Ok(value.flatten().filter(|val| !val.is_null()))
+}
+
+/// Atomically merges client metadata entries for an account (`null` values remove keys).
+pub async fn client_metadata_patch(
+    pool: &PgPool,
+    account_id: &str,
+    entries: &Map<String, Value>,
+) -> Result<Map<String, Value>, ClientMetadataStoreError> {
+    for key in entries.keys() {
+        validate_key(key)?;
+    }
+    let mut tx = pool.begin().await?;
+    let current: Option<Value> =
+        sqlx::query_scalar("SELECT client_metadata FROM account WHERE id = $1 FOR UPDATE")
+            .bind(account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(current) = current else {
+        return Err(ClientMetadataStoreError::AccountNotFound);
+    };
+    let mut map = match current {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+    for (key, value) in entries {
+        if value.is_null() {
+            map.remove(key);
+        } else {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    let json_value = validate_metadata_map(&map)?;
+    sqlx::query("UPDATE account SET client_metadata = $2, updated_at = now() WHERE id = $1")
+        .bind(account_id)
+        .bind(json_value)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(map)
+}
+
+/// Replaces all client metadata entries for an account (top-level `null` values are omitted).
+pub async fn client_metadata_replace(
+    pool: &PgPool,
+    account_id: &str,
+    entries: &Map<String, Value>,
+) -> Result<Map<String, Value>, ClientMetadataStoreError> {
+    let mut map = Map::new();
+    for (key, value) in entries {
+        validate_key(key)?;
+        if !value.is_null() {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    let json_value = validate_metadata_map(&map)?;
+    let updated =
+        sqlx::query("UPDATE account SET client_metadata = $2, updated_at = now() WHERE id = $1")
+            .bind(account_id)
+            .bind(json_value)
+            .execute(pool)
+            .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ClientMetadataStoreError::AccountNotFound);
+    }
+    Ok(map)
+}
+
+/// Sets or updates a single client metadata key for an account.
+pub async fn client_metadata_set_key(
+    pool: &PgPool,
+    account_id: &str,
+    key: &str,
+    value: Value,
+) -> Result<Map<String, Value>, ClientMetadataStoreError> {
+    let mut entries = Map::new();
+    entries.insert(key.to_owned(), value);
+    client_metadata_patch(pool, account_id, &entries).await
+}
+
+/// Removes the specified client metadata keys for an account.
+pub async fn client_metadata_delete_keys(
+    pool: &PgPool,
+    account_id: &str,
+    keys: &[String],
+) -> Result<Map<String, Value>, ClientMetadataStoreError> {
+    let mut entries = Map::new();
+    for key in keys {
+        entries.insert(key.clone(), Value::Null);
+    }
+    client_metadata_patch(pool, account_id, &entries).await
+}
+
+/// Clears all client metadata entries for an account.
+pub async fn client_metadata_clear(
+    pool: &PgPool,
+    account_id: &str,
+) -> Result<(), ClientMetadataStoreError> {
+    let updated = sqlx::query(
+        "UPDATE account SET client_metadata = '{}'::jsonb, updated_at = now() WHERE id = $1",
+    )
+    .bind(account_id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ClientMetadataStoreError::AccountNotFound);
+    }
+    Ok(())
 }

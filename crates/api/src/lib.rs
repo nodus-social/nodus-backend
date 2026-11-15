@@ -12,6 +12,7 @@ pub mod admin;
 pub mod announcements;
 pub mod apps;
 pub mod auth;
+pub mod client_metadata;
 pub mod dto;
 pub mod error;
 pub mod filters;
