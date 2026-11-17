@@ -44,7 +44,7 @@ CREATE TABLE scanner_rule (
     id         text PRIMARY KEY,
     scanner_id text NOT NULL REFERENCES scanner (id) ON DELETE CASCADE,
     label      text NOT NULL,
-    threshold  real NOT NULL DEFAULT 0.5 CHECK (threshold >= 0 AND threshold <= 1),
+    threshold  double precision NOT NULL DEFAULT 0.5 CHECK (threshold >= 0 AND threshold <= 1),
     severity   text NOT NULL DEFAULT 'flag'
         CHECK (severity IN ('ignore', 'flag', 'sensitive', 'block')),
     created_at timestamptz NOT NULL DEFAULT now(),
