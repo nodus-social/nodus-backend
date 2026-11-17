@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package nodus.control;
+
+// A service that only works when asked.
+//
+// Everything here can also be reached by enqueuing a row: the queues are the durable
+// path. This is the on-demand path — an administrator who wants the prune to run now,
+// or a test that needs one sweep to finish before it asserts.
+service Control {
+  rpc Trigger(TriggerRequest) returns (TriggerReply);
+}
+
+message TriggerRequest {
+  // The work to do in this process. A service refuses anything it does not perform,
+  // so a typo in an admin console cannot start the wrong loop.
+  string work = 1;
+}
+
+message TriggerReply {
+  bool accepted = 1;
+  string detail = 2;
+}

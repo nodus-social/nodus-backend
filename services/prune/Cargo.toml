@@ -1,0 +1,24 @@
+[package]
+name = "nodus-prune"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deletes what has expired: media, sessions, codes and stale rows."
+
+[[bin]]
+name = "nodus-prune"
+path = "src/main.rs"
+
+[dependencies]
+nodus-server-proto = { path = "../../crates/proto" }
+nodus-server-runtime = { path = "../../crates/runtime" }
+nodus-server-store.workspace = true
+
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

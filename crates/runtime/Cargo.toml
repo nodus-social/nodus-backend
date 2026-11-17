@@ -1,0 +1,26 @@
+[package]
+name = "nodus-server-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "What every Nodus service needs before it does anything: configuration, logging, storage, and a clean stop."
+
+[dependencies]
+nodus-auth.workspace = true
+nodus-server-core.workspace = true
+nodus-server-proto = { path = "../proto" }
+nodus-server-store.workspace = true
+nodus-server-telemetry = { path = "../telemetry" }
+nodus-server-transport = { path = "../transport" }
+
+axum.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

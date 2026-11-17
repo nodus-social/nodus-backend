@@ -1,0 +1,26 @@
+[package]
+name = "nodus-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Mastodon-compatible API, ActivityPub documents, and the auth pages."
+
+[[bin]]
+name = "nodus-api"
+path = "src/main.rs"
+
+[dependencies]
+nodus-auth.workspace = true
+nodus-server-api.workspace = true
+nodus-server-runtime = { path = "../../crates/runtime" }
+nodus-server-store.workspace = true
+nodus-server-transport = { path = "../../crates/transport" }
+
+axum.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

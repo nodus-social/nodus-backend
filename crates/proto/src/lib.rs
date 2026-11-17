@@ -7,3 +7,7 @@
 pub mod telemetry {
     tonic::include_proto!("nodus.telemetry");
 }
+
+pub mod control {
+    tonic::include_proto!("nodus.control");
+}

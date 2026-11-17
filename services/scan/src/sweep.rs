@@ -3,8 +3,9 @@
 //! A scanner is another process, often someone else's model, and it only ever answers
 //! "these labels, with these confidences". This loop is the one place that turns those
 //! answers into something that happened to a post: a review item, a sensitive flag, or a
-//! deletion. It runs inside the main process because the scanner registry lives in the
-//! database it already talks to, and because a verdict is only useful once it is applied.
+//! deletion. It runs as its own service because the scanner registry lives in the database
+//! it already talks to and a verdict is only useful once it is applied, so a slow model must
+//! not be able to slow a request down.
 //!
 //! Two passes per tick. Discovery queues work that was never queued — content posted while
 //! a scanner was unreachable, or before one was configured — so nothing is permanently
@@ -36,7 +37,10 @@ const MAX_TEXT: usize = 8 * 1024;
 
 /// Starts the sweep on the current runtime. It never returns; a failed pass is logged and
 /// retried on the next tick, because one unreachable scanner must not stop the others.
-pub fn spawn(store: Store, base_url: String) {
+///
+/// `wake` is the on-demand path: a caller that wants a pass now notifies it instead of
+/// waiting out the tick.
+pub fn spawn(store: Store, base_url: String, wake: std::sync::Arc<tokio::sync::Notify>) {
     tokio::spawn(async move {
         let transport = match Transport::new() {
             Ok(transport) => transport,
@@ -47,7 +51,10 @@ pub fn spawn(store: Store, base_url: String) {
         };
         let mut ticker = tokio::time::interval(TICK);
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = wake.notified() => {}
+            }
             if let Err(error) = once(&store, &base_url, &transport).await {
                 tracing::error!(%error, "scanner sweep failed");
             }

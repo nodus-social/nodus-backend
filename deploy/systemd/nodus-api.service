@@ -1,0 +1,26 @@
+[Unit]
+Description=Nodus The instance's public face: API, ActivityPub documents and auth pages.
+Documentation=https://github.com/nodus-social/nodus-backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nodus
+Group=nodus
+EnvironmentFile=/etc/nodus-backend.env
+Environment=NODUS_NODE_NAME=api
+Environment=NODUS_BIND=0.0.0.0:3001
+Environment=NODUS_TELEMETRY_SOCKET=/var/lib/nodus/run/api-telemetry.sock
+ReadWritePaths=/mnt/nodus-media /var/lib/nodus
+ExecStart=/usr/local/bin/nodus-api
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=nodus
+
+[Install]
+WantedBy=multi-user.target

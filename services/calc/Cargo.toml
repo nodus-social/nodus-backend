@@ -1,0 +1,26 @@
+[package]
+name = "nodus-calc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The recommendation engine's heavy half: crawling, recomputing and retention."
+
+[[bin]]
+name = "nodus-calc"
+path = "src/main.rs"
+
+[dependencies]
+nodus-cache = { path = "../../../recommender/crates/cache" }
+nodus-calculator = { path = "../../../recommender/crates/calculator" }
+nodus-server-proto = { path = "../../crates/proto" }
+nodus-server-runtime = { path = "../../crates/runtime" }
+nodus-store = { path = "../../../recommender/crates/store" }
+
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

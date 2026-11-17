@@ -310,11 +310,18 @@ pub struct PrunedUnattached {
 
 /// Deletes unattached media uploads older than 24 hours along with their variants,
 /// returning the original and variant digests that may now be unreferenced on disk.
+///
+/// An avatar or a header has no status either, so "unattached" cannot mean "no status":
+/// a profile references its picture as `<media id>/<layer>` in `account.avatar_ref` and
+/// `header_ref`, and pruning the row removes a face the account still points at.
 pub async fn delete_expired_unattached(pool: &PgPool) -> Result<PrunedUnattached, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM media_attachment \
-         WHERE status_id IS NULL AND created_at < now() - interval '24 hours' \
+        "SELECT m.id FROM media_attachment m \
+         WHERE m.status_id IS NULL AND m.created_at < now() - interval '24 hours' \
+           AND NOT EXISTS (SELECT 1 FROM account a \
+                            WHERE split_part(a.avatar_ref, '/', 1) = m.id \
+                               OR split_part(a.header_ref, '/', 1) = m.id) \
          LIMIT 200 \
          FOR UPDATE SKIP LOCKED",
     )
@@ -492,6 +499,76 @@ mod tests {
             .expect("compressed variant");
         assert_eq!(best_compressed.max_edge, 1080);
         assert_eq!(best_compressed.digest, "digest-1080");
+
+        let _ = sqlx::query("DELETE FROM account WHERE id = $1")
+            .bind(&account.id)
+            .execute(pool)
+            .await;
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_profile_picture_is_not_an_unattached_upload(pool: PgPool) {
+        let pool = &pool;
+
+        let username = format!("media_face_{}", Id::new());
+        let account = accounts::insert(
+            pool,
+            &NewAccount {
+                username: &username,
+                display_name: "Face Test",
+                note: "",
+                bot: false,
+                locked: false,
+            },
+        )
+        .await
+        .expect("insert account");
+
+        let face = Id::new().to_string();
+        let upload = Id::new().to_string();
+        let old = Utc::now() - chrono::Duration::hours(48);
+        for id in [&face, &upload] {
+            insert(
+                pool,
+                &MediaRow {
+                    id: id.clone(),
+                    account_id: account.id.clone(),
+                    status_id: None,
+                    digest: format!("digest-{id}"),
+                    content_type: "image/png".to_owned(),
+                    size: 512,
+                    width: Some(400),
+                    height: Some(400),
+                    blurhash: None,
+                    description: String::new(),
+                    sensitive: false,
+                    lossless: false,
+                    processing_state: "ready".to_owned(),
+                    processing_progress: 100,
+                    processing_error: None,
+                    original_pruned: false,
+                    created_at: old,
+                },
+            )
+            .await
+            .expect("insert media");
+        }
+        sqlx::query("UPDATE account SET avatar_ref = $1 WHERE id = $2")
+            .bind(format!("{face}/preview"))
+            .bind(&account.id)
+            .execute(pool)
+            .await
+            .expect("set the avatar");
+
+        let pruned = delete_expired_unattached(pool)
+            .await
+            .expect("delete_expired_unattached");
+
+        assert_eq!(pruned.original_digests, vec![format!("digest-{upload}")]);
+        assert!(
+            by_id(pool, &face).await.expect("by_id").is_some(),
+            "the picture the profile points at must survive the prune"
+        );
 
         let _ = sqlx::query("DELETE FROM account WHERE id = $1")
             .bind(&account.id)

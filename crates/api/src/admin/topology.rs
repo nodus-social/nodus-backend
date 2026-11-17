@@ -17,6 +17,8 @@ use axum::response::Sse;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
+use nodus_server_proto::control::control_client::ControlClient;
+use nodus_server_proto::control::TriggerRequest;
 use nodus_server_proto::telemetry::telemetry_client::TelemetryClient;
 use nodus_server_proto::telemetry::{Empty, LogEntry, LogStreamRequest};
 use serde::{Deserialize, Serialize};
@@ -109,12 +111,19 @@ fn targets() -> &'static [Target] {
                 }
             })
             .collect();
-        if parsed.is_empty() {
-            if let Ok(path) = std::env::var("NODUS_TELEMETRY_SOCKET") {
-                parsed.push(Target::Socket {
-                    name: "api".to_owned(),
-                    path: socket_path(&path),
-                });
+        // The API answers the question and is a node of its own, so it belongs in the
+        // answer even when the worker list is configured: a console that hides the process
+        // it is talking to cannot show that process failing.
+        if let Ok(path) = std::env::var("NODUS_TELEMETRY_SOCKET") {
+            let name = std::env::var("NODUS_NODE_NAME").unwrap_or_else(|_| "api".to_owned());
+            if !parsed.iter().any(|target| target.name() == name) {
+                parsed.insert(
+                    0,
+                    Target::Socket {
+                        name,
+                        path: socket_path(&path),
+                    },
+                );
             }
         }
         parsed
@@ -182,7 +191,8 @@ fn remembered(name: &str) -> Seen {
     )
 }
 
-async fn client(target: &Target) -> Result<TelemetryClient<Channel>, String> {
+/// The channel to one node, whether it is a socket or an address.
+async fn channel(target: &Target) -> Result<Channel, String> {
     match target {
         Target::Socket { path, .. } => {
             let socket = path.clone();
@@ -197,17 +207,62 @@ async fn client(target: &Target) -> Result<TelemetryClient<Channel>, String> {
                 }))
                 .await
                 .map_err(|error| describe(&error))?;
-            Ok(TelemetryClient::new(channel))
+            Ok(channel)
         }
-        Target::Http { url, .. } => {
-            let channel = Endpoint::from_shared(url.clone())
-                .map_err(|error| error.to_string())?
-                .connect()
-                .await
-                .map_err(|error| describe(&error))?;
-            Ok(TelemetryClient::new(channel))
-        }
+        Target::Http { url, .. } => Endpoint::from_shared(url.clone())
+            .map_err(|error| error.to_string())?
+            .connect()
+            .await
+            .map_err(|error| describe(&error)),
     }
+}
+
+async fn client(target: &Target) -> Result<TelemetryClient<Channel>, String> {
+    Ok(TelemetryClient::new(channel(target).await?))
+}
+
+/// What a node said when asked to do something now.
+#[derive(Debug, Serialize)]
+pub struct TriggerDto {
+    pub accepted: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TriggerBody {
+    /// The work to do. Empty asks the node for whatever it does by default.
+    #[serde(default)]
+    pub work: String,
+}
+
+/// Ask one node to run its work now instead of on its tick.
+///
+/// The queue is the durable path; this is the path an administrator takes when they do
+/// not want to wait for a clock, and it goes over the same channel the report does.
+async fn trigger(
+    State(_state): State<AppState>,
+    auth: Auth,
+    Path(name): Path<String>,
+    Json(body): Json<TriggerBody>,
+) -> ApiResult<Json<TriggerDto>> {
+    auth.require_admin("admin:write")?;
+    let target = targets()
+        .iter()
+        .find(|target| target.name() == name)
+        .ok_or_else(|| ApiError::not_found("no such node"))?;
+    let answer = ControlClient::new(channel(target).await.map_err(refused)?)
+        .trigger(TriggerRequest { work: body.work })
+        .await
+        .map_err(|status| refused(status.to_string()))?
+        .into_inner();
+    Ok(Json(TriggerDto {
+        accepted: answer.accepted,
+        detail: answer.detail,
+    }))
+}
+
+fn refused(reason: String) -> ApiError {
+    ApiError::new(axum::http::StatusCode::BAD_GATEWAY, reason)
 }
 
 #[derive(Debug, Serialize)]
@@ -470,5 +525,9 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/admin/topology/{name}/logs/stream",
             axum::routing::get(stream_logs),
+        )
+        .route(
+            "/api/v1/admin/topology/{name}/trigger",
+            axum::routing::post(trigger),
         )
 }

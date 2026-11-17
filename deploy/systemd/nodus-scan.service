@@ -1,0 +1,24 @@
+[Unit]
+Description=Nodus Turns scanner answers into moderation decisions.
+Documentation=https://github.com/nodus-social/nodus-backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nodus
+Group=nodus
+EnvironmentFile=/etc/nodus-backend.env
+Environment=NODUS_NODE_NAME=scan
+Environment=NODUS_TELEMETRY_SOCKET=/var/lib/nodus/run/scan.sock
+ExecStart=/usr/local/bin/nodus-scan
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=nodus
+
+[Install]
+WantedBy=multi-user.target

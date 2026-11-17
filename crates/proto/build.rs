@@ -6,7 +6,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&["proto/telemetry.proto"], &["proto"])?;
+        .compile_protos(
+            &["proto/telemetry.proto", "proto/control.proto"],
+            &["proto"],
+        )?;
     println!("cargo:rerun-if-changed=proto/telemetry.proto");
+    println!("cargo:rerun-if-changed=proto/control.proto");
     Ok(())
 }

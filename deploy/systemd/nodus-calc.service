@@ -1,0 +1,24 @@
+[Unit]
+Description=Nodus The recommendation engine's heavy half: crawling, recomputing and retention.
+Documentation=https://github.com/nodus-social/nodus-backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nodus
+Group=nodus
+EnvironmentFile=/etc/nodus-backend.env
+Environment=NODUS_NODE_NAME=calc
+Environment=NODUS_TELEMETRY_SOCKET=/var/lib/nodus/run/calc.sock
+ExecStart=/usr/local/bin/nodus-calc
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=nodus
+
+[Install]
+WantedBy=multi-user.target

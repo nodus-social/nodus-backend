@@ -13,6 +13,6 @@ mod serve;
 pub use agent::{entry, Agent, Node, Sampler};
 pub use layer::TelemetryLayer;
 pub use ring::{Ring, CAPACITY};
-pub use serve::{serve, Error};
+pub use serve::{serve, serve_with, Error};
 
 pub use nodus_server_proto::telemetry;

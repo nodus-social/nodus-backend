@@ -8,6 +8,7 @@
 pub mod client_metadata;
 pub mod content;
 pub mod id;
+pub mod instance;
 pub mod limits;
 pub mod pagination;
 pub mod visibility;
