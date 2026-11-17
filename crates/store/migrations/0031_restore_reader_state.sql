@@ -59,3 +59,37 @@ CREATE TABLE IF NOT EXISTS conversation_mute (
 
 ALTER TABLE account ADD COLUMN IF NOT EXISTS avatar_url text;
 ALTER TABLE account ADD COLUMN IF NOT EXISTS header_url text;
+
+-- The tables above are guarded by name, so a table a person recreated by hand wins. These
+-- guards make that table usable rather than merely present: a hand-made `marker` without
+-- `version`, or a `scheduled_status` whose `params` arrived as text, would otherwise fail
+-- at the first read instead of at this migration.
+ALTER TABLE marker ADD COLUMN IF NOT EXISTS last_read_id text;
+ALTER TABLE marker ADD COLUMN IF NOT EXISTS version integer NOT NULL DEFAULT 1;
+ALTER TABLE marker ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE conversation_read ADD COLUMN IF NOT EXISTS last_read_id text;
+ALTER TABLE conversation_read
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE featured_tag ADD COLUMN IF NOT EXISTS name citext;
+ALTER TABLE featured_tag ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE instance_rule ADD COLUMN IF NOT EXISTS text text;
+ALTER TABLE instance_rule ADD COLUMN IF NOT EXISTS hint text;
+ALTER TABLE instance_rule ADD COLUMN IF NOT EXISTS ord integer NOT NULL DEFAULT 0;
+ALTER TABLE scheduled_status ADD COLUMN IF NOT EXISTS scheduled_at timestamptz;
+ALTER TABLE scheduled_status ADD COLUMN IF NOT EXISTS params jsonb;
+ALTER TABLE scheduled_status
+    ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE conversation_mute ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+
+-- `ON CONFLICT` needs a unique constraint or a unique index, and a table a person made by
+-- hand may have neither. These are the same keys the creates above declare, restated as
+-- indexes so the guarded form works on both kinds of table.
+CREATE UNIQUE INDEX IF NOT EXISTS marker_account_timeline_key ON marker (account_id, timeline);
+CREATE UNIQUE INDEX IF NOT EXISTS conversation_read_account_root_key
+    ON conversation_read (account_id, root_id);
+CREATE UNIQUE INDEX IF NOT EXISTS conversation_mute_account_root_key
+    ON conversation_mute (account_id, root_id);
+CREATE UNIQUE INDEX IF NOT EXISTS featured_tag_account_name_key
+    ON featured_tag (account_id, name);
+CREATE UNIQUE INDEX IF NOT EXISTS instance_rule_id_key ON instance_rule (id);
+CREATE UNIQUE INDEX IF NOT EXISTS scheduled_status_id_key ON scheduled_status (id);
