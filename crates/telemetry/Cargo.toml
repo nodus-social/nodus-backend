@@ -1,0 +1,23 @@
+[package]
+name = "nodus-server-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+nodus-server-proto = { path = "../proto" }
+chrono = { workspace = true }
+sysinfo = "0.33"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+futures-util = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tower = { workspace = true }

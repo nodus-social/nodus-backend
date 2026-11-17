@@ -18,6 +18,7 @@ use axum::Router;
 use nodus_auth::store::PgAuthStore;
 use nodus_server_api::{AppState, InstanceConfig};
 use nodus_server_store::{media, Store};
+use nodus_server_telemetry::{Agent, Node, TelemetryLayer};
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
 const DEFAULT_DATABASE_URL: &str = "postgres://nodus:nodus@localhost/nodus";
@@ -122,6 +123,17 @@ struct Config {
     migrate_only: bool,
     roles: Roles,
     bootstrap: Option<Bootstrap>,
+    /// Where this process answers questions about itself, if anywhere.
+    telemetry: Option<TelemetryTarget>,
+}
+
+/// How the telemetry service is reachable.
+#[derive(Debug, Clone)]
+enum TelemetryTarget {
+    /// A Unix socket, for processes sharing a machine.
+    Socket(PathBuf),
+    /// A TCP address, for a host reaching another host.
+    Bind(SocketAddr),
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +180,18 @@ impl Config {
             }
         };
 
+        let telemetry = match (
+            env::var("NODUS_TELEMETRY_SOCKET").ok(),
+            env::var("NODUS_TELEMETRY_BIND").ok(),
+        ) {
+            (Some(path), None) => Some(TelemetryTarget::Socket(PathBuf::from(path))),
+            (None, Some(address)) => Some(TelemetryTarget::Bind(address.parse()?)),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err("set NODUS_TELEMETRY_SOCKET or NODUS_TELEMETRY_BIND, not both".into())
+            }
+        };
+
         Ok(Self {
             bind,
             database_url: env::var("NODUS_DATABASE_URL")
@@ -188,6 +212,7 @@ impl Config {
             migrate_only: env::args().any(|argument| argument == "--migrate-only"),
             roles: Roles::from_args()?,
             bootstrap,
+            telemetry,
         })
     }
 }
@@ -351,14 +376,40 @@ async fn shutdown() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    let agent = Agent::new(Node {
+        name: env::var("NODUS_NODE_NAME").unwrap_or_else(|_| "api".to_owned()),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    });
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,tower_http=info".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(TelemetryLayer::new(agent.ring(), agent.live()))
         .init();
 
     let config = Config::from_env()?;
+    if let Some(target) = config.telemetry.clone() {
+        let serving = std::sync::Arc::clone(&agent);
+        tokio::spawn(async move {
+            let stopped = match target {
+                TelemetryTarget::Socket(path) => {
+                    tracing::info!(path = %path.display(), "telemetry listening");
+                    nodus_server_telemetry::serve_uds(serving, path).await
+                }
+                TelemetryTarget::Bind(address) => {
+                    tracing::info!(%address, "telemetry listening");
+                    nodus_server_telemetry::serve_tcp(serving, address).await
+                }
+            };
+            if let Err(error) = stopped {
+                tracing::error!(%error, "the telemetry service stopped");
+            }
+        });
+    }
     let store = Store::connect(&config.database_url, config.database_connections).await?;
 
     if config.migrate_only {
@@ -440,6 +491,7 @@ mod tests {
             registrations_open: false,
             migrate_only: false,
             roles: Roles::parse(DEFAULT_ROLES).expect("default roles"),
+            telemetry: None,
             bootstrap: None,
         }
     }

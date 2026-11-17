@@ -12,6 +12,7 @@ mod accounts;
 mod federation;
 mod reports;
 mod scanners;
+mod topology;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -639,6 +640,7 @@ pub fn router() -> Router<AppState> {
         .merge(accounts::router())
         .merge(federation::router())
         .merge(scanners::router())
+        .merge(topology::router())
         .route("/api/v1/admin/meta", get(meta))
         .route("/api/v1/admin/overview", get(overview))
         .route("/api/v1/admin/measures", get(measures))

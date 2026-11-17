@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 nodus-server-core = { workspace = true }
 nodus-server-federation = { workspace = true }
 nodus-server-media = { workspace = true }
+nodus-server-proto = { path = "../proto" }
 nodus-server-scan = { path = "../scan" }
 nodus-server-store = { workspace = true }
 nodus-auth = { workspace = true }
@@ -37,6 +38,9 @@ tokio-stream = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
 tower-http = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
