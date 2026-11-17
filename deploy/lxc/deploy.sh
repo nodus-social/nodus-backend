@@ -51,6 +51,12 @@ done
 echo "==> stopping the old monolith"
 ssh "${HOST}" "pct exec ${VMID} -- systemctl disable --now nodus-backend || true"
 
+# Every unit is stopped before anything is pushed: a running binary cannot be replaced
+# ("Text file busy"), and a half-replaced set is worse than the build it replaces.
+for service in "${SERVICES[@]}"; do
+  ssh "${HOST}" "pct exec ${VMID} -- systemctl stop nodus-${service} || true"
+done
+
 for service in "${SERVICES[@]}"; do
   # Keep the binary that is running now: a rollback is a `cp` in the container.
   ssh "${HOST}" "pct exec ${VMID} -- sh -c 'cp -a /usr/local/bin/nodus-${service} /usr/local/bin/nodus-${service}.bak-previous 2>/dev/null || true'"
