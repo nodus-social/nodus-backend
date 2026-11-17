@@ -1,0 +1,22 @@
+[package]
+name = "nodus-media"
+description = "Byte serving for uploaded media, on its own listener"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "nodus-media"
+path = "src/main.rs"
+
+[dependencies]
+nodus-server-media = { path = "../../crates/media" }
+nodus-server-runtime = { path = "../../crates/runtime" }
+nodus-server-store = { path = "../../crates/store" }
+nodus-server-transport = { path = "../../crates/transport" }
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

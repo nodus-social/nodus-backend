@@ -7,11 +7,15 @@ license.workspace = true
 publish = false
 
 [dependencies]
+axum = { workspace = true }
+nodus-server-store = { path = "../store" }
 serde.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 blurhash = "0.2.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 tokio = { workspace = true }
+tracing.workspace = true
 ulid = { workspace = true }
 
 [lints]

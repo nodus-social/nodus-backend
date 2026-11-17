@@ -21,7 +21,7 @@ VMID="${VMID:-118}"
 PORT="${PORT:-3001}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 CACHE_VOLUME="${CACHE_VOLUME:-nodus-cargo}"
-SERVICES=(api feed scan prune calc)
+SERVICES=(api media feed scan prune calc)
 BUILD_DIR="${ROOT}/nodus-backend/target-bookworm/release"
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
@@ -33,7 +33,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     -e CARGO_HOME=/cargo \
     rust:1-bookworm \
     cargo build --release --locked --target-dir /src/nodus-backend/target-bookworm \
-    --bin nodus-api --bin nodus-feed --bin nodus-scan --bin nodus-prune --bin nodus-calc
+    --bin nodus-api --bin nodus-media --bin nodus-feed --bin nodus-scan --bin nodus-prune --bin nodus-calc
 fi
 
 for service in "${SERVICES[@]}"; do
@@ -81,7 +81,7 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 
-for service in feed scan prune calc; do
+for service in media feed scan prune calc; do
   echo "==> starting nodus-${service}"
   ssh "${HOST}" "pct exec ${VMID} -- systemctl restart nodus-${service}"
 done

@@ -2480,7 +2480,6 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2542,7 +2541,6 @@ dependencies = [
  "tokio",
  "tower-http 0.7.1",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2555,6 +2553,18 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
+]
+
+[[package]]
+name = "nodus-media"
+version = "0.1.0"
+dependencies = [
+ "nodus-server-media",
+ "nodus-server-runtime",
+ "nodus-server-store",
+ "nodus-server-transport",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2680,11 +2690,15 @@ dependencies = [
 name = "nodus-server-media"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.9",
  "blurhash",
  "image",
+ "nodus-server-store",
  "serde",
+ "sqlx",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "ulid",
 ]
 

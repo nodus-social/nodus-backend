@@ -6,10 +6,8 @@
 
 use std::path::PathBuf;
 
-use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
-use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -31,91 +29,24 @@ use crate::state::AppState;
 const MAX_UPLOAD: usize = 40 * 1024 * 1024;
 const MAX_DESCRIPTION: usize = 1_500;
 
-/// `/api/v1/media`, `/api/v2/media`, `/media/{id}`.
+/// `/api/v1/media`, `/api/v2/media`.
+///
+/// Uploads and their metadata. The bytes are served by `nodus-media`, which reads the same
+/// catalogue.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/media", post(upload))
         .route("/api/v2/media", post(upload))
         .route("/api/v1/media/{id}", get(show).put(update))
-        .route("/media/default-avatar.png", get(default_avatar))
-        .route("/media/{id}", get(serve))
-        .route("/media/{id}/{layer}", get(serve_variant))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
 }
 
-/// The picture an account shows before it chooses one.
-const DEFAULT_AVATAR_SIZE: u32 = 400;
-/// Neutral grey, so one picture works on both a light and a dark timeline.
-const PLACEHOLDER_BACKGROUND: [u8; 4] = [214, 211, 209, 255];
-const PLACEHOLDER_FIGURE: [u8; 4] = [168, 162, 158, 255];
-
-/// `GET /media/default-avatar.png` — the picture every account starts with.
-///
-/// Generated rather than shipped as a file: the arithmetic is cheaper to keep correct than a
-/// binary in the repository, and the shape can be tuned without a build-time image tool.
-///
-/// Only the picture has a default. An account with no banner answers an empty `header`, so a
-/// client draws nothing there rather than a grey band pretending to be one.
-pub async fn default_avatar() -> Response {
-    static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let bytes = BYTES.get_or_init(render_default_avatar);
-    (
-        [
-            (header::CONTENT_TYPE, HeaderValue::from_static("image/png")),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=86400"),
-            ),
-        ],
-        Body::from(bytes.clone()),
-    )
-        .into_response()
-}
-
-/// A head and shoulders inside a square: what a client crops to a circle reads as a person.
-///
-/// Drawn with integer arithmetic on purpose — the canvas is a fixed size, so squared
-/// distances and a rational gradient are exact, and no float casts creep in.
-fn render_default_avatar() -> Vec<u8> {
-    const HEAD_CENTRE_Y: i64 = 156;
-    const HEAD_RADIUS: i64 = 72;
-    const SHOULDER_CENTRE_Y: i64 = 384;
-    const SHOULDER_RADIUS: i64 = 120;
-
-    let size = DEFAULT_AVATAR_SIZE;
-    let mut canvas = image::RgbaImage::from_pixel(size, size, image::Rgba(PLACEHOLDER_BACKGROUND));
-    let centre = i64::from(size / 2);
-    for (x, y, pixel) in canvas.enumerate_pixels_mut() {
-        let px = i64::from(x);
-        let py = i64::from(y);
-        let head = (px - centre).pow(2) + (py - HEAD_CENTRE_Y).pow(2) < HEAD_RADIUS * HEAD_RADIUS;
-        let shoulders = (px - centre).pow(2) + (py - SHOULDER_CENTRE_Y).pow(2)
-            < SHOULDER_RADIUS * SHOULDER_RADIUS;
-        if head || shoulders {
-            *pixel = image::Rgba(PLACEHOLDER_FIGURE);
-        }
-    }
-    encode_png(&canvas)
-}
-
-fn encode_png(canvas: &image::RgbaImage) -> Vec<u8> {
-    use image::ImageEncoder as _;
-    let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes)
-        .write_image(
-            canvas.as_raw(),
-            canvas.width(),
-            canvas.height(),
-            image::ExtendedColorType::Rgba8,
-        )
-        .expect("a generated placeholder always encodes");
-    bytes
-}
-
+/// Where originals are kept: the deployment decides, the default is for a checkout.
 fn storage_dir() -> PathBuf {
     std::env::var_os("NODUS_MEDIA_DIR").map_or_else(|| PathBuf::from("./media"), PathBuf::from)
 }
 
+/// Where generated variants are kept, beside the originals unless the deployment separates them.
 fn variants_dir() -> PathBuf {
     std::env::var_os("NODUS_MEDIA_VARIANTS_DIR")
         .map_or_else(|| storage_dir().join("variants"), PathBuf::from)
@@ -458,74 +389,6 @@ pub async fn update(
     Ok(Json(MediaAttachmentDto::from_row(&row, state.instance())))
 }
 
-/// `GET /media/{id}` — original bytes, cached by digest.
-pub async fn serve(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
-    let Some(row) = media::by_id(state.store().pool(), &id).await? else {
-        return Err(ApiError::not_found("Record not found"));
-    };
-    if !row.original_pruned {
-        if let Ok(bytes) = tokio::fs::read(storage_dir().join(&row.digest)).await {
-            let content_type = HeaderValue::from_str(&row.content_type)
-                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-            return Ok((
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (
-                        header::CACHE_CONTROL,
-                        HeaderValue::from_static("public, max-age=31536000, immutable"),
-                    ),
-                ],
-                Body::from(bytes),
-            )
-                .into_response());
-        }
-    }
-    for layer in [Layer::Compressed, Layer::Preview] {
-        if let Some(variant) = media::variant(state.store().pool(), &id, layer.as_str()).await? {
-            return variant_response(variant, layer).await;
-        }
-    }
-    Err(ApiError::not_found("Record not found"))
-}
-
-/// `GET /media/{id}/{layer}` — a generated preview/compressed/lossless variant.
-pub async fn serve_variant(
-    State(state): State<AppState>,
-    Path((id, layer)): Path<(String, String)>,
-) -> ApiResult<Response> {
-    let layer = match layer.as_str() {
-        "preview" => Layer::Preview,
-        "compressed" => Layer::Compressed,
-        "lossless" => Layer::Lossless,
-        _ => return Err(ApiError::not_found("Record not found")),
-    };
-    if let Some(variant) = media::variant(state.store().pool(), &id, layer.as_str()).await? {
-        return variant_response(variant, layer).await;
-    }
-    serve(State(state), Path(id)).await
-}
-
-async fn variant_response(variant: VariantRow, layer: Layer) -> ApiResult<Response> {
-    let bytes = tokio::fs::read(variants_dir().join(&variant.digest))
-        .await
-        .map_err(|_| ApiError::not_found("Record not found"))?;
-    let content_type = HeaderValue::from_str(&variant.content_type)
-        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-    let cache = CachePolicy::default().cache_control(layer);
-    Ok((
-        [
-            (header::CONTENT_TYPE, content_type),
-            (
-                header::CACHE_CONTROL,
-                HeaderValue::from_str(&cache)
-                    .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600")),
-            ),
-        ],
-        Body::from(bytes),
-    )
-        .into_response())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,27 +514,5 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// The default picture is only useful if a client can decode it, so the test decodes it.
-    #[tokio::test]
-    async fn the_default_avatar_is_a_square_png_with_a_figure() {
-        let response = default_avatar().await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .expect("body");
-        let decoded = image::load_from_memory(&bytes).expect("decodable png");
-        assert_eq!(decoded.width(), DEFAULT_AVATAR_SIZE);
-        assert_eq!(decoded.height(), DEFAULT_AVATAR_SIZE);
 
-        // A flat square would be indistinguishable from a failed load, so check the figure
-        // is actually drawn: the middle of the head is the figure colour, the corner is not.
-        let middle = decoded.to_rgba8();
-        let head = middle.get_pixel(DEFAULT_AVATAR_SIZE / 2, 156);
-        let corner = middle.get_pixel(2, 2);
-        assert_eq!([head[0], head[1], head[2]], PLACEHOLDER_FIGURE[..3]);
-        assert_eq!(
-            [corner[0], corner[1], corner[2]],
-            PLACEHOLDER_BACKGROUND[..3]
-        );
-    }
 }
