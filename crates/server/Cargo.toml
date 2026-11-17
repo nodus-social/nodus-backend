@@ -12,6 +12,7 @@ axum = { workspace = true }
 nodus-auth = { workspace = true }
 nodus-server-api = { workspace = true }
 nodus-server-core = { workspace = true }
+nodus-server-scan = { path = "../scan" }
 nodus-server-store = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true }

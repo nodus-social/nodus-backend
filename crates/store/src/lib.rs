@@ -23,6 +23,7 @@ pub mod markers;
 pub mod media;
 pub mod miauth;
 pub mod moderation;
+pub mod scanners;
 pub mod schedules;
 pub mod social;
 pub mod statuses;

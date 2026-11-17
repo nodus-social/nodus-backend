@@ -211,12 +211,11 @@ fn workspace_dependencies_resolve_and_api_has_no_raw_sql() {
             continue;
         }
         let source = std::fs::read_to_string(&path).expect("read api source");
-        let production = source
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or(source.as_str());
+        // A test harness creates and drops its own schema; only the handler code above the
+        // test module is held to the rule.
+        let handlers = source.split("#[cfg(test)]").next().unwrap_or(&source);
         assert!(
-            !production.contains("sqlx::query"),
+            !handlers.contains("sqlx::query"),
             "API source {} contains raw sqlx::query",
             path.display()
         );

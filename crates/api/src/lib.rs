@@ -11,6 +11,7 @@ pub mod activitypub;
 pub mod admin;
 pub mod announcements;
 pub mod apps;
+pub mod assets;
 pub mod auth;
 pub mod body;
 pub mod client_metadata;
@@ -125,6 +126,8 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(nodus::router())
         .merge(announcements::router())
         .merge(admin::router())
+        .merge(admin::public_router())
+        .merge(assets::router())
         .merge(media::router())
         .merge(filters::router())
         .merge(lists::router())

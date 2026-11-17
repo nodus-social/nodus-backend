@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 nodus-server-core = { workspace = true }
 nodus-server-federation = { workspace = true }
 nodus-server-media = { workspace = true }
+nodus-server-scan = { path = "../scan" }
 nodus-server-store = { workspace = true }
 nodus-auth = { workspace = true }
 axum-extra = { workspace = true }
@@ -26,6 +27,7 @@ reqwest = { workspace = true }
 rsa = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
+serde_urlencoded = "0.7"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }

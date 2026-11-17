@@ -6,6 +6,8 @@
 //! auth pages. Splitting a service out is a deployment change; this binary is the
 //! default composition.
 
+mod scanning;
+
 use std::env;
 use std::error::Error;
 use std::net::SocketAddr;
@@ -19,6 +21,94 @@ use nodus_server_store::{media, Store};
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
 const DEFAULT_DATABASE_URL: &str = "postgres://nodus:nodus@localhost/nodus";
+const DEFAULT_ROLES: &str = "api,scan,prune";
+
+/// What this process does, chosen at start so one binary can run as a monolith or as
+/// several narrower processes over the same database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The public listener: client API, OAuth pages, ActivityPub documents.
+    Api,
+    /// The scan sweep: claims queued scans, calls scanner services, applies policy.
+    Scan,
+    /// The hourly media prune.
+    Prune,
+}
+
+impl Role {
+    fn all() -> [Self; 3] {
+        [Self::Api, Self::Scan, Self::Prune]
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Scan => "scan",
+            Self::Prune => "prune",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "api" => Some(Self::Api),
+            "scan" => Some(Self::Scan),
+            "prune" => Some(Self::Prune),
+            _ => None,
+        }
+    }
+}
+
+/// The roles this process runs, from `--roles=api,scan` or `NODUS_ROLES`.
+///
+/// An empty value means every role: a deployment that says nothing keeps the monolith.
+#[derive(Debug, Clone)]
+struct Roles(Vec<Role>);
+
+impl Roles {
+    fn from_args() -> Result<Self, Box<dyn Error>> {
+        for argument in env::args() {
+            if let Some(value) = argument.strip_prefix("--roles=") {
+                return Self::parse(value);
+            }
+        }
+        Self::parse(&env::var("NODUS_ROLES").unwrap_or_else(|_| DEFAULT_ROLES.to_owned()))
+    }
+
+    fn parse(value: &str) -> Result<Self, Box<dyn Error>> {
+        let mut roles = Vec::new();
+        for name in value.split(',').filter(|name| !name.trim().is_empty()) {
+            let role = Role::parse(name).ok_or_else(|| {
+                format!(
+                    "unknown role \"{name}\"; expected one of {}",
+                    Role::all()
+                        .iter()
+                        .map(|role| role.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            if !roles.contains(&role) {
+                roles.push(role);
+            }
+        }
+        if roles.is_empty() {
+            return Err("no roles selected".into());
+        }
+        Ok(Self(roles))
+    }
+
+    fn has(&self, role: Role) -> bool {
+        self.0.contains(&role)
+    }
+
+    fn names(&self) -> String {
+        self.0
+            .iter()
+            .map(|role| role.name())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -30,6 +120,7 @@ struct Config {
     /// Whether `/auth/register` accepts new accounts. Off unless the operator opts in.
     registrations_open: bool,
     migrate_only: bool,
+    roles: Roles,
     bootstrap: Option<Bootstrap>,
 }
 
@@ -95,6 +186,7 @@ impl Config {
             secure_cookies,
             registrations_open,
             migrate_only: env::args().any(|argument| argument == "--migrate-only"),
+            roles: Roles::from_args()?,
             bootstrap,
         })
     }
@@ -279,7 +371,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(bootstrap) = &config.bootstrap {
         provision_bootstrap(&store, bootstrap).await?;
     }
-    {
+    tracing::info!(roles = %config.roles.names(), "nodus server starting");
+    if config.roles.has(Role::Scan) {
+        scanning::spawn(store.clone(), config.instance.base_url.clone());
+    }
+    if config.roles.has(Role::Prune) {
         let store = store.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(3600));
@@ -289,16 +385,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         });
     }
-    // Posts a reader queued are published here, in the same process that serves requests:
-    // a separate worker would be a second deployable to keep in step for one small loop.
-    {
-        let state = nodus_server_api::AppState::new(store.clone(), config.instance.clone());
-        tokio::spawn(nodus_server_api::schedules::run(state));
+    if !config.roles.has(Role::Api) {
+        tracing::info!(roles = %config.roles.names(), "no listener in this process");
+        shutdown().await;
+        return Ok(());
     }
-    // Outbound federation: the queue is drained here for the same reason the scheduler
-    // lives here — one process that already holds the keys and the pool.
+    // Queued posts publish and outbound activities leave from the process that also
+    // serves requests: one pool, one set of signing keys, and no second deployable to
+    // keep in step with this one.
     {
         let state = nodus_server_api::AppState::new(store.clone(), config.instance.clone());
+        tokio::spawn(nodus_server_api::schedules::run(state.clone()));
         tokio::spawn(nodus_server_api::outbox::run(state));
     }
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
@@ -342,6 +439,7 @@ mod tests {
             secure_cookies: true,
             registrations_open: false,
             migrate_only: false,
+            roles: Roles::parse(DEFAULT_ROLES).expect("default roles"),
             bootstrap: None,
         }
     }
@@ -894,5 +992,35 @@ mod tests {
                 .expect("repeated bootstrap should be idempotent");
         })
         .await;
+    }
+
+    #[test]
+    fn default_roles_run_every_loop() {
+        let roles = Roles::parse(DEFAULT_ROLES).expect("default roles parse");
+        for role in Role::all() {
+            assert!(roles.has(role), "{} must run by default", role.name());
+        }
+        assert_eq!(roles.names(), "api,scan,prune");
+    }
+
+    #[test]
+    fn a_narrow_role_list_runs_only_what_it_names() {
+        let roles = Roles::parse("scan").expect("scan parses");
+        assert!(roles.has(Role::Scan));
+        assert!(!roles.has(Role::Api));
+        assert!(!roles.has(Role::Prune));
+    }
+
+    #[test]
+    fn roles_are_deduplicated_and_trimmed() {
+        let roles = Roles::parse(" api , api,scan ").expect("padded roles parse");
+        assert_eq!(roles.names(), "api,scan");
+    }
+
+    #[test]
+    fn an_unknown_or_empty_role_list_is_refused() {
+        assert!(Roles::parse("api,frontend").is_err());
+        assert!(Roles::parse("").is_err());
+        assert!(Roles::parse(" , ").is_err());
     }
 }

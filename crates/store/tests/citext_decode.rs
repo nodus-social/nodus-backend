@@ -54,7 +54,7 @@ async fn seed_local_and_remote_accounts(pool: &PgPool) -> (String, String) {
 async fn admin_accounts_decodes_citext_username_domain_and_email(pool: PgPool) {
     let (local_id, remote_id) = seed_local_and_remote_accounts(&pool).await;
 
-    let all = moderation::admin_accounts(&pool, false, false, 20)
+    let all = moderation::admin_accounts(&pool, &moderation::AccountFilter::all(20))
         .await
         .expect("admin_accounts should decode citext columns");
 
@@ -74,9 +74,16 @@ async fn admin_accounts_decodes_citext_username_domain_and_email(pool: PgPool) {
         .expect("reject local account")
         .expect("local account exists");
 
-    let pending = moderation::admin_accounts(&pool, true, true, 20)
-        .await
-        .expect("admin_accounts(local=true, pending=true) should decode citext columns");
+    let pending = moderation::admin_accounts(
+        &pool,
+        &moderation::AccountFilter {
+            local: Some(true),
+            status: Some("pending"),
+            ..moderation::AccountFilter::all(20)
+        },
+    )
+    .await
+    .expect("admin_accounts(local=true, pending=true) should decode citext columns");
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].account.id, local_id);
     assert_eq!(pending[0].account.username, "Alice");
