@@ -75,11 +75,9 @@ async fn block_deletes_pending_follow_requests_in_both_directions(pool: PgPool) 
             .expect("carol follow request to alice"),
         FollowOutcome::Requested
     );
-    assert!(
-        social::accept_follow(&pool, &alice, &carol)
-            .await
-            .expect("alice accepts carol")
-    );
+    assert!(social::accept_follow(&pool, &alice, &carol)
+        .await
+        .expect("alice accepts carol"));
 
     social::block(&pool, &alice, &bob)
         .await
@@ -99,16 +97,12 @@ async fn block_deletes_pending_follow_requests_in_both_directions(pool: PgPool) 
     assert!(!alice_to_bob.following);
 
     // Neither pending request may survive to be accepted later.
-    assert!(
-        !social::accept_follow(&pool, &alice, &bob)
-            .await
-            .expect("accept_follow alice <- bob")
-    );
-    assert!(
-        !social::accept_follow(&pool, &bob, &alice)
-            .await
-            .expect("accept_follow bob <- alice")
-    );
+    assert!(!social::accept_follow(&pool, &alice, &bob)
+        .await
+        .expect("accept_follow alice <- bob"));
+    assert!(!social::accept_follow(&pool, &bob, &alice)
+        .await
+        .expect("accept_follow bob <- alice"));
 
     assert_counts_match_follow_table(&pool, &alice).await;
     assert_counts_match_follow_table(&pool, &bob).await;

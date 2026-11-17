@@ -9,13 +9,13 @@
 
 use std::collections::HashSet;
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
-use rsa::RsaPublicKey;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
+use rsa::RsaPublicKey;
 use sha2::{Digest as _, Sha256};
 
 /// Tolerated clock skew, applied symmetrically.
@@ -286,11 +286,11 @@ pub fn digest_header(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsa::RsaPrivateKey;
     use rsa::pkcs1v15::SigningKey;
     use rsa::pkcs8::{EncodePublicKey as _, LineEnding};
     use rsa::rand_core::OsRng;
     use rsa::signature::{SignatureEncoding as _, Signer as _};
+    use rsa::RsaPrivateKey;
 
     /// 1024 bits keeps the debug-build tests fast; the verification path is identical.
     fn key_pair() -> (RsaPrivateKey, String) {

@@ -127,6 +127,23 @@ pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<AccountRow>, sqlx::
         .await
 }
 
+/// Removes an account and everything it owns.
+///
+/// Every table that points at `account` either cascades or nulls out, so the single
+/// delete is the whole purge; the transaction exists so a foreign key added later that
+/// does neither fails the purge instead of leaving half an account behind.
+pub async fn purge(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let removed = sqlx::query("DELETE FROM account WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+        == 1;
+    tx.commit().await?;
+    Ok(removed)
+}
+
 /// One account by its canonical `ActivityPub` actor URL.
 pub async fn by_uri(pool: &PgPool, uri: &str) -> Result<Option<AccountRow>, sqlx::Error> {
     let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM account WHERE uri = $1");

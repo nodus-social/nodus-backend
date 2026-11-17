@@ -17,6 +17,7 @@ pub mod lists;
 pub mod media;
 pub mod miauth;
 pub mod moderation;
+pub mod scanners;
 pub mod social;
 pub mod statuses;
 

@@ -346,6 +346,21 @@ pub async fn delete_owned(
     Ok(true)
 }
 
+/// Marks a live status as sensitive.
+///
+/// Used when a scanner reports adult content the instance does not remove: the post keeps
+/// its place on its author's profile, with its media behind a warning.
+pub async fn mark_sensitive(pool: &PgPool, status_id: &str) -> Result<bool, sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE status SET sensitive = true WHERE id = $1 AND deleted_at IS NULL AND NOT sensitive",
+    )
+    .bind(status_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(updated > 0)
+}
+
 /// Inserts a local status and returns it exactly as a timeline would.
 pub async fn insert(pool: &PgPool, new: &NewStatus<'_>) -> Result<StatusRow, sqlx::Error> {
     let mut tx = pool.begin().await?;

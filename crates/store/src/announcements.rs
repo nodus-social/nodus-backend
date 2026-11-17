@@ -28,7 +28,8 @@ pub struct NewAnnouncement<'a> {
 
 const COLUMNS: &str = "a.id, a.content, a.published, a.all_day, a.starts_at, a.ends_at, \
      a.created_at, a.updated_at";
-const RETURNING: &str = "id, content, published, all_day, starts_at, ends_at, created_at, updated_at";
+const RETURNING: &str =
+    "id, content, published, all_day, starts_at, ends_at, created_at, updated_at";
 
 /// Announcements visible to an account, with its read state.
 pub async fn list_for(

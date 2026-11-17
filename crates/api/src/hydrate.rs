@@ -1,9 +1,9 @@
 //! On-demand hydration of remote profiles and posts into the local store.
 
-use axum::Json;
-use axum::Router;
 use axum::extract::{Query, State};
 use axum::routing::get;
+use axum::Json;
+use axum::Router;
 use serde::Deserialize;
 use serde_json::json;
 
