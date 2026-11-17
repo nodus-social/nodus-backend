@@ -52,14 +52,21 @@ impl AccountDto {
             Some(domain) => format!("{}@{domain}", row.username),
             None => row.username.clone(),
         };
-        let avatar = instance.url(&format!(
-            "/media/{}",
-            row.avatar_ref.as_deref().unwrap_or("default-avatar.png")
-        ));
-        let header = instance.url(&format!(
-            "/media/{}",
-            row.header_ref.as_deref().unwrap_or("default-header.png")
-        ));
+        let avatar = row.avatar_url.clone().unwrap_or_else(|| {
+            instance.url(&format!(
+                "/media/{}",
+                row.avatar_ref.as_deref().unwrap_or("default-avatar.png")
+            ))
+        });
+        let header = row
+            .header_url
+            .clone()
+            .or_else(|| {
+                row.header_ref
+                    .as_ref()
+                    .map(|reference| instance.url(&format!("/media/{reference}")))
+            })
+            .unwrap_or_default();
         Self {
             id: row.id.clone(),
             username: row.username.clone(),

@@ -9,13 +9,14 @@
 
 use std::collections::HashSet;
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
-use rsa::RsaPublicKey;
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
+use rsa::signature::{SignatureEncoding as _, Signer as _};
+use rsa::RsaPublicKey;
 use sha2::{Digest as _, Sha256};
 
 /// Tolerated clock skew, applied symmetrically.
@@ -283,14 +284,74 @@ pub fn digest_header(body: &[u8]) -> String {
     format!("SHA-256={}", BASE64.encode(Sha256::digest(body)))
 }
 
+/// The headers an outgoing signed request covers.
+pub const OUTGOING_SIGNED_HEADERS: [&str; 4] = ["(request-target)", "host", "date", "digest"];
+
+/// A request we are about to send, signed with one of our own keys.
+#[derive(Debug, Clone)]
+pub struct SignedHeaders {
+    pub date: String,
+    pub digest: String,
+    pub signature: String,
+}
+
+impl SignedHeaders {
+    /// The header pairs to add to the request, in the order they were signed.
+    #[must_use]
+    pub fn pairs(&self) -> [(&'static str, &str); 3] {
+        [
+            ("date", &self.date),
+            ("digest", &self.digest),
+            ("signature", &self.signature),
+        ]
+    }
+}
+
+/// Signs an outgoing request with `key_id`, which must name the `#main-key` of an actor
+/// on our own domain.
+///
+/// Instances in authorised-fetch mode answer unsigned reads with 401, so a fetch of a
+/// remote profile has to carry a signature the same way a delivery does. An empty body
+/// still gets a digest: the format requires the header, and a reader that checks it
+/// against the body finds nothing to disagree with.
+pub fn sign(
+    method: &str,
+    path: &str,
+    host: &str,
+    date: DateTime<Utc>,
+    body: &[u8],
+    key_id: &str,
+    private_key_pem: &str,
+) -> Result<SignedHeaders, VerifyError> {
+    let key = rsa::pkcs8::DecodePrivateKey::from_pkcs8_pem(private_key_pem)
+        .or_else(|_| rsa::pkcs1::DecodeRsaPrivateKey::from_pkcs1_pem(private_key_pem))
+        .map_err(|_| VerifyError::MissingKey)?;
+    let date_header = date.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let digest = digest_header(body);
+    let signing = format!(
+        "(request-target): {} {}\nhost: {host}\ndate: {date_header}\ndigest: {digest}",
+        method.to_lowercase(),
+        path
+    );
+    let signature = rsa::pkcs1v15::SigningKey::<Sha256>::new(key).sign(signing.as_bytes());
+    Ok(SignedHeaders {
+        date: date_header,
+        digest,
+        signature: format!(
+            "keyId=\"{key_id}\",algorithm=\"rsa-sha256\",headers=\"{}\",signature=\"{}\"",
+            OUTGOING_SIGNED_HEADERS.join(" "),
+            BASE64.encode(signature.to_bytes())
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsa::RsaPrivateKey;
     use rsa::pkcs1v15::SigningKey;
     use rsa::pkcs8::{EncodePublicKey as _, LineEnding};
     use rsa::rand_core::OsRng;
-    use rsa::signature::{SignatureEncoding as _, Signer as _};
+    use rsa::RsaPrivateKey;
 
     /// 1024 bits keeps the debug-build tests fast; the verification path is identical.
     fn key_pair() -> (RsaPrivateKey, String) {
@@ -299,6 +360,44 @@ mod tests {
             .to_public_key_pem(LineEnding::LF)
             .expect("pem");
         (private, pem)
+    }
+
+    /// The signature we produce must satisfy the verifier we wrote for others: if this
+    /// drifts, every instance in authorised-fetch mode silently refuses our reads.
+    #[test]
+    fn a_request_we_sign_passes_our_own_verification() {
+        let (private, public) = key_pair();
+        let private_pem = rsa::pkcs8::EncodePrivateKey::to_pkcs8_pem(&private, LineEnding::LF)
+            .expect("private pem")
+            .to_string();
+        let now = Utc::now();
+        let signed = sign(
+            "GET",
+            "/users/Gargron",
+            "mastodon.social",
+            now,
+            b"",
+            "https://nodus.test/users/lux#main-key",
+            &private_pem,
+        )
+        .expect("sign");
+
+        let headers = vec![
+            ("host".to_owned(), "mastodon.social".to_owned()),
+            ("date".to_owned(), signed.date.clone()),
+            ("digest".to_owned(), signed.digest.clone()),
+            ("signature".to_owned(), signed.signature.clone()),
+        ];
+        prepare("GET", "/users/Gargron", &headers, b"", now).expect("prepare");
+        let request = SignedRequest {
+            headers: &headers,
+            method: "GET",
+            path: "/users/Gargron",
+            body: b"",
+            now,
+            actor_key_pem: &public,
+        };
+        verify(&request).expect("our own signature should verify");
     }
 
     #[test]

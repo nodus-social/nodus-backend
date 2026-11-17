@@ -68,7 +68,7 @@ pub async fn instance_v1(State(state): State<AppState>) -> ApiResult<Json<Instan
         stats: serde_json::json!({ "user_count": 0, "status_count": 0, "domain_count": 1 }),
         thumbnail: instance.url("/media/thumbnail.png"),
         languages: vec!["en".to_owned()],
-        registrations: true,
+        registrations: instance.registrations_open,
         approval_required: false,
         invites_enabled: false,
         configuration: ConfigurationDto::build(instance),
@@ -93,12 +93,15 @@ pub async fn instance_v2(State(state): State<AppState>) -> ApiResult<Json<Instan
         languages: vec!["en".to_owned()],
         configuration: ConfigurationDto::build(instance),
         registrations: RegistrationsDto {
-            enabled: true,
+            enabled: instance.registrations_open,
             approval_required: false,
             message: None,
         },
+        // `email` is a string in Mastodon's payload and every client types it as one, so
+        // an instance with no contact address sends `""` rather than `null`: a null here
+        // is a decode failure in clients, not a missing value.
         contact: serde_json::json!({
-            "email": instance.contact_email,
+            "email": instance.contact_email.clone().unwrap_or_default(),
             "account": null
         }),
         rules: Vec::new(),

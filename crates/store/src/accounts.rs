@@ -29,6 +29,8 @@ pub struct AccountRow {
     pub note: String,
     pub avatar_ref: Option<String>,
     pub header_ref: Option<String>,
+    pub avatar_url: Option<String>,
+    pub header_url: Option<String>,
     pub fields: Value,
     pub client_metadata: Value,
     pub locked: bool,
@@ -57,13 +59,13 @@ pub struct AccountRow {
 }
 
 pub(crate) const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS username, a.domain::text AS domain, \
-     a.display_name, a.note, a.avatar_ref, a.header_ref, a.fields, a.client_metadata, a.locked, a.bot, a.local, a.uri, \
+     a.display_name, a.note, a.avatar_ref, a.header_ref, a.avatar_url, a.header_url, a.fields, a.client_metadata, a.locked, a.bot, a.local, a.uri, \
      a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.approved, \
      a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
      a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.created_at";
 
 pub(crate) const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
-     display_name, note, avatar_ref, header_ref, fields, client_metadata, locked, bot, local, uri, \
+     display_name, note, avatar_ref, header_ref, avatar_url, header_url, fields, client_metadata, locked, bot, local, uri, \
      inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, approved, \
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \
      lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, created_at";
@@ -144,7 +146,9 @@ pub struct RemoteAccount<'a> {
     pub domain: &'a str,
     pub display_name: &'a str,
     pub note: &'a str,
-    pub avatar: Option<&'a str>,
+    /// A picture URL on the account's own instance; `avatar_ref` names a file we host.
+    pub avatar_url: Option<&'a str>,
+    pub header_url: Option<&'a str>,
     pub inbox_url: Option<&'a str>,
     pub shared_inbox_url: Option<&'a str>,
     pub public_key_pem: Option<&'a str>,
@@ -158,11 +162,12 @@ pub async fn upsert_remote(
     remote: &RemoteAccount<'_>,
 ) -> Result<AccountRow, sqlx::Error> {
     let sql = format!(
-        "INSERT INTO account (id, username, domain, display_name, note, avatar_ref, local, uri, \
-             inbox_url, shared_inbox_url, public_key_pem, locked, bot) \
-         VALUES ($1, $2, $3, $4, $5, $6, false, $7, $8, $9, $10, $11, $12) \
+        "INSERT INTO account (id, username, domain, display_name, note, avatar_url, header_url, \
+             local, uri, inbox_url, shared_inbox_url, public_key_pem, locked, bot) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8, $9, $10, $11, $12, $13) \
          ON CONFLICT (uri) DO UPDATE SET display_name = EXCLUDED.display_name, note = EXCLUDED.note, \
-             avatar_ref = COALESCE(EXCLUDED.avatar_ref, account.avatar_ref), \
+             avatar_url = COALESCE(EXCLUDED.avatar_url, account.avatar_url), \
+             header_url = COALESCE(EXCLUDED.header_url, account.header_url), \
              inbox_url = COALESCE(EXCLUDED.inbox_url, account.inbox_url), \
              shared_inbox_url = COALESCE(EXCLUDED.shared_inbox_url, account.shared_inbox_url), \
              public_key_pem = COALESCE(EXCLUDED.public_key_pem, account.public_key_pem), \
@@ -175,7 +180,8 @@ pub async fn upsert_remote(
         .bind(remote.domain)
         .bind(remote.display_name)
         .bind(remote.note)
-        .bind(remote.avatar)
+        .bind(remote.avatar_url)
+        .bind(remote.header_url)
         .bind(remote.uri)
         .bind(remote.inbox_url)
         .bind(remote.shared_inbox_url)
@@ -431,6 +437,88 @@ pub async fn search_local(
         .await
 }
 
+/// The parts of a profile its owner may change.
+///
+/// Every field is optional: a client sends the ones the reader touched, and `None` means
+/// "leave it alone" rather than "clear it", which is what a partial update means.
+#[derive(Debug, Default, Clone)]
+pub struct ProfileUpdate<'a> {
+    pub display_name: Option<&'a str>,
+    pub note: Option<&'a str>,
+    pub locked: Option<bool>,
+    pub bot: Option<bool>,
+    pub discoverable: Option<bool>,
+    pub indexable: Option<bool>,
+    /// A reference under `/media/`, such as `{id}/preview`, or `None` to keep the current
+    /// picture.
+    pub avatar_ref: Option<&'a str>,
+    pub header_ref: Option<&'a str>,
+}
+
+/// Writes the parts of a profile that were sent.
+pub async fn update_profile(
+    pool: &PgPool,
+    id: &str,
+    update: &ProfileUpdate<'_>,
+) -> Result<AccountRow, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET \
+            display_name = COALESCE($2, display_name), \
+            note = COALESCE($3, note), \
+            locked = COALESCE($4, locked), \
+            bot = COALESCE($5, bot), \
+            discoverable = COALESCE($6, discoverable), \
+            indexable = COALESCE($7, indexable), \
+            avatar_ref = COALESCE($8, avatar_ref), \
+            header_ref = COALESCE($9, header_ref), \
+            updated_at = now() \
+          WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(update.display_name)
+        .bind(update.note)
+        .bind(update.locked)
+        .bind(update.bot)
+        .bind(update.discoverable)
+        .bind(update.indexable)
+        .bind(update.avatar_ref)
+        .bind(update.header_ref)
+        .fetch_one(pool)
+        .await
+}
+
+/// Accounts the instance suggests, for the directory screen.
+///
+/// `order = "active"` puts the accounts that actually post first, which is what a reader
+/// opening a directory wants; the default is by sign-up date, so a fresh profile with
+/// nothing in it does not lead the list.
+pub async fn directory(
+    pool: &PgPool,
+    local_only: bool,
+    active_first: bool,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<AccountRow>, sqlx::Error> {
+    let order = if active_first {
+        "last_status_at DESC NULLS LAST, followers_count DESC, username ASC"
+    } else {
+        "created_at DESC, username ASC"
+    };
+    let sql = format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM account \
+          WHERE suspended_at IS NULL AND discoverable \
+            AND ($1 = false OR domain IS NULL) \
+          ORDER BY {order} OFFSET $2 LIMIT $3"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(local_only)
+        .bind(offset)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
 /// Errors from updating or clearing per-account client metadata.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientMetadataStoreError {
@@ -491,6 +579,23 @@ pub async fn client_metadata_get_keys(
 }
 
 /// Reads a single client metadata key for an account.
+/// The key we sign outgoing federation reads with.
+///
+/// `None` means no local account carries a private key yet, in which case callers send
+/// unsigned requests and instances in authorised-fetch mode refuse them.
+pub async fn local_signer(
+    pool: &PgPool,
+) -> Result<Option<(String, Option<String>, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, Option<String>, String)>(
+        "SELECT username, uri, private_key_pem FROM account \
+          WHERE domain IS NULL AND private_key_pem IS NOT NULL \
+            AND suspended_at IS NULL \
+          ORDER BY admin DESC, created_at ASC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn client_metadata_get_key(
     pool: &PgPool,
     account_id: &str,

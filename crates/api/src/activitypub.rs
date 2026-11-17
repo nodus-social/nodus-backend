@@ -9,14 +9,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::SecondsFormat;
-use rsa::RsaPrivateKey;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::OsRng;
+use rsa::RsaPrivateKey;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -520,7 +520,7 @@ fn is_disallowed_domain(domain: &str) -> bool {
         })
 }
 
-fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
+pub(crate) fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
     let octets = v4.octets();
     v4.is_loopback()
         || v4.is_private()
@@ -538,7 +538,7 @@ fn is_disallowed_ipv4(v4: Ipv4Addr) -> bool {
         || octets[0] >= 240
 }
 
-fn is_disallowed_ipv6(v6: Ipv6Addr) -> bool {
+pub(crate) fn is_disallowed_ipv6(v6: Ipv6Addr) -> bool {
     if let Some(v4) = v6.to_ipv4() {
         if is_disallowed_ipv4(v4) {
             return true;
@@ -583,7 +583,8 @@ async fn upsert_remote_actor(
             domain,
             display_name: &display_name,
             note: &note,
-            avatar: actor.avatar.as_deref(),
+            avatar_url: actor.avatar.as_deref(),
+            header_url: actor.header.as_deref(),
             inbox_url: actor.inbox.as_deref(),
             shared_inbox_url: actor.shared_inbox.as_deref(),
             public_key_pem: actor.public_key_pem.as_deref(),
@@ -699,7 +700,7 @@ fn html_to_text(html: &str) -> String {
     text.trim().to_owned()
 }
 
-async fn status_activity(
+pub(crate) async fn status_activity(
     state: &AppState,
     row: &StatusRow,
     account: &AccountRow,
@@ -866,7 +867,7 @@ fn actor_document(state: &AppState, account: &AccountRow) -> Actor {
     }
 }
 
-fn actor_url(state: &AppState, account: &AccountRow) -> String {
+pub(crate) fn actor_url(state: &AppState, account: &AccountRow) -> String {
     account.uri.clone().unwrap_or_else(|| {
         state
             .instance()
@@ -874,7 +875,7 @@ fn actor_url(state: &AppState, account: &AccountRow) -> String {
     })
 }
 
-fn status_url(state: &AppState, row: &StatusRow) -> String {
+pub(crate) fn status_url(state: &AppState, row: &StatusRow) -> String {
     row.uri
         .clone()
         .unwrap_or_else(|| state.instance().url(&format!("/statuses/{}", row.id)))
@@ -942,6 +943,7 @@ mod tests {
                 contact_email: None,
                 api_version: "4.3.0".to_owned(),
                 version: "0.1.0".to_owned(),
+                registrations_open: false,
             },
         );
         body(store, state).await;
@@ -962,7 +964,8 @@ mod tests {
                     domain: "remote.test",
                     display_name: "Mallory",
                     note: "",
-                    avatar: None,
+                    avatar_url: None,
+                    header_url: None,
                     inbox_url: Some("https://remote.test/users/mallory/inbox"),
                     shared_inbox_url: None,
                     public_key_pem: None,

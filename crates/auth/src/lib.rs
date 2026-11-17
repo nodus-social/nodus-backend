@@ -24,7 +24,7 @@ use crate::domain::{
     redirect_allowed, redirect_with, token_hash, verify_csrf, verify_pkce, AuthorizeRequest,
     CSRF_COOKIE,
 };
-use crate::store::{AuthStore, Credential, PgAuthStore, SessionAccount};
+use crate::store::{AuthStore, Credential, PgAuthStore, RegisterError, SessionAccount};
 
 pub mod domain;
 pub mod store;
@@ -98,6 +98,11 @@ pub struct Config {
     pub domain: String,
     pub issuer: String,
     pub secure_cookies: bool,
+    /// Whether a stranger may create an account from `/auth/register`.
+    ///
+    /// Off unless the operator says otherwise: an instance that is reachable before
+    /// anyone has decided to open it should not be fillable by a script.
+    pub registrations_open: bool,
 }
 
 impl Config {
@@ -108,6 +113,7 @@ impl Config {
             issuer: format!("https://{domain}"),
             domain,
             secure_cookies: true,
+            registrations_open: false,
         }
     }
 }
@@ -131,6 +137,10 @@ pub fn router<S: AuthStore>(state: AppState<S>) -> Router {
     Router::new()
         .route("/", get(|| async { Redirect::to("/auth/login") }))
         .route("/auth/login", get(login_page::<S>).post(login_submit::<S>))
+        .route(
+            "/auth/register",
+            get(register_page::<S>).post(register_submit::<S>),
+        )
         .route("/auth/logout", post(logout::<S>))
         .route("/auth/session", get(session::<S>))
         .route(
@@ -166,12 +176,15 @@ async fn login_page<S: AuthStore>(
     let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
     (
         jar,
-        Html(render_login(
-            query.return_to.as_deref(),
+        Html(render_login(LoginView {
+            domain: &state.config.domain,
+            registrations_open: state.config.registrations_open,
+            return_to: query.return_to.as_deref(),
             signed_in,
-            None,
-            &csrf_token,
-        )),
+            error: None,
+            filled: None,
+            csrf_token: &csrf_token,
+        })),
     )
 }
 
@@ -205,12 +218,15 @@ async fn login_submit<S: AuthStore>(
         let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
         return (
             jar,
-            Html(render_login(
-                form.return_to.as_deref(),
-                false,
-                Some("Wrong email or password."),
-                &csrf_token,
-            )),
+            Html(render_login(LoginView {
+                domain: &state.config.domain,
+                registrations_open: state.config.registrations_open,
+                return_to: form.return_to.as_deref(),
+                signed_in: false,
+                error: Some("Wrong email or password."),
+                filled: Some(form.email.trim()),
+                csrf_token: &csrf_token,
+            })),
         )
             .into_response();
     }
@@ -236,6 +252,229 @@ async fn login_submit<S: AuthStore>(
     let rotated_csrf = csrf_cookie(opaque_token(), state.config.secure_cookies);
     let target = safe_return_to(form.return_to.as_deref()).unwrap_or("/");
     (jar.add(cookie).add(rotated_csrf), Redirect::to(target)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterForm {
+    username: String,
+    email: String,
+    password: String,
+    password_confirmation: String,
+    return_to: Option<String>,
+    #[serde(default)]
+    csrf_token: String,
+}
+
+const USERNAME_MIN: usize = 3;
+const USERNAME_MAX: usize = 30;
+const PASSWORD_MIN: usize = 8;
+const PASSWORD_MAX: usize = 200;
+
+/// Names a new account may not take.
+///
+/// These are the first path segment of routes the instance answers, plus the names people
+/// read as staff; a local account holding one would shadow a page or sound official.
+const RESERVED_USERNAMES: &[&str] = &[
+    "about",
+    "admin",
+    "administrator",
+    "api",
+    "ap",
+    "auth",
+    "explore",
+    "help",
+    "inbox",
+    "media",
+    "moderator",
+    "nodus",
+    "oauth",
+    "outbox",
+    "root",
+    "settings",
+    "staff",
+    "statuses",
+    "support",
+    "system",
+    "users",
+    "web",
+];
+
+struct Registration {
+    username: String,
+    email: String,
+    password: String,
+}
+
+/// Normalises a submitted form into the values that are written, or the one sentence
+/// that tells the reader what to change.
+fn normalized_registration(form: &RegisterForm) -> Result<Registration, &'static str> {
+    let username = form.username.trim().to_ascii_lowercase();
+    if !(USERNAME_MIN..=USERNAME_MAX).contains(&username.chars().count()) {
+        return Err("A username is 3 to 30 characters.");
+    }
+    if !username.chars().all(|character| {
+        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+    }) {
+        return Err("Use only letters, numbers and underscores in the username.");
+    }
+    if RESERVED_USERNAMES.contains(&username.as_str()) {
+        return Err("That username is reserved on this instance.");
+    }
+    let email = form.email.trim();
+    if !plausible_email(email) {
+        return Err("That does not look like an email address.");
+    }
+    let password = form.password.clone();
+    if password.chars().count() < PASSWORD_MIN {
+        return Err("A password is at least 8 characters.");
+    }
+    if password.chars().count() > PASSWORD_MAX {
+        return Err("That password is too long.");
+    }
+    if password != form.password_confirmation {
+        return Err("The two passwords do not match.");
+    }
+    Ok(Registration {
+        username,
+        email: email.to_owned(),
+        password,
+    })
+}
+
+/// What passes for an email check here: one `@`, a local part, and a domain with a dot.
+///
+/// Deliverability is not decided at sign-up — nothing on this page sends mail — and a
+/// stricter check only rejects addresses that happen to be unusual.
+fn plausible_email(value: &str) -> bool {
+    if value.is_empty() || value.len() > 254 || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = value.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+async fn register_page<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    Query(query): Query<LoginQuery>,
+    jar: CookieJar,
+) -> (CookieJar, Html<String>) {
+    let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    (
+        jar,
+        Html(render_register(RegisterView {
+            domain: &state.config.domain,
+            open: state.config.registrations_open,
+            return_to: query.return_to.as_deref(),
+            error: None,
+            filled: None,
+            csrf_token: &csrf_token,
+        })),
+    )
+}
+
+async fn register_submit<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    Form(form): Form<RegisterForm>,
+) -> Response {
+    if !state.config.registrations_open {
+        return (
+            StatusCode::FORBIDDEN,
+            "registration is closed on this instance",
+        )
+            .into_response();
+    }
+    if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    let registration = match normalized_registration(&form) {
+        Ok(registration) => registration,
+        Err(message) => return registration_error(&state, jar, &form, message),
+    };
+    let Ok(password_hash) = hash_password(&registration.password) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "password could not be hashed",
+        )
+            .into_response();
+    };
+    let account = match state
+        .store
+        .register_local(&registration.username, &registration.email, &password_hash)
+        .await
+    {
+        Ok(account) => account,
+        Err(RegisterError::UsernameTaken) => {
+            return registration_error(&state, jar, &form, "That username is already taken.");
+        }
+        Err(RegisterError::EmailTaken) => {
+            return registration_error(
+                &state,
+                jar,
+                &form,
+                "That email address already has a login.",
+            );
+        }
+        Err(RegisterError::Database(error)) => {
+            tracing::error!(%error, "registration failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the account could not be created",
+            )
+                .into_response();
+        }
+    };
+
+    // A new account arrives signed in: making someone type the password they just chose
+    // into the same page is a step that only exists to be clicked past.
+    let session = opaque_token();
+    let expiry = Utc::now() + Duration::days(SESSION_DAYS);
+    if state
+        .store
+        .create_session(&token_hash(&session), &account.account_id, expiry)
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session could not be stored",
+        )
+            .into_response();
+    }
+    tracing::info!(username = %account.username, "account registered");
+
+    let cookie = session_cookie(session, expiry, state.config.secure_cookies);
+    let rotated_csrf = csrf_cookie(opaque_token(), state.config.secure_cookies);
+    let target = safe_return_to(form.return_to.as_deref()).unwrap_or("/");
+    (jar.add(cookie).add(rotated_csrf), Redirect::to(target)).into_response()
+}
+
+/// Re-renders the form with the submitted name and email still in it.
+fn registration_error<S: AuthStore>(
+    state: &AppState<S>,
+    jar: CookieJar,
+    form: &RegisterForm,
+    message: &str,
+) -> Response {
+    let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    (
+        jar,
+        Html(render_register(RegisterView {
+            domain: &state.config.domain,
+            open: true,
+            return_to: form.return_to.as_deref(),
+            error: Some(message),
+            filled: Some(RegisterFilled {
+                username: form.username.trim(),
+                email: form.email.trim(),
+            }),
+            csrf_token: &csrf_token,
+        })),
+    )
+        .into_response()
 }
 
 async fn logout<S: AuthStore>(State(state): State<AppState<S>>, jar: CookieJar) -> Response {
@@ -450,17 +689,22 @@ async fn token<S: AuthStore>(
     let Ok(Some(app)) = state.store.client_app(&form.client_id).await else {
         return oauth_error("invalid_client");
     };
-    let Some(secret) = form
+    // A public client cannot keep a secret: a browser bundle and a mobile app are both
+    // readable by whoever runs them. PKCE is what makes that safe — the verifier proves
+    // the same thing the secret would, that whoever redeems the code is whoever started
+    // the flow — so the exchange is allowed without one. A secret that *is* presented
+    // still has to match, which keeps a leaked confidential client from being replayed.
+    if form
         .client_secret
         .as_deref()
         .filter(|value| !value.is_empty())
-    else {
-        return oauth_error("invalid_client");
-    };
-    if !constant_time_eq(
-        token_hash(secret).as_bytes(),
-        app.client_secret_hash.as_bytes(),
-    ) {
+        .is_some_and(|secret| {
+            !constant_time_eq(
+                token_hash(secret).as_bytes(),
+                app.client_secret_hash.as_bytes(),
+            )
+        })
+    {
         return oauth_error("invalid_client");
     }
     let Ok(Some(stored)) = state.store.consume_code(&token_hash(code)).await else {
@@ -583,7 +827,65 @@ struct SessionJson {
     display_name: String,
 }
 
-fn shell(title: &str, content: impl IntoView + 'static) -> String {
+/// The stylesheet the auth pages wear.
+///
+/// These pages are answered by the backend, not by the client, so they cannot link the
+/// client's compiled stylesheet: its name is a content hash. The tokens below are copied
+/// from `web/crates/web-shared/style/theme.css`, so the door and the room behind it look
+/// like one product — keep them in step when that palette changes.
+const STYLES: &str = "\
+:root{color-scheme:light dark;\
+--sans:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans',sans-serif;\
+--mono:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;\
+--radius:0.5rem;\
+--base-100:oklch(99% 0.003 250);--base-200:oklch(97% 0.004 250);--base-300:oklch(93% 0.006 250);\
+--base-content:oklch(28% 0.012 255);--primary:oklch(58% 0.16 258);\
+--primary-content:oklch(99% 0.005 258);--error:oklch(60% 0.19 25)}\
+@media (prefers-color-scheme:dark){:root{\
+--base-100:oklch(22% 0.01 255);--base-200:oklch(19% 0.01 255);--base-300:oklch(16% 0.01 255);\
+--base-content:oklch(92% 0.006 255);--primary:oklch(72% 0.13 258);\
+--primary-content:oklch(18% 0.02 258);--error:oklch(70% 0.16 25)}}\
+*{box-sizing:border-box}\
+body{margin:0;min-height:100vh;background:var(--base-200);color:var(--base-content);\
+font-family:var(--sans);font-size:1rem;line-height:1.5;-webkit-font-smoothing:antialiased}\
+a{color:var(--primary)}\
+.top{display:flex;align-items:center;justify-content:space-between;gap:.75rem;\
+border-bottom:1px solid var(--base-300);background:var(--base-100);padding:.5rem .75rem}\
+.brand{font-weight:600;letter-spacing:-.01em;color:var(--base-content);text-decoration:none}\
+.top nav{font-size:.875rem}\
+main{width:min(26rem,calc(100vw - 2rem));margin:2rem auto 3rem;padding:1.5rem;\
+background:var(--base-100);border:1px solid var(--base-300);border-radius:var(--radius);\
+box-shadow:0 1px 2px 0 color-mix(in oklch,#000 8%,transparent)}\
+h1{font-size:1.25rem;font-weight:600;letter-spacing:-.01em;margin:0 0 .25rem}\
+p{margin:0 0 .75rem;font-size:.875rem}\
+p.muted,.muted{color:color-mix(in oklch,var(--base-content) 65%,transparent)}\
+.field{margin:0 0 .75rem}\
+label{display:block;margin:0 0 .25rem;font-size:.875rem}\
+.hint{margin:.25rem 0 0;font-size:.75rem;color:color-mix(in oklch,var(--base-content) 60%,transparent)}\
+input{width:100%;padding:.5rem .625rem;font:inherit;font-size:.9375rem;color:var(--base-content);\
+background:var(--base-100);border:1px solid var(--base-300);border-radius:var(--radius)}\
+input:focus-visible{outline:2px solid var(--primary);outline-offset:1px}\
+button{display:block;width:100%;padding:.55rem .75rem;font:inherit;font-size:.9375rem;\
+font-weight:600;color:var(--primary-content);background:var(--primary);border:1px solid transparent;\
+border-radius:var(--radius);cursor:pointer}\
+button:hover{background:color-mix(in oklch,var(--primary) 88%,var(--base-content))}\
+button:focus-visible{outline:2px solid var(--primary);outline-offset:2px}\
+button.secondary{color:var(--base-content);background:var(--base-200);border-color:var(--base-300)}\
+button.secondary:hover{background:var(--base-300)}\
+.actions{display:flex;gap:.5rem}.actions button{flex:1}\
+.alert{margin:0 0 .75rem;padding:.5rem .75rem;font-size:.875rem;color:var(--error);\
+background:color-mix(in oklch,var(--error) 12%,transparent);\
+border:1px solid color-mix(in oklch,var(--error) 35%,transparent);border-radius:var(--radius)}\
+.scopes{list-style:none;margin:0 0 .75rem;padding:0;display:flex;flex-direction:column;gap:.375rem}\
+.scopes li{display:flex;gap:.5rem;align-items:baseline;padding:.375rem .5rem;font-size:.8125rem;\
+border:1px solid var(--base-300);border-radius:var(--radius);background:var(--base-200)}\
+.scopes code{font-family:var(--mono);font-size:.8125rem;font-weight:600}\
+.scopes span{color:color-mix(in oklch,var(--base-content) 70%,transparent)}\
+footer{margin:1.25rem 0 0;padding:.875rem 0 0;border-top:1px solid var(--base-300);font-size:.875rem}\
+footer button{width:auto;margin:0;padding:.35rem .6rem;font-size:.8125rem}\
+";
+
+fn shell(title: &str, nav: Option<(String, String)>, content: impl IntoView + 'static) -> String {
     let title = title.to_owned();
     let body = Owner::new().with(|| {
         view! {
@@ -593,20 +895,17 @@ fn shell(title: &str, content: impl IntoView + 'static) -> String {
                     <meta name="viewport" content="width=device-width, initial-scale=1"/>
                     <meta name="robots" content="noindex"/>
                     <title>{title}</title>
-                    <style>
-                        ":root{color-scheme:light dark;font-family:system-ui,sans-serif}"
-                        "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f4}"
-                        "main{width:min(26rem,calc(100vw - 2rem));background:white;border:1px solid #d6d3d1;border-radius:12px;padding:1.5rem}"
-                        "h1{font-size:1.25rem;margin:0 0 .5rem}p{color:#57534e;line-height:1.5}"
-                        "label{display:block;margin:.75rem 0 .25rem;font-size:.875rem}"
-                        "input{width:100%;box-sizing:border-box;padding:.6rem;border:1px solid #a8a29e;border-radius:8px}"
-                        "button{margin-top:1rem;width:100%;padding:.65rem;border:0;border-radius:8px;background:#292524;color:white;font-weight:600;cursor:pointer}"
-                        ".error{color:#b91c1c;font-size:.875rem}.actions{display:flex;gap:.5rem}.actions button{flex:1}"
-                        ".secondary{background:#e7e5e4;color:#292524}"
-                        "@media(prefers-color-scheme:dark){body{background:#1c1917}main{background:#292524;border-color:#44403c}p{color:#a8a29e}input{background:#1c1917;color:white;border-color:#57534e}}"
-                    </style>
+                    <style>{STYLES}</style>
                 </head>
-                <body><main>{content}</main></body>
+                <body>
+                    <header class="top">
+                        <a class="brand" href="/">"Nodus"</a>
+                        <nav>
+                            {nav.map(|(href, label)| view! { <a href=href>{label}</a> })}
+                        </nav>
+                    </header>
+                    <main>{content}</main>
+                </body>
             </html>
         }
         .to_html()
@@ -614,31 +913,212 @@ fn shell(title: &str, content: impl IntoView + 'static) -> String {
     format!("<!DOCTYPE html>{body}")
 }
 
-fn render_login(
-    return_to: Option<&str>,
+/// Rebuilds a link that carries the caller's `return_to`, so a detour through a form still
+/// ends where the reader was going.
+fn with_return(path: &str, return_to: Option<&str>) -> String {
+    match safe_return_to(return_to) {
+        Some(target) => format!(
+            "{path}?return_to={}",
+            url::form_urlencoded::byte_serialize(target.as_bytes()).collect::<String>()
+        ),
+        None => path.to_owned(),
+    }
+}
+
+/// The one line the consent screen shows for a scope.
+fn scope_label(scope: &str) -> &'static str {
+    match scope {
+        "read" => "Read your timelines, notifications and profile",
+        "write" => "Post, edit, boost and delete on your behalf",
+        "follow" => "Follow and unfollow accounts for you",
+        "push" => "Receive push notifications",
+        _ => "An ability this instance does not describe",
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LoginView<'a> {
+    domain: &'a str,
+    registrations_open: bool,
+    return_to: Option<&'a str>,
     signed_in: bool,
-    error: Option<&str>,
-    csrf_token: &str,
-) -> String {
-    let return_to = return_to.unwrap_or("/").to_owned();
-    let error = error.map(str::to_owned);
-    let csrf_token = csrf_token.to_owned();
+    error: Option<&'a str>,
+    filled: Option<&'a str>,
+    csrf_token: &'a str,
+}
+
+fn render_login(view: LoginView<'_>) -> String {
+    let return_to = view.return_to.unwrap_or("/").to_owned();
+    let email = view.filled.unwrap_or_default().to_owned();
+    let csrf_token = view.csrf_token.to_owned();
+    let domain = view.domain.to_owned();
+    let error = view.error.map(str::to_owned);
+    let signed_in = view.signed_in;
+    let register_href = with_return("/auth/register", view.return_to);
+    let nav = view
+        .registrations_open
+        .then(|| (register_href.clone(), "Create account".to_owned()));
+    let open = view.registrations_open;
     shell(
         "Sign in · Nodus",
+        nav,
         view! {
-            <h1>"Sign in to Nodus"</h1>
-            <p>"Use your instance account to continue."</p>
-            {signed_in.then(|| view! { <p>"You are already signed in."</p> })}
+            <h1>"Sign in"</h1>
+            <p class="muted">{format!("Use your {domain} account to continue.")}</p>
+            {signed_in.then(|| view! { <p class="muted">"You are already signed in."</p> })}
+            {error.map(|message| view! { <div class="alert" role="alert">{message}</div> })}
             <form method="post" action="/auth/login">
                 <input type="hidden" name="return_to" value=return_to/>
                 <input type="hidden" name="csrf_token" value=csrf_token/>
-                <label for="email">"Email"</label>
-                <input id="email" name="email" type="email" autocomplete="username" required/>
-                <label for="password">"Password"</label>
-                <input id="password" name="password" type="password" autocomplete="current-password" required/>
+                <div class="field">
+                    <label for="email">"Email"</label>
+                    <input
+                        id="email"
+                        name="email"
+                        type="email"
+                        autocomplete="username"
+                        value=email
+                        required
+                    />
+                </div>
+                <div class="field">
+                    <label for="password">"Password"</label>
+                    <input
+                        id="password"
+                        name="password"
+                        type="password"
+                        autocomplete="current-password"
+                        required
+                    />
+                </div>
                 <button type="submit">"Sign in"</button>
             </form>
-            {error.map(|message| view! { <p class="error">{message}</p> })}
+            {open
+                .then(|| {
+                    view! {
+                        <footer>
+                            <span class="muted">"No account yet? "</span>
+                            <a href=register_href>"Create one"</a>
+                        </footer>
+                    }
+                })}
+        },
+    )
+}
+
+struct RegisterFilled<'a> {
+    username: &'a str,
+    email: &'a str,
+}
+
+struct RegisterView<'a> {
+    domain: &'a str,
+    open: bool,
+    return_to: Option<&'a str>,
+    error: Option<&'a str>,
+    filled: Option<RegisterFilled<'a>>,
+    csrf_token: &'a str,
+}
+
+fn render_register(view: RegisterView<'_>) -> String {
+    let domain = view.domain.to_owned();
+    let sign_in_href = with_return("/auth/login", view.return_to);
+    let nav = Some((sign_in_href.clone(), "Sign in".to_owned()));
+
+    if !view.open {
+        return shell(
+            "Create account · Nodus",
+            nav,
+            view! {
+                <h1>"Registration is closed"</h1>
+                <p class="muted">
+                    {format!(
+                        "{domain} is not accepting new accounts right now. Ask an administrator to create one for you.",
+                    )}
+                </p>
+            },
+        );
+    }
+
+    let return_to = view.return_to.unwrap_or("/").to_owned();
+    let csrf_token = view.csrf_token.to_owned();
+    let error = view.error.map(str::to_owned);
+    let (username, email) = view.filled.map_or_else(
+        || (String::new(), String::new()),
+        |filled| (filled.username.to_owned(), filled.email.to_owned()),
+    );
+    let handle = if username.is_empty() {
+        "name".to_owned()
+    } else {
+        username.clone()
+    };
+    shell(
+        "Create account · Nodus",
+        nav,
+        view! {
+            <h1>"Create account"</h1>
+            <p class="muted">{format!("Pick a name and a password for {domain}.")}</p>
+            {error.map(|message| view! { <div class="alert" role="alert">{message}</div> })}
+            <form method="post" action="/auth/register">
+                <input type="hidden" name="return_to" value=return_to/>
+                <input type="hidden" name="csrf_token" value=csrf_token/>
+                <div class="field">
+                    <label for="username">"Username"</label>
+                    <input
+                        id="username"
+                        name="username"
+                        type="text"
+                        autocomplete="username"
+                        value=username
+                        required
+                        minlength="3"
+                        maxlength="30"
+                        pattern="[A-Za-z0-9_]+"
+                    />
+                    <p class="hint">{format!(
+                        "Letters, numbers and underscores. Others will see you as @{handle}@{domain}.",
+                    )}</p>
+                </div>
+                <div class="field">
+                    <label for="email">"Email"</label>
+                    <input
+                        id="email"
+                        name="email"
+                        type="email"
+                        autocomplete="email"
+                        value=email
+                        required
+                    />
+                    <p class="hint">"Used to sign in. Nothing is sent to it."</p>
+                </div>
+                <div class="field">
+                    <label for="password">"Password"</label>
+                    <input
+                        id="password"
+                        name="password"
+                        type="password"
+                        autocomplete="new-password"
+                        minlength="8"
+                        required
+                    />
+                </div>
+                <div class="field">
+                    <label for="password_confirmation">"Repeat password"</label>
+                    <input
+                        id="password_confirmation"
+                        name="password_confirmation"
+                        type="password"
+                        autocomplete="new-password"
+                        minlength="8"
+                        required
+                    />
+                </div>
+                <button type="submit">"Create account"</button>
+            </form>
+            <footer>
+                <span class="muted">"Already have an account? "</span>
+                <a href=sign_in_href>"Sign in"</a>
+            </footer>
         },
     )
 }
@@ -652,12 +1132,27 @@ fn render_consent(
     let scopes = request.scopes.join(" ");
     let state = request.state.clone().unwrap_or_default();
     let csrf_token = csrf_token.to_owned();
+    let heading = format!("Authorize {app_name}");
+    let signed_in = format!("Signed in as @{}.", account.username);
+    let asks = format!("{app_name} is asking for:");
+    let rows: Vec<(String, &'static str)> = request
+        .scopes
+        .iter()
+        .map(|scope| (scope.clone(), scope_label(scope)))
+        .collect();
     shell(
         "Authorize · Nodus",
+        None,
         view! {
-            <h1>{format!("Authorize {app_name}")}</h1>
-            <p>{format!("Signed in as @{}.", account.username)}</p>
-            <p>{format!("This application is asking for: {scopes}.")}</p>
+            <h1>{heading}</h1>
+            <p class="muted">{signed_in}</p>
+            <p>{asks}</p>
+            <ul class="scopes">
+                {rows
+                    .into_iter()
+                    .map(|(scope, label)| view! { <li><code>{scope}</code><span>{label}</span></li> })
+                    .collect_view()}
+            </ul>
             <form method="post" action="/oauth/authorize">
                 <input type="hidden" name="client_id" value=request.client_id.clone()/>
                 <input type="hidden" name="redirect_uri" value=request.redirect_uri.clone()/>
@@ -666,10 +1161,17 @@ fn render_consent(
                 <input type="hidden" name="code_challenge" value=request.code_challenge.clone()/>
                 <input type="hidden" name="csrf_token" value=csrf_token/>
                 <div class="actions">
-                    <button class="secondary" type="submit" name="decision" value="deny">"Deny"</button>
+                    <button class="secondary" type="submit" name="decision" value="deny">
+                        "Deny"
+                    </button>
                     <button type="submit" name="decision" value="allow">"Allow"</button>
                 </div>
             </form>
+            <footer>
+                <form method="post" action="/auth/logout">
+                    <button class="secondary" type="submit">"Not you? Sign out"</button>
+                </form>
+            </footer>
         },
     )
 }
@@ -700,10 +1202,68 @@ mod tests {
 
     #[test]
     fn login_page_escapes_the_return_target() {
-        let html = render_login(Some("/ok"), false, None, "csrf-sample");
+        let html = render_login(LoginView {
+            domain: "social.test",
+            registrations_open: true,
+            return_to: Some("/ok"),
+            signed_in: false,
+            error: None,
+            filled: None,
+            csrf_token: "csrf-sample",
+        });
         assert!(html.contains("name=\"return_to\" value=\"/ok\""));
         assert!(html.contains("name=\"csrf_token\" value=\"csrf-sample\""));
         assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn a_closed_instance_shows_no_form() {
+        let html = render_register(RegisterView {
+            domain: "social.test",
+            open: false,
+            return_to: None,
+            error: None,
+            filled: None,
+            csrf_token: "csrf-sample",
+        });
+        assert!(html.contains("Registration is closed"));
+        assert!(!html.contains("action=\"/auth/register\""));
+    }
+
+    #[test]
+    fn registration_normalises_the_username_and_keeps_the_password_verbatim() {
+        let form = RegisterForm {
+            username: "  Lux_Test ".to_owned(),
+            email: " Lux@Test.example ".to_owned(),
+            password: "correct horse".to_owned(),
+            password_confirmation: "correct horse".to_owned(),
+            return_to: None,
+            csrf_token: String::new(),
+        };
+        let registration = normalized_registration(&form).expect("valid form");
+        assert_eq!(registration.username, "lux_test");
+        assert_eq!(registration.email, "Lux@Test.example");
+        assert_eq!(registration.password, "correct horse");
+    }
+
+    #[test]
+    fn registration_refuses_the_usual_mistakes() {
+        let base = |username: &str, email: &str, password: &str| RegisterForm {
+            username: username.to_owned(),
+            email: email.to_owned(),
+            password: password.to_owned(),
+            password_confirmation: password.to_owned(),
+            return_to: None,
+            csrf_token: String::new(),
+        };
+        assert!(normalized_registration(&base("ab", "a@b.test", "longenough")).is_err());
+        assert!(normalized_registration(&base("has space", "a@b.test", "longenough")).is_err());
+        assert!(normalized_registration(&base("admin", "a@b.test", "longenough")).is_err());
+        assert!(normalized_registration(&base("fine", "not-an-email", "longenough")).is_err());
+        assert!(normalized_registration(&base("fine", "a@b.test", "short")).is_err());
+        let mut mismatch = base("fine", "a@b.test", "longenough");
+        mismatch.password_confirmation = "different".to_owned();
+        assert!(normalized_registration(&mismatch).is_err());
     }
 
     #[test]

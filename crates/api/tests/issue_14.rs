@@ -28,6 +28,7 @@ fn instance_config() -> InstanceConfig {
         contact_email: None,
         api_version: "4.3.0".to_owned(),
         version: "0.1.0".to_owned(),
+        registrations_open: false,
     }
 }
 
@@ -64,6 +65,7 @@ where
             domain: "social.test".to_owned(),
             issuer: "https://social.test".to_owned(),
             secure_cookies: false,
+            registrations_open: false,
         },
     ));
     let app = api.merge(auth);
@@ -576,6 +578,9 @@ async fn oauth_rejects_client_secret_bypass_scope_escalation_and_csrf() {
         assert_eq!(status, StatusCode::SEE_OTHER);
         let code = extract_code_from_location(&headers);
 
+        // A secret that is presented must match: a confidential client cannot be
+        // replayed by whoever guessed its id. Omitting it entirely is a public client
+        // and is covered by PKCE instead (see `a_public_client_redeems_a_code_without_a_secret`).
         let (status, _, body) = send(
             &app,
             Request::builder()
@@ -587,6 +592,7 @@ async fn oauth_rejects_client_secret_bypass_scope_escalation_and_csrf() {
                     ("code", &code),
                     ("redirect_uri", "https://client.test/cb"),
                     ("client_id", &client_id),
+                    ("client_secret", "not-the-secret"),
                     ("code_verifier", &verifier),
                 ]))
                 .expect("request"),

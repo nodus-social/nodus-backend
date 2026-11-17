@@ -1952,6 +1952,7 @@ dependencies = [
  "axum-extra",
  "base64 0.22.1",
  "chrono",
+ "http-body-util",
  "leptos",
  "rand 0.9.5",
  "serde",
@@ -1961,9 +1962,20 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "ulid",
+ "url",
+]
+
+[[package]]
+name = "nodus-client-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "url",
 ]
 
@@ -2030,14 +2042,17 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http-body-util",
+ "image",
  "leptos",
  "nodus-auth",
+ "nodus-client-core",
  "nodus-server-core",
  "nodus-server-federation",
  "nodus-server-media",
  "nodus-server-sdk",
  "nodus-server-store",
  "rand 0.9.5",
+ "reqwest",
  "rsa",
  "serde",
  "serde_json",

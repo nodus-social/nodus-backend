@@ -10,6 +10,7 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/nodus-social/nodus-backend"
 
 [workspace.dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots"] }
 ammonia = "4"
 nodus-server-core = { path = "crates/core" }
 nodus-server-store = { path = "crates/store" }

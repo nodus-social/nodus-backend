@@ -17,25 +17,46 @@ pub struct Relationship {
     pub showing_reblogs: bool,
     pub notifying: bool,
     pub blocked: bool,
+    pub blocked_by: bool,
+    pub followed_by: bool,
     pub muting: bool,
     pub muting_notifications: bool,
 }
 
+/// `(follow state, reblogs, notify, blocked, muting, muting notifications, followed by, blocked by)`
+type RelationshipRow = (
+    Option<String>,
+    Option<bool>,
+    Option<bool>,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+);
+
 /// One account's relationship to another.
+///
+/// Two of these fields point the other way — `followed_by` and `blocked_by` ask what the
+/// target did to the reader, not what the reader did to the target — because a client draws
+/// "Follows you" and "Blocks you" from the same answer as "Following" and "Blocking".
 pub async fn relationship(
     pool: &PgPool,
     account_id: &str,
     target_id: &str,
 ) -> Result<Relationship, sqlx::Error> {
-    let row: (Option<String>, Option<bool>, Option<bool>, bool, bool, bool) =
-        sqlx::query_as(
+    let row: RelationshipRow = sqlx::query_as(
             "SELECT f.state, f.reblogs, f.notify, \
                     EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = $2 AND r.kind = 'block'), \
                     EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = $2 AND r.kind = 'mute'), \
                     COALESCE((SELECT r.notifications FROM account_relation r WHERE r.account_id = $1 \
-                            AND r.target_account_id = $2 AND r.kind = 'mute'), false) \
+                            AND r.target_account_id = $2 AND r.kind = 'mute'), false), \
+                    EXISTS (SELECT 1 FROM follow back WHERE back.account_id = $2 \
+                            AND back.target_account_id = $1 AND back.state = 'accepted'), \
+                    EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $2 \
+                            AND r.target_account_id = $1 AND r.kind = 'block') \
              FROM (SELECT 1) seed \
              LEFT JOIN follow f ON f.account_id = $1 AND f.target_account_id = $2",
         )
@@ -51,6 +72,8 @@ pub async fn relationship(
         blocked: row.3,
         muting: row.4,
         muting_notifications: row.5,
+        followed_by: row.6,
+        blocked_by: row.7,
     })
 }
 
@@ -234,6 +257,8 @@ pub struct AccountListRow {
     pub note: String,
     pub avatar_ref: Option<String>,
     pub header_ref: Option<String>,
+    pub avatar_url: Option<String>,
+    pub header_url: Option<String>,
     pub locked: bool,
     pub bot: bool,
     pub local: bool,
@@ -246,6 +271,33 @@ pub struct AccountListRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// One account waiting for this reader to approve or refuse their follow.
+#[derive(Debug, Clone, FromRow)]
+pub struct FollowRequestRow {
+    pub account_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Pending follows of a locked account, newest first.
+///
+/// Only `pending` rows: an accepted follow is in the followers list and a rejected one
+/// has been deleted, so the state alone is the whole story.
+pub async fn follow_requests(
+    pool: &PgPool,
+    target_id: &str,
+    limit: i64,
+) -> Result<Vec<FollowRequestRow>, sqlx::Error> {
+    sqlx::query_as::<_, FollowRequestRow>(
+        "SELECT account_id, created_at FROM follow \
+          WHERE target_account_id = $1 AND state = 'pending' \
+          ORDER BY created_at DESC LIMIT $2",
+    )
+    .bind(target_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Followers or following, newest relationship first.
 pub async fn follow_page(
     pool: &PgPool,
@@ -256,7 +308,7 @@ pub async fn follow_page(
 ) -> Result<Vec<AccountListRow>, sqlx::Error> {
     let sql = if followers {
         "SELECT a.id, a.username::text, a.domain::text, a.display_name, a.note, a.avatar_ref, \
-                a.header_ref, a.locked, a.bot, a.local, a.uri, a.followers_count, \
+                a.header_ref, a.avatar_url, a.header_url, a.locked, a.bot, a.local, a.uri, a.followers_count, \
                 a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.created_at \
            FROM follow f JOIN account a ON a.id = f.account_id \
           WHERE f.target_account_id = $1 AND f.state = 'accepted' \
@@ -264,7 +316,7 @@ pub async fn follow_page(
           ORDER BY f.id DESC LIMIT $3"
     } else {
         "SELECT a.id, a.username::text, a.domain::text, a.display_name, a.note, a.avatar_ref, \
-                a.header_ref, a.locked, a.bot, a.local, a.uri, a.followers_count, \
+                a.header_ref, a.avatar_url, a.header_url, a.locked, a.bot, a.local, a.uri, a.followers_count, \
                 a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.created_at \
            FROM follow f JOIN account a ON a.id = f.target_account_id \
           WHERE f.account_id = $1 AND f.state = 'accepted' \

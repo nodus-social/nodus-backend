@@ -81,13 +81,40 @@ pub fn redirect_allowed(registered: &[String], requested: &str) -> bool {
     is_safe_redirect_uri(requested) && registered.iter().any(|uri| uri == requested)
 }
 
-/// Whether `uri` is a safe OAuth redirect URI (`http`, `https` with host, or Mastodon OOB).
+/// Whether `uri` is a safe OAuth redirect URI.
+///
+/// Three shapes are accepted, because three shapes are in use: `http`/`https` with a
+/// host (web clients), `urn:` identifiers (the OOB flow and Assa's `ugc` variant that
+/// Mastodon also accepts), and an app's own custom scheme such as
+/// `org.joinmastodon.android:`. Schemes that hand code to a document rather than to an
+/// app — `javascript`, `data`, `vbscript`, `file`, `about` — are refused: a redirect is
+/// a place to deliver a code, not a program to run.
 #[must_use]
 pub fn is_safe_redirect_uri(uri: &str) -> bool {
-    if uri == "urn:ietf:wg:oauth:2.0:oob" {
+    if is_safe_http_url(uri) {
         return true;
     }
-    is_safe_http_url(uri)
+    let Some((scheme, rest)) = uri.split_once(':') else {
+        return false;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if matches!(
+        scheme.as_str(),
+        "javascript" | "data" | "vbscript" | "file" | "about" | "blob"
+    ) {
+        return false;
+    }
+    if !rest.is_empty() && scheme == "urn" {
+        return rest.split(':').filter(|part| !part.is_empty()).count() >= 2;
+    }
+    // A custom scheme: a valid scheme name followed by anything at all, since the shape
+    // of an app URI is the app's business.
+    !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && !rest.is_empty()
 }
 
 /// Whether `uri` is an `http` or `https` URL with a host.
@@ -137,6 +164,17 @@ pub fn redirect_with(uri: &str, code: &str, state: Option<&str>) -> Result<Strin
         return Err(Error::RedirectUri);
     }
     let mut url = Url::parse(uri).map_err(|_| Error::RedirectUri)?;
+    if url.cannot_be_a_base() {
+        // A `urn:` identifier has no query to set, so the parameters go on the end of
+        // the identifier itself — which is how Mastodon's OOB flow hands back a code.
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("code", code);
+        if let Some(state) = state {
+            query.append_pair("state", state);
+        }
+        let base = uri.split(['?', '#']).next().unwrap_or(uri);
+        return Ok(format!("{base}?{}", query.finish()));
+    }
     url.query_pairs_mut().append_pair("code", code);
     if let Some(state) = state {
         url.query_pairs_mut().append_pair("state", state);
@@ -249,5 +287,40 @@ mod tests {
             &["https://client.test/cb".to_owned()],
             "https://client.test/cb/extra"
         ));
+    }
+
+    #[test]
+    fn redirect_uris_cover_the_shapes_clients_register() {
+        // Web clients.
+        assert!(is_safe_redirect_uri("https://client.test/cb"));
+        assert!(is_safe_redirect_uri("http://localhost:5173/cb"));
+        // The OOB flow, and the `ugc` variant Mastodon also accepts.
+        assert!(is_safe_redirect_uri("urn:ietf:wg:oauth:2.0:oob"));
+        assert!(is_safe_redirect_uri("urn:ietf:wg:oauth:2.0:ugc"));
+        // An app's own scheme.
+        assert!(is_safe_redirect_uri(
+            "org.joinmastodon.android:/oauth2redirect"
+        ));
+        assert!(is_safe_redirect_uri("nodus://callback"));
+        // A redirect is a place to deliver a code, not a program to run.
+        assert!(!is_safe_redirect_uri("javascript:alert(1)"));
+        assert!(!is_safe_redirect_uri("data:text/html,<script>"));
+        assert!(!is_safe_redirect_uri("vbscript:msgbox"));
+        assert!(!is_safe_redirect_uri("file:///etc/passwd"));
+        // Nothing at all, and a relative path.
+        assert!(!is_safe_redirect_uri(""));
+        assert!(!is_safe_redirect_uri("callback"));
+        assert!(!is_safe_redirect_uri("urn:"));
+    }
+
+    #[test]
+    fn a_urn_redirect_carries_the_code_on_the_identifier() {
+        let redirect = redirect_with("urn:ietf:wg:oauth:2.0:ugc", "abc123", Some("st"))
+            .expect("a urn redirect is allowed");
+        assert_eq!(redirect, "urn:ietf:wg:oauth:2.0:ugc?code=abc123&state=st");
+
+        let redirect = redirect_with("https://client.test/cb", "abc123", None)
+            .expect("an https redirect is allowed");
+        assert_eq!(redirect, "https://client.test/cb?code=abc123");
     }
 }

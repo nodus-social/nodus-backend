@@ -75,11 +75,9 @@ async fn block_deletes_pending_follow_requests_in_both_directions(pool: PgPool) 
             .expect("carol follow request to alice"),
         FollowOutcome::Requested
     );
-    assert!(
-        social::accept_follow(&pool, &alice, &carol)
-            .await
-            .expect("alice accepts carol")
-    );
+    assert!(social::accept_follow(&pool, &alice, &carol)
+        .await
+        .expect("alice accepts carol"));
 
     social::block(&pool, &alice, &bob)
         .await
@@ -99,16 +97,12 @@ async fn block_deletes_pending_follow_requests_in_both_directions(pool: PgPool) 
     assert!(!alice_to_bob.following);
 
     // Neither pending request may survive to be accepted later.
-    assert!(
-        !social::accept_follow(&pool, &alice, &bob)
-            .await
-            .expect("accept_follow alice <- bob")
-    );
-    assert!(
-        !social::accept_follow(&pool, &bob, &alice)
-            .await
-            .expect("accept_follow bob <- alice")
-    );
+    assert!(!social::accept_follow(&pool, &alice, &bob)
+        .await
+        .expect("accept_follow alice <- bob"));
+    assert!(!social::accept_follow(&pool, &bob, &alice)
+        .await
+        .expect("accept_follow bob <- alice"));
 
     assert_counts_match_follow_table(&pool, &alice).await;
     assert_counts_match_follow_table(&pool, &bob).await;
@@ -236,4 +230,43 @@ async fn concurrent_follows_unfollows_accepts_and_blocks_keep_counters_in_sync(p
     for follower in &followers {
         assert_counts_match_follow_table(&pool, follower).await;
     }
+}
+
+/// The reader's own verbs and the other side's actions share one answer, because the
+/// profile header draws "Following" and "Follows you" from the same read.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_relationship_reports_what_the_other_account_did(pool: PgPool) {
+    let alice = create_account(&pool, "alice", false).await;
+    let bob = create_account(&pool, "bob", false).await;
+
+    let before = social::relationship(&pool, &alice, &bob)
+        .await
+        .expect("relationship before any follow");
+    assert!(!before.following);
+    assert!(!before.followed_by);
+
+    social::follow(&pool, &alice, &bob, true, false)
+        .await
+        .expect("alice follows bob");
+
+    let alice_to_bob = social::relationship(&pool, &alice, &bob)
+        .await
+        .expect("relationship alice -> bob");
+    assert!(alice_to_bob.following);
+    assert!(!alice_to_bob.followed_by, "bob has not followed back yet");
+
+    let bob_to_alice = social::relationship(&pool, &bob, &alice)
+        .await
+        .expect("relationship bob -> alice");
+    assert!(bob_to_alice.followed_by, "bob is followed by alice");
+
+    social::block(&pool, &bob, &alice)
+        .await
+        .expect("bob blocks alice");
+
+    let alice_to_bob = social::relationship(&pool, &alice, &bob)
+        .await
+        .expect("relationship after the block");
+    assert!(alice_to_bob.blocked_by, "bob blocks alice");
+    assert!(!alice_to_bob.blocked, "alice has not blocked bob");
 }

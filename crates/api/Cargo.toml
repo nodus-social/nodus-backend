@@ -12,6 +12,7 @@ ammonia = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
 nodus-server-core = { workspace = true }
 nodus-server-federation = { workspace = true }
 nodus-server-media = { workspace = true }
@@ -21,6 +22,7 @@ axum-extra = { workspace = true }
 leptos = { workspace = true }
 nodus-server-sdk = { workspace = true, features = ["nodus", "misskey", "native"] }
 rand = { workspace = true }
+reqwest = { workspace = true }
 rsa = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
@@ -38,6 +40,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { workspace = true }
+# The contract tests decode responses into the shipped client's own types, so a field
+# this server stops sending fails here instead of in somebody's browser.
+nodus-client-core = { path = "../../../sdk/crates/client-core", version = "0.1.0", default-features = false }
 
 [lints]
 workspace = true

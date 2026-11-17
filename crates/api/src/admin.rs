@@ -3,7 +3,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
-use axum::{Form, Json, Router};
+use axum::{Json, Router};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -13,6 +13,7 @@ use nodus_server_store::alerts;
 use nodus_server_store::moderation::{self, Action, NewDomainBlock, NewReport};
 
 use crate::auth::Auth;
+use crate::body::JsonOrForm;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -322,7 +323,7 @@ async fn account_action(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
-    Form(form): Form<ActionForm>,
+    JsonOrForm(form): JsonOrForm<ActionForm>,
 ) -> ApiResult<Json<AdminAccountDto>> {
     auth.require_admin("admin:write")?;
     let action = Action::parse(&form.kind)
@@ -400,7 +401,7 @@ fn suspend() -> String {
 async fn create_domain_block(
     State(state): State<AppState>,
     auth: Auth,
-    Form(form): Form<DomainForm>,
+    JsonOrForm(form): JsonOrForm<DomainForm>,
 ) -> ApiResult<Json<DomainBlockDto>> {
     auth.require_admin("admin:write")?;
     if form.domain.trim().is_empty() {
@@ -489,7 +490,7 @@ async fn domain_allows(
 async fn create_domain_allow(
     State(state): State<AppState>,
     auth: Auth,
-    Form(form): Form<DomainForm>,
+    JsonOrForm(form): JsonOrForm<DomainForm>,
 ) -> ApiResult<Json<DomainAllowDto>> {
     auth.require_admin("admin:write")?;
     if form.domain.trim().is_empty() {
@@ -621,7 +622,7 @@ fn other() -> String {
 async fn create_report(
     State(state): State<AppState>,
     auth: Auth,
-    Form(form): Form<NewReportForm>,
+    JsonOrForm(form): JsonOrForm<NewReportForm>,
 ) -> ApiResult<Json<ReportDto>> {
     if form.account_id.trim().is_empty() {
         return Err(ApiError::unprocessable("account_id is required"));

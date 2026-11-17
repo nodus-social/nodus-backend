@@ -39,6 +39,9 @@ pub struct CreateStatus {
     pub media_ids: Vec<String>,
     #[serde(default)]
     pub content_type: Option<String>,
+    /// Set to queue the post instead of publishing it.
+    #[serde(default)]
+    pub scheduled_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,30 +54,40 @@ pub async fn create(
     State(state): State<AppState>,
     auth: Auth,
     Json(request): Json<CreateStatus>,
-) -> ApiResult<Json<StatusDto>> {
+) -> ApiResult<Response> {
     auth.require_scope("write:statuses")?;
+    if let Some(at) = request.scheduled_at.as_deref() {
+        let at = chrono::DateTime::parse_from_rfc3339(at.trim())
+            .map_err(|_| ApiError::unprocessable("scheduled_at must be an ISO 8601 timestamp"))?
+            .with_timezone(&chrono::Utc);
+        if at <= chrono::Utc::now() {
+            return Err(ApiError::unprocessable(
+                "scheduled_at must be in the future",
+            ));
+        }
+        // The draft is checked now as well as when it goes out, so a reader is told about
+        // an empty post while they are still looking at it.
+        validated(&request)?;
+        let queued = crate::schedules::store(&state, &auth.0.account.id, at, &request).await?;
+        return Ok(Json(queued).into_response());
+    }
+    let row = publish(&state, &auth.0.account.id, request).await?;
+    Ok(Json(dto(&state, &row, Some(&auth)).await?).into_response())
+}
+
+/// Publishes a post for `account_id`.
+///
+/// Kept apart from [`create`] because the scheduler publishes posts that no request asked
+/// for, and both paths must apply exactly the same rules.
+pub(crate) async fn publish(
+    state: &AppState,
+    account_id: &str,
+    request: CreateStatus,
+) -> ApiResult<StatusRow> {
+    let visibility = validated(&request)?;
     let text = request.status.trim();
-    if text.chars().count() > STATUS_MAX_CHARS as usize {
-        return Err(ApiError::unprocessable(format!(
-            "status must be at most {STATUS_MAX_CHARS} characters"
-        )));
-    }
-    let visibility = request
-        .visibility
-        .as_deref()
-        .unwrap_or("public")
-        .to_ascii_lowercase();
-    if !matches!(
-        visibility.as_str(),
-        "public" | "unlisted" | "private" | "direct"
-    ) {
-        return Err(ApiError::unprocessable("invalid visibility"));
-    }
-    if text.is_empty() && request.media_ids.is_empty() {
-        return Err(ApiError::unprocessable("status must contain text or media"));
-    }
-    let media_ids = validate_media(&state, &auth, &request.media_ids).await?;
-    let mention_ids = resolve_mentions(&state, text).await?;
+    let media_ids = validate_media(state, account_id, &request.media_ids).await?;
+    let mention_ids = resolve_mentions(state, text).await?;
     let tags = extract_tags(text);
     let in_reply_to = match request.in_reply_to_id.as_deref() {
         Some(id) => {
@@ -91,7 +104,7 @@ pub async fn create(
         state.store().pool(),
         &NewStatus {
             id: &id,
-            account_id: &auth.0.account.id,
+            account_id,
             content: text,
             content_html: &rendered,
             content_source: Some(text),
@@ -114,7 +127,7 @@ pub async fn create(
     .await?;
     notify_mentions(
         state.store().pool(),
-        &auth.0.account.id,
+        account_id,
         &row.id,
         in_reply_to
             .as_ref()
@@ -122,7 +135,38 @@ pub async fn create(
         &mention_ids,
     )
     .await?;
-    Ok(Json(dto(&state, &row, Some(&auth)).await?))
+    // The post exists and is visible here; telling the peers is somebody else's job, so a
+    // peer that is down cannot fail the post itself.
+    crate::outbox::deliver_create(state, account_id, &row).await;
+    Ok(row)
+}
+
+/// The checks a post must pass whether it goes out now or later, and the visibility the
+/// post is stored with.
+fn validated(request: &CreateStatus) -> ApiResult<String> {
+    let text = request.status.trim();
+    if text.chars().count() > STATUS_MAX_CHARS as usize {
+        return Err(ApiError::unprocessable(format!(
+            "status must be at most {STATUS_MAX_CHARS} characters"
+        )));
+    }
+    if text.is_empty() && request.media_ids.is_empty() {
+        return Err(ApiError::unprocessable("status must contain text or media"));
+    }
+    // A scheduled post is stored with its visibility, so it has to be normalised before
+    // it is written, not when it is published.
+    let visibility = request
+        .visibility
+        .as_deref()
+        .unwrap_or("public")
+        .to_ascii_lowercase();
+    if !matches!(
+        visibility.as_str(),
+        "public" | "unlisted" | "private" | "direct"
+    ) {
+        return Err(ApiError::unprocessable("invalid visibility"));
+    }
+    Ok(visibility)
 }
 
 pub async fn show(
@@ -148,6 +192,7 @@ pub async fn destroy(
             "You are not allowed to delete this status",
         ));
     }
+    crate::outbox::deliver_delete(&state, &row.account_id, &row).await;
     let json = Json(dto(&state, &row, Some(&auth)).await?);
     nodus_server_store::statuses::delete_owned(state.store().pool(), &id, &auth.0.account.id)
         .await?;
@@ -162,6 +207,14 @@ pub async fn favourite(
     auth.require_scope("write:favourites")?;
     let row = visible_status(&state, Some(&auth), &id).await?;
     nodus_server_store::social::favourite(state.store().pool(), &auth.0.account.id, &id).await?;
+    crate::outbox::deliver_reaction(
+        &state,
+        &auth.0.account.id,
+        &row.account_id,
+        nodus_server_sdk::activitypub::ActivityKind::Like,
+        true,
+    )
+    .await;
     Ok(Json(dto(&state, &row, Some(&auth)).await?))
 }
 
@@ -173,6 +226,14 @@ pub async fn unfavourite(
     auth.require_scope("write:favourites")?;
     let row = visible_status(&state, Some(&auth), &id).await?;
     nodus_server_store::social::unfavourite(state.store().pool(), &auth.0.account.id, &id).await?;
+    crate::outbox::deliver_reaction(
+        &state,
+        &auth.0.account.id,
+        &row.account_id,
+        nodus_server_sdk::activitypub::ActivityKind::Like,
+        false,
+    )
+    .await;
     Ok(Json(dto(&state, &row, Some(&auth)).await?))
 }
 
@@ -210,6 +271,14 @@ pub async fn reblog(
             .await?
             .ok_or_else(|| ApiError::unprocessable("This status cannot be boosted"))?;
     if created {
+        crate::outbox::deliver_reaction(
+            &state,
+            &auth.0.account.id,
+            &original.account_id,
+            nodus_server_sdk::activitypub::ActivityKind::Announce,
+            true,
+        )
+        .await;
         nodus_server_store::social::notify(
             state.store().pool(),
             &original.account_id,
@@ -233,6 +302,14 @@ pub async fn unreblog(
         nodus_server_store::statuses::unreblog(state.store().pool(), &auth.0.account.id, &id)
             .await?
             .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    crate::outbox::deliver_reaction(
+        &state,
+        &auth.0.account.id,
+        &original.account_id,
+        nodus_server_sdk::activitypub::ActivityKind::Announce,
+        false,
+    )
+    .await;
     Ok(Json(dto(&state, &original, Some(&auth)).await?))
 }
 
@@ -311,6 +388,7 @@ pub(crate) async fn dto(
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     let media = nodus_server_store::media::by_status(state.store().pool(), &row.id).await?;
     let mut dto = StatusDto::from_row_with_media(row, &account, state.instance(), &media);
+    decorate(state, &mut dto, &row.id).await?;
     if let Some(original_id) = &row.reblog_of_id {
         if let Some(original) =
             nodus_server_store::statuses::by_id(state.store().pool(), original_id).await?
@@ -321,12 +399,14 @@ pub(crate) async fn dto(
                     .ok_or_else(|| ApiError::not_found("Record not found"))?;
             let original_media =
                 nodus_server_store::media::by_status(state.store().pool(), &original.id).await?;
-            dto.reblog = Some(Box::new(StatusDto::from_row_with_media(
+            let mut boost = StatusDto::from_row_with_media(
                 &original,
                 &original_account,
                 state.instance(),
                 &original_media,
-            )));
+            );
+            decorate(state, &mut boost, &original.id).await?;
+            dto.reblog = Some(Box::new(boost));
         }
     }
     if let Some(viewer) = viewer {
@@ -354,6 +434,43 @@ fn apply_flags(dto: &mut StatusDto, flags: ViewerFlags) {
     dto.favourited = flags.favourited;
     dto.reblogged = flags.reblogged;
     dto.bookmarked = flags.bookmarked;
+}
+
+/// Fills in the parts of a status payload that live in their own tables.
+///
+/// Hashtags and mentions are rows beside the status, not columns on it, so a payload built
+/// from the status row alone renders `#nodus` as plain text and `@someone` as neither a
+/// link nor a notification — which is what clients were getting before this ran.
+async fn decorate(state: &AppState, dto: &mut StatusDto, status_id: &str) -> ApiResult<()> {
+    let pool = state.store().pool();
+    let instance = state.instance();
+    let tags = nodus_server_store::statuses::tags_of(pool, status_id).await?;
+    dto.tags = tags
+        .iter()
+        .map(|tag| {
+            serde_json::json!({
+                "name": tag,
+                "url": instance.url(&format!("/tags/{tag}")),
+            })
+        })
+        .collect();
+    let mentions = nodus_server_store::statuses::mentions_of(pool, status_id).await?;
+    for account_id in mentions {
+        let Some(account) = nodus_server_store::accounts::by_id(pool, &account_id).await? else {
+            continue;
+        };
+        let acct = match &account.domain {
+            Some(domain) => format!("{}@{domain}", account.username),
+            None => account.username.clone(),
+        };
+        dto.mentions.push(serde_json::json!({
+            "id": account.id,
+            "username": account.username,
+            "acct": acct,
+            "url": instance.url(&format!("/@{}", account.username)),
+        }));
+    }
+    Ok(())
 }
 
 pub(crate) async fn visible_status(
@@ -419,7 +536,11 @@ pub(crate) async fn can_view_for_viewer(
         .map_err(Into::into)
 }
 
-async fn validate_media(state: &AppState, auth: &Auth, ids: &[String]) -> ApiResult<Vec<String>> {
+async fn validate_media(
+    state: &AppState,
+    account_id: &str,
+    ids: &[String],
+) -> ApiResult<Vec<String>> {
     if ids.len() > nodus_server_core::limits::MEDIA_MAX_ATTACHMENTS {
         return Err(ApiError::unprocessable("too many media attachments"));
     }
@@ -427,7 +548,7 @@ async fn validate_media(state: &AppState, auth: &Auth, ids: &[String]) -> ApiRes
         let Some(media) = nodus_server_store::media::by_id(state.store().pool(), id).await? else {
             return Err(ApiError::unprocessable("unknown media attachment"));
         };
-        if media.account_id != auth.0.account.id || media.status_id.is_some() {
+        if media.account_id != account_id || media.status_id.is_some() {
             return Err(ApiError::unprocessable("media attachment is not available"));
         }
     }

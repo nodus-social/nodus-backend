@@ -39,7 +39,7 @@ pub struct StatusRow {
     pub replies_count: i64,
 }
 
-const STATUS_COLUMNS: &str = "s.id, s.account_id, s.uri, s.content, s.content_html, \
+pub(crate) const STATUS_COLUMNS: &str = "s.id, s.account_id, s.uri, s.content, s.content_html, \
      s.content_source, s.content_format, s.spoiler_text, s.visibility, s.sensitive, s.in_reply_to_id, s.in_reply_to_account_id, \
      s.reblog_of_id, s.language, s.local, s.edited_at, s.created_at, \
      s.favourites_count, s.reblogs_count, s.replies_count";
@@ -61,6 +61,28 @@ pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<StatusRow>, sqlx::E
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+/// The hashtags a status carries, alphabetically.
+///
+/// Tags live in `status_tag` rather than on the row, so every payload that shows a post
+/// has to ask for them; without this a client renders `#tag` as plain text and a tag
+/// timeline disagrees with the post that fed it.
+pub async fn tags_of(pool: &PgPool, status_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT tag::text FROM status_tag WHERE status_id = $1 ORDER BY tag")
+        .bind(status_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// The accounts a status mentions, so a client can link them instead of showing text.
+pub async fn mentions_of(pool: &PgPool, status_id: &str) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT account_id FROM status_mention WHERE status_id = $1 ORDER BY account_id",
+    )
+    .bind(status_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// One status by its canonical `ActivityPub` URI.

@@ -1,11 +1,12 @@
 //! Mastodon lists: client-owned groups of followed accounts.
 
-use axum::extract::{Path, RawForm, State};
+use axum::extract::{Path, State};
 use axum::routing::get;
-use axum::{Form, Json, Router};
+use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Auth;
+use crate::body::JsonOrForm;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -41,12 +42,35 @@ fn default_policy() -> String {
     "list".to_owned()
 }
 
-fn account_ids(body: &[u8]) -> Vec<String> {
-    url::form_urlencoded::parse(body)
-        .filter(|(key, _)| key == "account_ids[]" || key == "account_ids")
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())
-        .collect()
+/// The accounts a membership change names, in whichever spelling the client sent.
+///
+/// Mastodon clients form-encode `account_ids[]=1&account_ids[]=2`; anything sending JSON
+/// sends `{"account_ids": ["1"]}`. Both land here, because a 415 on the second shape is a
+/// failure the client cannot see coming.
+#[derive(Debug, Default, Deserialize)]
+struct MembershipForm {
+    #[serde(default)]
+    account_ids: Vec<String>,
+    #[serde(default, rename = "account_ids[]")]
+    bracketed_ids: Vec<String>,
+    #[serde(default)]
+    single_id: Option<String>,
+}
+
+impl MembershipForm {
+    fn ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .account_ids
+            .iter()
+            .chain(self.bracketed_ids.iter())
+            .chain(self.single_id.iter())
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
 }
 
 async fn lists(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<ListDto>>> {
@@ -71,7 +95,7 @@ fn validate_list_form(form: &ListForm) -> ApiResult<&str> {
 async fn create(
     State(state): State<AppState>,
     auth: Auth,
-    Form(form): Form<ListForm>,
+    JsonOrForm(form): JsonOrForm<ListForm>,
 ) -> ApiResult<Json<ListDto>> {
     let title = validate_list_form(&form)?;
     let row = nodus_server_store::lists::create(
@@ -100,7 +124,7 @@ async fn update(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
-    Form(form): Form<ListForm>,
+    JsonOrForm(form): JsonOrForm<ListForm>,
 ) -> ApiResult<Json<ListDto>> {
     let title = validate_list_form(&form)?;
     let row = nodus_server_store::lists::update(
@@ -154,7 +178,7 @@ async fn add_accounts(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
-    RawForm(body): RawForm,
+    JsonOrForm(body): JsonOrForm<MembershipForm>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if nodus_server_store::lists::list(state.store().pool(), &auth.0.account.id, &id)
         .await?
@@ -162,7 +186,7 @@ async fn add_accounts(
     {
         return Err(ApiError::not_found("list does not exist"));
     }
-    for account_id in account_ids(&body) {
+    for account_id in body.ids() {
         nodus_server_store::lists::add_account(state.store().pool(), &id, &account_id).await?;
     }
     Ok(Json(serde_json::json!({})))
@@ -172,7 +196,7 @@ async fn remove_accounts(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
-    RawForm(body): RawForm,
+    JsonOrForm(body): JsonOrForm<MembershipForm>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if nodus_server_store::lists::list(state.store().pool(), &auth.0.account.id, &id)
         .await?
@@ -180,7 +204,7 @@ async fn remove_accounts(
     {
         return Err(ApiError::not_found("list does not exist"));
     }
-    for account_id in account_ids(&body) {
+    for account_id in body.ids() {
         nodus_server_store::lists::remove_account(state.store().pool(), &id, &account_id).await?;
     }
     Ok(Json(serde_json::json!({})))

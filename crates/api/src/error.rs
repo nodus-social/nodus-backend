@@ -17,6 +17,15 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// The message a client would see. Used by background work that logs a failure
+    /// instead of answering a request.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl ApiError {
     #[must_use]
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
@@ -85,6 +94,18 @@ impl From<std::io::Error> for ApiError {
 
 /// Result alias used by handlers.
 pub type ApiResult<T> = Result<T, ApiError>;
+
+/// Answers an unknown path in the same shape as every other error.
+///
+/// Without this, axum's own 404 has an empty body, which a client reports as
+/// `message: ""` — the reader learns that something failed but not what.
+pub async fn not_found_fallback(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("no route for {method} {uri}") })),
+    )
+        .into_response()
+}
 
 #[cfg(test)]
 mod tests {

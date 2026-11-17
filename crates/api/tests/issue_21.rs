@@ -33,6 +33,7 @@ fn instance_config() -> InstanceConfig {
         contact_email: None,
         api_version: "4.3.0".to_owned(),
         version: "0.1.0".to_owned(),
+        registrations_open: false,
     }
 }
 

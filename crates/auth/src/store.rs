@@ -16,6 +16,27 @@ pub enum Error {
     Database(#[from] sqlx::Error),
 }
 
+/// Why a self-service registration was refused.
+///
+/// The name clashes are separated from storage errors because the form re-renders with a
+/// message about the field that caused it, and "that username is taken" is a different
+/// repair than "the database is down".
+#[derive(Debug, Error)]
+pub enum RegisterError {
+    #[error("that username is already taken")]
+    UsernameTaken,
+    #[error("that email address already has a login")]
+    EmailTaken,
+    #[error(transparent)]
+    Database(#[from] Error),
+}
+
+impl From<sqlx::Error> for RegisterError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(Error::Database(error))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Credential {
     pub account_id: String,
@@ -105,6 +126,14 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
     fn revoke_token(&self, token_hash: &str) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Creates a local account together with its password login.
+    fn register_local(
+        &self,
+        username: &str,
+        email: &str,
+        password_hash: &str,
+    ) -> impl Future<Output = Result<SessionAccount, RegisterError>> + Send;
 }
 
 #[derive(Clone)]
@@ -191,6 +220,67 @@ impl PgAuthStore {
         Ok(result.rows_affected())
     }
 
+    /// Creates a local account with a password login in one transaction.
+    ///
+    /// The uniqueness checks run inside the transaction so a refused name leaves no
+    /// orphaned account behind, and the two unique indexes stay the real guard against two
+    /// people claiming one name at the same moment.
+    pub async fn register_local_with(
+        pool: &PgPool,
+        username: &str,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<SessionAccount, RegisterError> {
+        let mut tx = pool.begin().await?;
+
+        let username_taken: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM account WHERE username = $1 AND domain IS NULL)",
+        )
+        .bind(username)
+        .fetch_one(&mut *tx)
+        .await?;
+        if username_taken {
+            return Err(RegisterError::UsernameTaken);
+        }
+
+        let email_taken: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM account_credential WHERE email = $1)")
+                .bind(email)
+                .fetch_one(&mut *tx)
+                .await?;
+        if email_taken {
+            return Err(RegisterError::EmailTaken);
+        }
+
+        let id = ulid::Ulid::new().to_string();
+        sqlx::query(
+            "INSERT INTO account (id, username, display_name, local) VALUES ($1, $2, $2, true)",
+        )
+        .bind(&id)
+        .bind(username)
+        .execute(&mut *tx)
+        .await
+        .map_err(name_clash)?;
+        sqlx::query(
+            "INSERT INTO account_credential (account_id, email, password_hash) VALUES ($1, $2, $3)",
+        )
+        .bind(&id)
+        .bind(email)
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(name_clash)?;
+
+        tx.commit().await?;
+
+        Ok(SessionAccount {
+            account_id: id,
+            username: username.to_owned(),
+            display_name: username.to_owned(),
+            admin: false,
+        })
+    }
+
     /// Deletes expired `OAuth` authorization codes and returns the number of rows removed.
     pub async fn delete_expired_codes(&self) -> Result<u64, Error> {
         let result = sqlx::query("DELETE FROM oauth_code WHERE expires_at < now()")
@@ -198,6 +288,19 @@ impl PgAuthStore {
             .await?;
         Ok(result.rows_affected())
     }
+}
+
+/// Maps a unique-index violation onto the field that collided.
+fn name_clash(error: sqlx::Error) -> RegisterError {
+    if let sqlx::Error::Database(database) = &error {
+        if database.code().as_deref() == Some("23505") {
+            return match database.constraint() {
+                Some("account_credential_email_key") => RegisterError::EmailTaken,
+                _ => RegisterError::UsernameTaken,
+            };
+        }
+    }
+    RegisterError::Database(Error::Database(error))
 }
 
 impl AuthStore for PgAuthStore {
@@ -219,6 +322,15 @@ impl AuthStore for PgAuthStore {
                 password_hash,
             },
         ))
+    }
+
+    async fn register_local(
+        &self,
+        username: &str,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<SessionAccount, RegisterError> {
+        Self::register_local_with(&self.pool, username, email, password_hash).await
     }
 
     async fn client_app(&self, client_id: &str) -> Result<Option<ClientApp>, Error> {

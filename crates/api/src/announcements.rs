@@ -2,13 +2,14 @@
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post, put};
-use axum::{Form, Json, Router};
+use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use nodus_server_store::announcements::{self, AnnouncementRow, NewAnnouncement};
 
 use crate::auth::{Auth, MaybeAuth};
+use crate::body::JsonOrForm;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -142,7 +143,7 @@ fn entry(form: &AnnouncementForm) -> ApiResult<ValidatedAnnouncement> {
 async fn create(
     State(state): State<AppState>,
     auth: Auth,
-    Form(form): Form<AnnouncementForm>,
+    JsonOrForm(form): JsonOrForm<AnnouncementForm>,
 ) -> ApiResult<Json<AnnouncementDto>> {
     auth.require_admin("admin:write")?;
     let entry = entry(&form)?;
@@ -154,7 +155,7 @@ async fn update(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
-    Form(form): Form<AnnouncementForm>,
+    JsonOrForm(form): JsonOrForm<AnnouncementForm>,
 ) -> ApiResult<Json<AnnouncementDto>> {
     auth.require_admin("admin:write")?;
     let entry = entry(&form)?;

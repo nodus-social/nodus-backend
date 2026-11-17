@@ -12,25 +12,37 @@ pub mod admin;
 pub mod announcements;
 pub mod apps;
 pub mod auth;
+pub mod body;
 pub mod client_metadata;
+pub mod collections;
+pub mod conversations;
+pub mod discovery;
 pub mod dto;
 pub mod error;
 pub mod filters;
+pub mod follow_requests;
+pub mod highlights;
 pub mod html;
 pub mod hydrate;
 pub mod lists;
+pub mod markers;
 pub mod mastodon;
 pub mod media;
 pub mod miauth;
 pub mod misskey;
 pub mod nodus;
+pub mod notifications;
+pub mod outbox;
+pub mod preferences;
 pub mod reactions;
+pub mod remote;
+pub mod schedules;
 pub mod state;
 pub mod statuses;
 
 pub use state::{AppState, InstanceConfig};
 
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 
 /// Builds the router. No port, no listener: the binary owns the process, this owns the
 /// surface.
@@ -46,6 +58,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route(
             "/api/v1/accounts/verify_credentials",
             get(mastodon::verify_credentials),
+        )
+        .route(
+            "/api/v1/accounts/update_credentials",
+            patch(accounts::update_credentials).post(accounts::update_credentials),
         )
         .route(
             "/api/v1/statuses/{id}/reaction",
@@ -113,6 +129,16 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(filters::router())
         .merge(lists::router())
         .merge(hydrate::router())
+        .merge(highlights::router())
+        .merge(schedules::router())
+        .merge(notifications::router())
+        .merge(collections::router())
+        .merge(conversations::router())
+        .merge(discovery::router())
+        .merge(preferences::router())
+        .merge(markers::router())
+        .merge(follow_requests::router())
+        .fallback(error::not_found_fallback)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             abuse::record,
@@ -152,6 +178,7 @@ mod tests {
                 contact_email: None,
                 api_version: "4.3.0".to_owned(),
                 version: "0.1.0".to_owned(),
+                registrations_open: false,
             },
         )
     }

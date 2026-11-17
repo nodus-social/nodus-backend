@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use nodus_auth::domain::{is_safe_redirect_uri, is_valid_scope};
 use nodus_server_core::Id;
 
+use crate::body::JsonOrForm;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -44,9 +45,15 @@ pub struct AppError {
     pub error: String,
 }
 
+/// Registers an OAuth client.
+///
+/// Mastodon is a Rails application, so it reads parameters from a JSON body and from a
+/// form-encoded one alike, and real clients use both: the browser client posts
+/// `application/x-www-form-urlencoded` here. Answering 415 to that shape would stop a
+/// standards-following client before it ever reached `/oauth/authorize`.
 pub async fn register(
     State(state): State<AppState>,
-    Json(request): Json<AppRequest>,
+    JsonOrForm(request): JsonOrForm<AppRequest>,
 ) -> ApiResult<Json<AppResponse>> {
     let name = request.client_name.trim();
     if name.is_empty() || name.chars().count() > 100 {

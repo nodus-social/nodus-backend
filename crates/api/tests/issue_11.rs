@@ -1,12 +1,12 @@
 #![allow(clippy::too_many_lines)]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
-use base64::Engine as _;
+use axum::http::{header, Request, StatusCode};
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chrono::Utc;
 use http_body_util::BodyExt;
 use rsa::pkcs1v15::SigningKey;
@@ -14,18 +14,18 @@ use rsa::pkcs8::{EncodePublicKey as _, LineEnding};
 use rsa::rand_core::OsRng;
 use rsa::signature::{SignatureEncoding as _, Signer as _};
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
-use nodus_server_api::{AppState, InstanceConfig, root_router};
+use nodus_server_api::{root_router, AppState, InstanceConfig};
 use nodus_server_core::Id;
 use nodus_server_store::accounts::{self, NewAccount, RemoteAccount};
 use nodus_server_store::moderation::{self, NewDomainBlock};
 use nodus_server_store::statuses::{self, NewRemoteStatus};
-use nodus_server_store::{Store, apps, social};
+use nodus_server_store::{apps, social, Store};
 
 fn instance_config() -> InstanceConfig {
     InstanceConfig {
@@ -36,6 +36,7 @@ fn instance_config() -> InstanceConfig {
         contact_email: None,
         api_version: "4.3.0".to_owned(),
         version: "0.1.0".to_owned(),
+        registrations_open: false,
     }
 }
 
@@ -146,7 +147,8 @@ async fn seed_remote_actor(
             domain,
             display_name: username,
             note: "",
-            avatar: None,
+            avatar_url: None,
+            header_url: None,
             inbox_url: Some(&format!("{uri}/inbox")),
             shared_inbox_url: None,
             public_key_pem,
@@ -485,12 +487,10 @@ async fn rejects_cross_origin_create_and_cross_actor_delete() {
             StatusCode::FORBIDDEN,
             "mismatched attributedTo must be forbidden: {resp}"
         );
-        assert!(
-            statuses::by_uri(pool, "https://evil.test/notes/spoof-attr")
-                .await
-                .expect("lookup")
-                .is_none()
-        );
+        assert!(statuses::by_uri(pool, "https://evil.test/notes/spoof-attr")
+            .await
+            .expect("lookup")
+            .is_none());
 
         // 3. Mallory sends Delete for victim's note on another origin.
         let cross_origin_delete = json!({
@@ -556,12 +556,10 @@ async fn rejects_cross_origin_create_and_cross_actor_delete() {
                 .expect("delete_remote"),
             "store delete_remote must delete the owning account's status"
         );
-        assert!(
-            statuses::by_uri(pool, alice_note_uri)
-                .await
-                .expect("lookup")
-                .is_none()
-        );
+        assert!(statuses::by_uri(pool, alice_note_uri)
+            .await
+            .expect("lookup")
+            .is_none());
 
         // 6. Undo with mismatched inner actor must be forbidden.
         let mismatched_undo = json!({

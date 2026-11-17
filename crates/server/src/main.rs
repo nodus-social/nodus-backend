@@ -27,6 +27,8 @@ struct Config {
     database_connections: u32,
     instance: InstanceConfig,
     secure_cookies: bool,
+    /// Whether `/auth/register` accepts new accounts. Off unless the operator opts in.
+    registrations_open: bool,
     migrate_only: bool,
     bootstrap: Option<Bootstrap>,
 }
@@ -55,6 +57,8 @@ impl Config {
             .unwrap_or(10);
         let secure_cookies =
             env::var("NODUS_AUTH_SECURE_COOKIES").map_or(Ok(true), |value| value.parse())?;
+        let registrations_open =
+            env::var("NODUS_REGISTRATIONS_OPEN").map_or(Ok(false), |value| value.parse())?;
         let bootstrap = match (
             env::var("NODUS_BOOTSTRAP_EMAIL"),
             env::var("NODUS_BOOTSTRAP_USERNAME"),
@@ -86,8 +90,10 @@ impl Config {
                 contact_email: env::var("NODUS_CONTACT_EMAIL").ok(),
                 api_version: "4.3.0".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
+                registrations_open,
             },
             secure_cookies,
+            registrations_open,
             migrate_only: env::args().any(|argument| argument == "--migrate-only"),
             bootstrap,
         })
@@ -102,6 +108,7 @@ fn app(store: &Store, config: &Config) -> Router {
             domain: config.instance.domain.clone(),
             issuer: config.instance.base_url.clone(),
             secure_cookies: config.secure_cookies,
+            registrations_open: config.registrations_open,
         },
     ));
     api.merge(auth)
@@ -282,6 +289,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         });
     }
+    // Posts a reader queued are published here, in the same process that serves requests:
+    // a separate worker would be a second deployable to keep in step for one small loop.
+    {
+        let state = nodus_server_api::AppState::new(store.clone(), config.instance.clone());
+        tokio::spawn(nodus_server_api::schedules::run(state));
+    }
+    // Outbound federation: the queue is drained here for the same reason the scheduler
+    // lives here — one process that already holds the keys and the pool.
+    {
+        let state = nodus_server_api::AppState::new(store.clone(), config.instance.clone());
+        tokio::spawn(nodus_server_api::outbox::run(state));
+    }
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(
         address = %config.bind,
@@ -318,8 +337,10 @@ mod tests {
                 contact_email: None,
                 api_version: "4.3.0".to_owned(),
                 version: "0.1.0".to_owned(),
+                registrations_open: false,
             },
             secure_cookies: true,
+            registrations_open: false,
             migrate_only: false,
             bootstrap: None,
         }

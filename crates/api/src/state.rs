@@ -21,6 +21,9 @@ pub struct InstanceConfig {
     pub api_version: String,
     /// Our own build, reported separately so it never confuses a client.
     pub version: String,
+    /// Whether `/auth/register` accepts new accounts, mirrored into the instance
+    /// payloads so a client knows whether to offer a sign-up link.
+    pub registrations_open: bool,
 }
 
 impl InstanceConfig {
