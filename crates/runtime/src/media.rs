@@ -19,7 +19,11 @@ pub fn variants_dir() -> PathBuf {
         .map_or_else(|| media_dir().join("variants"), PathBuf::from)
 }
 
-async fn remove_unreferenced_variants(pool: &sqlx::PgPool, variants_root: &Path, digests: Vec<String>) {
+async fn remove_unreferenced_variants(
+    pool: &sqlx::PgPool,
+    variants_root: &Path,
+    digests: Vec<String>,
+) {
     for digest in digests {
         if !media::variant_digest_referenced(pool, &digest)
             .await
@@ -30,7 +34,11 @@ async fn remove_unreferenced_variants(pool: &sqlx::PgPool, variants_root: &Path,
     }
 }
 
-async fn remove_unreferenced_originals(pool: &sqlx::PgPool, media_root: &Path, digests: Vec<String>) {
+async fn remove_unreferenced_originals(
+    pool: &sqlx::PgPool,
+    media_root: &Path,
+    digests: Vec<String>,
+) {
     for digest in digests {
         if !media::original_digest_referenced(pool, &digest)
             .await

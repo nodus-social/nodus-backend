@@ -69,7 +69,7 @@ impl Message {
 impl Visit for Message {
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
-            self.message = value.to_owned();
+            value.clone_into(&mut self.message);
         } else {
             self.rest.push(format!("{}={value}", field.name()));
         }

@@ -23,3 +23,6 @@ futures-util = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tower = { workspace = true }
+
+[lints]
+workspace = true

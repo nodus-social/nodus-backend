@@ -13,3 +13,6 @@ tokio = { workspace = true }
 tokio-listener = { version = "0.5", features = ["axum08", "tonic012", "unix", "unix_path_tools", "serde", "tokio-util"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

@@ -123,7 +123,9 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let listener = bind(address).await?;
-    tracing::info!(listen = %address, "grpc listening");
+    // Debug, because every caller announces the address it was given along with its own
+    // name: one listen should produce one line.
+    tracing::debug!(listen = %address, "grpc listening");
     let incoming = unfold(listener, |mut listener| async move {
         match listener.accept().await {
             Ok((connection, _peer)) => Some((Ok::<_, io::Error>(connection), listener)),

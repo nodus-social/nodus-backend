@@ -90,7 +90,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(nodus_cache::RedisBudget::connect(url, rate).await?)
     } else {
         tracing::warn!("no shared request budget configured; per-host budgets are per process");
-        Arc::new(nodus_cache::InMemoryBudget::with_rate(sync.effective_rps(), 5))
+        Arc::new(nodus_cache::InMemoryBudget::with_rate(
+            sync.effective_rps(),
+            5,
+        ))
     };
     let sync = sync.with_budget(Arc::clone(&budget));
     let refresh = refresh.with_budget(budget);

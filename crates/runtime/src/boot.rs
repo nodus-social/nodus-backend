@@ -53,7 +53,10 @@ pub async fn prepare(config: &Config) -> Result<Store, Box<dyn Error>> {
 ///
 /// Fails when the email is already bound to a different account, which would otherwise
 /// silently leave an operator locked out of the instance they just provisioned.
-pub async fn provision_bootstrap(store: &Store, bootstrap: &Bootstrap) -> Result<(), Box<dyn Error>> {
+pub async fn provision_bootstrap(
+    store: &Store,
+    bootstrap: &Bootstrap,
+) -> Result<(), Box<dyn Error>> {
     use nodus_server_store::accounts;
 
     let mut tx = store.pool().begin().await?;

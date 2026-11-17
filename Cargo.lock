@@ -2433,7 +2433,6 @@ dependencies = [
  "time",
  "tokio",
  "tower 0.5.3",
- "tower-http 0.6.11",
  "tracing",
  "ulid",
  "url",

@@ -41,11 +41,10 @@ where
     let (stopping, stopped) = tokio::sync::oneshot::channel::<()>();
     tracing::info!(listen = %address, "telemetry listening");
     let task = tokio::spawn(async move {
-        let served =
-            nodus_server_telemetry::serve_with(agent, &address, control, async move {
-                let _ = stopped.await;
-            })
-            .await;
+        let served = nodus_server_telemetry::serve_with(agent, &address, control, async move {
+            let _ = stopped.await;
+        })
+        .await;
         if let Err(error) = served {
             tracing::error!(%error, "the telemetry service stopped");
         }

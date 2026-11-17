@@ -498,9 +498,7 @@ async fn stream_logs(
                     .event("error")
                     .data(format!("a log entry could not be read: {error}")),
             },
-            Err(status) => SseEvent::default()
-                .event("error")
-                .data(status.message()),
+            Err(status) => SseEvent::default().event("error").data(status.message()),
         })
     });
     Ok(Sse::new(events).keep_alive(KeepAlive::default()))

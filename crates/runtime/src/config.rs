@@ -55,7 +55,8 @@ pub fn read() -> Result<Config, Box<dyn Error>> {
         .map(|value| value.parse())
         .transpose()?
         .unwrap_or(10);
-    let secure_cookies = env::var("NODUS_AUTH_SECURE_COOKIES").map_or(Ok(true), |value| value.parse())?;
+    let secure_cookies =
+        env::var("NODUS_AUTH_SECURE_COOKIES").map_or(Ok(true), |value| value.parse())?;
     let registrations_open =
         env::var("NODUS_REGISTRATIONS_OPEN").map_or(Ok(false), |value| value.parse())?;
     let bootstrap = match (

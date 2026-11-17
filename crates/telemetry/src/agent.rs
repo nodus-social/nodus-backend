@@ -177,8 +177,9 @@ impl Telemetry for Service {
                             return;
                         }
                     }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A reader that fell behind keeps following: the ring still holds the
+                    // entries it missed, and ending the stream would hide everything after.
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
