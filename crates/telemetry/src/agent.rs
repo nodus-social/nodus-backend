@@ -99,7 +99,6 @@ impl Agent {
         self.live.clone()
     }
 
-    #[must_use]
     pub fn mark_degraded(&self) {
         self.degraded.fetch_add(1, Ordering::Relaxed);
     }

@@ -414,17 +414,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = Config::from_env()?;
-    if let Some(address) = config.telemetry.clone() {
+    let mut telemetry = config.telemetry.clone().map(|address| {
         let serving = std::sync::Arc::clone(&agent);
-        tokio::spawn(async move {
-            tracing::info!(listen = %address, "telemetry listening");
+        let (stopping, stopped) = tokio::sync::oneshot::channel::<()>();
+        tracing::info!(listen = %address, "telemetry listening");
+        let task = tokio::spawn(async move {
             let stopped =
-                nodus_server_telemetry::serve(serving, &address, std::future::pending()).await;
+                nodus_server_telemetry::serve(serving, &address, async move {
+                    let _ = stopped.await;
+                })
+                .await;
             if let Err(error) = stopped {
                 tracing::error!(%error, "the telemetry service stopped");
             }
         });
-    }
+        Telemetry { stopping, task }
+    });
     let store = Store::connect(&config.database_url, config.database_connections).await?;
 
     if config.migrate_only {
@@ -433,6 +438,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             nodus_feeds::prepare(&config.database_url, config.database_connections).await?;
         }
         tracing::info!("migrations applied");
+        stop(telemetry.take()).await;
         return Ok(());
     }
 
@@ -458,6 +464,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if !config.roles.has(Role::Api) {
         tracing::info!(roles = %config.roles.names(), "no listener in this process");
         shutdown().await;
+        stop(telemetry.take()).await;
         return Ok(());
     }
     // Queued posts publish and outbound activities leave from the process that also
@@ -474,7 +481,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "nodus server listening"
     );
     nodus_server_transport::serve_http(&config.bind, app(&store, &config, feed), shutdown()).await?;
+    stop(telemetry.take()).await;
     Ok(())
+}
+
+/// A telemetry listener that has to be told to stop, so its socket is removed
+/// rather than left for the next process to trip over.
+struct Telemetry {
+    stopping: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn stop(telemetry: Option<Telemetry>) {
+    let Some(telemetry) = telemetry else {
+        return;
+    };
+    let _ = telemetry.stopping.send(());
+    let _ = telemetry.task.await;
 }
 
 #[cfg(test)]

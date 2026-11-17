@@ -76,8 +76,7 @@ fn full_visibility() -> bool {
     static FULL: OnceLock<bool> = OnceLock::new();
     *FULL.get_or_init(|| {
         std::env::var("NODUS_TELEMETRY_FULL")
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
+            .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
     })
 }
 
@@ -446,7 +445,7 @@ async fn stream_logs(
             },
             Err(status) => SseEvent::default()
                 .event("error")
-                .data(status.message().to_owned()),
+                .data(status.message()),
         })
     });
     Ok(Sse::new(events).keep_alive(KeepAlive::default()))
