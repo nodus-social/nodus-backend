@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 nodus-server-proto = { path = "../proto" }
+nodus-server-transport = { path = "../transport" }
 chrono = { workspace = true }
 sysinfo = "0.33"
 thiserror = { workspace = true }
@@ -17,6 +18,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+nodus-server-transport = { path = "../transport" }
 futures-util = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

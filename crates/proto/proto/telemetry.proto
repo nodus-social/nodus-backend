@@ -7,11 +7,12 @@ syntax = "proto3";
 package nodus.telemetry;
 
 service Telemetry {
-  rpc GetNodeTelemetry(TelemetryRequest) returns (NodeTelemetry);
+  rpc GetNodeTelemetry(Empty) returns (NodeTelemetry);
   rpc StreamLogs(LogStreamRequest) returns (stream LogEntry);
 }
 
-message TelemetryRequest {}
+// A question needs no arguments: a service can only describe itself.
+message Empty {}
 
 message NodeTelemetry {
   string service_name = 1;

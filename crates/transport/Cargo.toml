@@ -1,0 +1,15 @@
+[package]
+name = "nodus-server-transport"
+description = "Listeners for the nodus services: one address string, TCP or Unix socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+tokio-listener = { version = "0.5", features = ["axum08", "tonic012", "unix", "unix_path_tools", "serde", "tokio-util"] }
+tonic = { workspace = true }
+tracing = { workspace = true }

@@ -5,8 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nodus_server_proto::telemetry::{
-    telemetry_server::Telemetry, Health, Level, LogEntry, LogStreamRequest, NodeTelemetry,
-    TelemetryRequest,
+    telemetry_server::Telemetry, Empty, Health, Level, LogEntry, LogStreamRequest, NodeTelemetry,
 };
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::broadcast;
@@ -125,7 +124,7 @@ impl Service {
 impl Telemetry for Service {
     async fn get_node_telemetry(
         &self,
-        _request: Request<TelemetryRequest>,
+        _request: Request<Empty>,
     ) -> Result<Response<NodeTelemetry>, Status> {
         let (cpu, rss) = self
             .agent

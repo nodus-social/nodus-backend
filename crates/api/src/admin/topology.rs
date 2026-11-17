@@ -6,16 +6,19 @@
 //! dead node costs the same wall-clock time as a fast one.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
+use axum::response::sse::{Event as SseEvent, KeepAlive};
+use axum::response::Sse;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use nodus_server_proto::telemetry::telemetry_client::TelemetryClient;
-use nodus_server_proto::telemetry::{LogEntry, LogStreamRequest, TelemetryRequest};
+use nodus_server_proto::telemetry::{Empty, LogEntry, LogStreamRequest};
 use serde::{Deserialize, Serialize};
 use tonic::transport::{Channel, Endpoint};
 
@@ -50,11 +53,32 @@ impl Target {
     }
 
     fn endpoint(&self) -> String {
+        if full_visibility() {
+            return match self {
+                Self::Socket { path, .. } => path.display().to_string(),
+                Self::Http { url, .. } => url.clone(),
+            };
+        }
+        // A socket path and an internal address are infrastructure, not health: an
+        // administrator who needs them says so once in the environment.
         match self {
-            Self::Socket { path, .. } => path.display().to_string(),
-            Self::Http { url, .. } => url.clone(),
+            Self::Socket { .. } => "unix socket".to_owned(),
+            Self::Http { .. } => "tcp".to_owned(),
         }
     }
+}
+
+/// Whether endpoint paths and addresses are answered as configured.
+///
+/// Off by default: the topology view answers whether a node is well, which does not
+/// need the filesystem layout. `NODUS_TELEMETRY_FULL=true` turns the detail on.
+fn full_visibility() -> bool {
+    static FULL: OnceLock<bool> = OnceLock::new();
+    *FULL.get_or_init(|| {
+        std::env::var("NODUS_TELEMETRY_FULL")
+            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    })
 }
 
 /// Reads `NODUS_TELEMETRY` once: `name=unix:/run/nodus/api.sock,name=http://10.0.1.4:50051`.
@@ -77,7 +101,7 @@ fn targets() -> &'static [Target] {
                 match address.strip_prefix("unix:") {
                     Some(path) => Some(Target::Socket {
                         name: name.to_owned(),
-                        path: PathBuf::from(path),
+                        path: socket_path(path),
                     }),
                     None => Some(Target::Http {
                         name: name.to_owned(),
@@ -90,12 +114,35 @@ fn targets() -> &'static [Target] {
             if let Ok(path) = std::env::var("NODUS_TELEMETRY_SOCKET") {
                 parsed.push(Target::Socket {
                     name: "api".to_owned(),
-                    path: PathBuf::from(path),
+                    path: socket_path(&path),
                 });
             }
         }
         parsed
     })
+}
+
+/// A socket path as either side of a deployment writes it: `/run/nodus/api.sock` or
+/// `unix:///run/nodus/api.sock`.
+fn socket_path(value: &str) -> PathBuf {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("unix://")
+        .or_else(|| value.strip_prefix("unix:"))
+        .unwrap_or(value);
+    PathBuf::from(value)
+}
+
+/// The whole chain, so a view that says a service is dead also says why.
+fn describe(error: &tonic::transport::Error) -> String {
+    let mut message = error.to_string();
+    let mut cause = std::error::Error::source(error);
+    while let Some(inner) = cause {
+        message.push_str(": ");
+        message.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    message
 }
 
 #[derive(Debug, Default)]
@@ -150,7 +197,7 @@ async fn client(target: &Target) -> Result<TelemetryClient<Channel>, String> {
                     }
                 }))
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| describe(&error))?;
             Ok(TelemetryClient::new(channel))
         }
         Target::Http { url, .. } => {
@@ -158,7 +205,7 @@ async fn client(target: &Target) -> Result<TelemetryClient<Channel>, String> {
                 .map_err(|error| error.to_string())?
                 .connect()
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| describe(&error))?;
             Ok(TelemetryClient::new(channel))
         }
     }
@@ -227,7 +274,7 @@ async fn probe(target: &Target) -> NodeDto {
     let answer = match tokio::time::timeout(PROBE_BUDGET, async {
         let mut client = client(target).await?;
         let telemetry = client
-            .get_node_telemetry(TelemetryRequest {})
+            .get_node_telemetry(Empty {})
             .await
             .map_err(|status| status.message().to_owned())?
             .into_inner();
@@ -237,10 +284,7 @@ async fn probe(target: &Target) -> NodeDto {
     {
         Ok(Ok(telemetry)) => Ok(telemetry),
         Ok(Err(error)) => Err(error),
-        Err(_) => Err(format!(
-            "no answer within {} ms",
-            PROBE_BUDGET.as_millis()
-        )),
+        Err(_) => Err(format!("no answer within {} ms", PROBE_BUDGET.as_millis())),
     };
 
     let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -313,9 +357,9 @@ async fn logs(
     let min_level = level_value(query.min_level.as_deref().unwrap_or("info"));
 
     let collected = tokio::time::timeout(PROBE_BUDGET, async {
-        let mut client = client(target).await.map_err(|error| {
-            ApiError::new(axum::http::StatusCode::BAD_GATEWAY, error)
-        })?;
+        let mut client = client(target)
+            .await
+            .map_err(|error| ApiError::new(axum::http::StatusCode::BAD_GATEWAY, error))?;
         let mut stream = client
             .stream_logs(LogStreamRequest {
                 buffered: u32::try_from(limit).unwrap_or(u32::try_from(LOG_LIMIT).unwrap_or(500)),
@@ -355,21 +399,77 @@ async fn logs(
         )
     })??;
 
-    Ok(Json(
-        collected
-            .into_iter()
-            .map(|entry| LogDto {
-                timestamp: entry.timestamp,
-                level: level_name(entry.level),
-                target: entry.target,
-                message: entry.message,
-            })
-            .collect(),
-    ))
+    Ok(Json(collected.into_iter().map(log_dto).collect()))
+}
+
+/// The tail of one node's log, as it happens.
+///
+/// The drawer opens this once and closes it by disconnecting; dropping the response
+/// drops the gRPC stream with it, so a closed drawer holds no socket on either side.
+async fn stream_logs(
+    State(_state): State<AppState>,
+    auth: Auth,
+    Path(name): Path<String>,
+    Query(query): Query<LogQuery>,
+) -> ApiResult<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>> {
+    auth.require_admin("admin:read")?;
+    let Some(target) = targets().iter().find(|target| target.name() == name) else {
+        return Err(ApiError::not_found("no such node"));
+    };
+    let limit = query.limit.unwrap_or(200).min(LOG_LIMIT);
+    let min_level = level_value(query.min_level.as_deref().unwrap_or("info"));
+
+    let mut client = client(target)
+        .await
+        .map_err(|error| ApiError::new(axum::http::StatusCode::BAD_GATEWAY, error))?;
+    let stream = client
+        .stream_logs(LogStreamRequest {
+            buffered: u32::try_from(limit).unwrap_or(u32::try_from(LOG_LIMIT).unwrap_or(500)),
+            min_level,
+        })
+        .await
+        .map_err(|status| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                status.message().to_owned(),
+            )
+        })?
+        .into_inner();
+
+    let events = stream.map(|entry| {
+        Ok(match entry {
+            Ok(entry) => match SseEvent::default().json_data(log_dto(entry)) {
+                Ok(event) => event,
+                Err(error) => SseEvent::default()
+                    .event("error")
+                    .data(format!("a log entry could not be read: {error}")),
+            },
+            Err(status) => SseEvent::default()
+                .event("error")
+                .data(status.message().to_owned()),
+        })
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
+}
+
+fn log_dto(entry: LogEntry) -> LogDto {
+    LogDto {
+        timestamp: entry.timestamp,
+        level: level_name(entry.level),
+        target: entry.target,
+        message: entry.message,
+    }
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/admin/topology", axum::routing::get(topology))
-        .route("/api/v1/admin/topology/{name}/logs", axum::routing::get(logs))
+        .route(
+            "/api/v1/admin/topology/{name}/logs",
+            axum::routing::get(logs),
+        )
+        .route(
+            "/api/v1/admin/topology/{name}/logs/stream",
+            axum::routing::get(stream_logs),
+        )
 }

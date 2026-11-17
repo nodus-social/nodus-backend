@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use nodus_server_proto::telemetry::telemetry_client::TelemetryClient;
-use nodus_server_proto::telemetry::{LogStreamRequest, TelemetryRequest};
+use nodus_server_proto::telemetry::{Empty, LogStreamRequest};
 use nodus_server_telemetry::{entry, Agent, Node};
 use tonic::transport::{Endpoint, Uri};
 
@@ -34,7 +34,10 @@ async fn a_node_answers_about_itself_over_its_socket() {
     });
     let serving = Arc::clone(&agent);
     let target = socket.clone();
-    let server = tokio::spawn(async move { nodus_server_telemetry::serve_uds(serving, target).await });
+    let server = tokio::spawn(async move {
+        let address = nodus_server_transport::Address::Path(target);
+        nodus_server_telemetry::serve(serving, &address, std::future::pending()).await
+    });
 
     for _ in 0..200 {
         if socket.exists() {
@@ -45,7 +48,7 @@ async fn a_node_answers_about_itself_over_its_socket() {
 
     let mut client = connect(socket).await;
     let telemetry = client
-        .get_node_telemetry(TelemetryRequest {})
+        .get_node_telemetry(Empty {})
         .await
         .expect("the node answers")
         .into_inner();
@@ -60,15 +63,18 @@ async fn a_node_answers_about_itself_over_its_socket() {
 
 #[tokio::test]
 async fn the_ring_is_what_a_log_drawer_reads() {
-    let directory = std::env::temp_dir().join(format!("nodus-telemetry-logs-{}", std::process::id()));
+    let directory =
+        std::env::temp_dir().join(format!("nodus-telemetry-logs-{}", std::process::id()));
     let socket = directory.join("api.sock");
     let agent = Agent::new(Node {
         name: "api".to_owned(),
         version: "9.9.9".to_owned(),
     });
-    agent
-        .ring()
-        .push(entry(tracing::Level::INFO, "nodus_server", "started".to_owned()));
+    agent.ring().push(entry(
+        tracing::Level::INFO,
+        "nodus_server",
+        "started".to_owned(),
+    ));
     agent.ring().push(entry(
         tracing::Level::ERROR,
         "nodus_server",
@@ -77,7 +83,10 @@ async fn the_ring_is_what_a_log_drawer_reads() {
 
     let serving = Arc::clone(&agent);
     let target = socket.clone();
-    let server = tokio::spawn(async move { nodus_server_telemetry::serve_uds(serving, target).await });
+    let server = tokio::spawn(async move {
+        let address = nodus_server_transport::Address::Path(target);
+        nodus_server_telemetry::serve(serving, &address, std::future::pending()).await
+    });
     for _ in 0..200 {
         if socket.exists() {
             break;

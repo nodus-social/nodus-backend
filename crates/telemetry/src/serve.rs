@@ -1,52 +1,34 @@
-//! Two transports, one service: a Unix socket where processes share a machine, TCP where
-//! they do not.
+//! Where the telemetry service listens.
+//!
+//! The address is the same one every other service takes, so a container can put its
+//! telemetry beside its requests on a Unix socket and a spread-out deployment can reach
+//! the same service over TCP without a second code path.
 
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nodus_server_proto::telemetry::telemetry_server::TelemetryServer;
+use nodus_server_transport::Address;
 use tonic::transport::Server;
 
 use crate::agent::{Agent, Service};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("the socket could not be prepared: {0}")]
+    #[error("the listener could not be prepared: {0}")]
     Io(#[from] std::io::Error),
-    #[error("the telemetry server stopped: {0}")]
-    Transport(#[from] tonic::transport::Error),
 }
 
-/// Serves on a Unix socket, replacing a socket left behind by an earlier run.
+/// Serve until `shutdown` resolves.
 ///
 /// # Errors
 ///
-/// Fails when the socket cannot be created or the server cannot run.
-pub async fn serve_uds(agent: Arc<Agent>, socket: PathBuf) -> Result<(), Error> {
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if Path::new(&socket).exists() {
-        std::fs::remove_file(&socket)?;
-    }
-    let listener = tokio::net::UnixListener::bind(&socket)?;
-    Server::builder()
-        .add_service(TelemetryServer::new(Service::new(agent)))
-        .serve_with_incoming(tokio_stream::wrappers::UnixListenerStream::new(listener))
-        .await?;
-    Ok(())
-}
-
-/// Serves on TCP, for a host that reaches another host.
-///
-/// # Errors
-///
-/// Fails when the address cannot be bound or the server cannot run.
-pub async fn serve_tcp(agent: Arc<Agent>, address: SocketAddr) -> Result<(), Error> {
-    Server::builder()
-        .add_service(TelemetryServer::new(Service::new(agent)))
-        .serve(address)
-        .await?;
+/// Fails when the address cannot be bound or the server stops with an error, either of
+/// which means this process cannot answer about itself.
+pub async fn serve<F>(agent: Arc<Agent>, address: &Address, shutdown: F) -> Result<(), Error>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let service = Server::builder().add_service(TelemetryServer::new(Service::new(agent)));
+    nodus_server_transport::serve_grpc(address, service, shutdown).await?;
     Ok(())
 }

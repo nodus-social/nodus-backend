@@ -10,7 +10,6 @@ mod scanning;
 
 use std::env;
 use std::error::Error;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -22,7 +21,7 @@ use nodus_server_telemetry::{Agent, Node, TelemetryLayer};
 
 const DEFAULT_BIND: &str = "0.0.0.0:3000";
 const DEFAULT_DATABASE_URL: &str = "postgres://nodus:nodus@localhost/nodus";
-const DEFAULT_ROLES: &str = "api,scan,prune";
+const DEFAULT_ROLES: &str = "api,feed,scan,prune";
 
 /// What this process does, chosen at start so one binary can run as a monolith or as
 /// several narrower processes over the same database.
@@ -30,6 +29,8 @@ const DEFAULT_ROLES: &str = "api,scan,prune";
 enum Role {
     /// The public listener: client API, OAuth pages, ActivityPub documents.
     Api,
+    /// The recommendation surface: feeds, browse, events, sharing, sync.
+    Feed,
     /// The scan sweep: claims queued scans, calls scanner services, applies policy.
     Scan,
     /// The hourly media prune.
@@ -37,13 +38,14 @@ enum Role {
 }
 
 impl Role {
-    fn all() -> [Self; 3] {
-        [Self::Api, Self::Scan, Self::Prune]
+    fn all() -> [Self; 4] {
+        [Self::Api, Self::Feed, Self::Scan, Self::Prune]
     }
 
     fn name(self) -> &'static str {
         match self {
             Self::Api => "api",
+            Self::Feed => "feed",
             Self::Scan => "scan",
             Self::Prune => "prune",
         }
@@ -52,6 +54,7 @@ impl Role {
     fn parse(value: &str) -> Option<Self> {
         match value.trim() {
             "api" => Some(Self::Api),
+            "feed" => Some(Self::Feed),
             "scan" => Some(Self::Scan),
             "prune" => Some(Self::Prune),
             _ => None,
@@ -113,7 +116,7 @@ impl Roles {
 
 #[derive(Debug, Clone)]
 struct Config {
-    bind: SocketAddr,
+    bind: nodus_server_transport::Address,
     database_url: String,
     database_connections: u32,
     instance: InstanceConfig,
@@ -124,16 +127,7 @@ struct Config {
     roles: Roles,
     bootstrap: Option<Bootstrap>,
     /// Where this process answers questions about itself, if anywhere.
-    telemetry: Option<TelemetryTarget>,
-}
-
-/// How the telemetry service is reachable.
-#[derive(Debug, Clone)]
-enum TelemetryTarget {
-    /// A Unix socket, for processes sharing a machine.
-    Socket(PathBuf),
-    /// A TCP address, for a host reaching another host.
-    Bind(SocketAddr),
+    telemetry: Option<nodus_server_transport::Address>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,9 +144,9 @@ impl Config {
             .unwrap_or_else(|_| format!("https://{domain}"))
             .trim_end_matches('/')
             .to_owned();
-        let bind = env::var("NODUS_BIND")
-            .unwrap_or_else(|_| DEFAULT_BIND.to_owned())
-            .parse()?;
+        let bind = nodus_server_transport::parse(
+            &env::var("NODUS_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
+        )?;
         let database_connections = env::var("NODUS_DATABASE_CONNECTIONS")
             .ok()
             .map(|value| value.parse())
@@ -184,8 +178,8 @@ impl Config {
             env::var("NODUS_TELEMETRY_SOCKET").ok(),
             env::var("NODUS_TELEMETRY_BIND").ok(),
         ) {
-            (Some(path), None) => Some(TelemetryTarget::Socket(PathBuf::from(path))),
-            (None, Some(address)) => Some(TelemetryTarget::Bind(address.parse()?)),
+            (Some(path), None) => Some(nodus_server_transport::parse(&path)?),
+            (None, Some(address)) => Some(nodus_server_transport::parse(&address)?),
             (None, None) => None,
             (Some(_), Some(_)) => {
                 return Err("set NODUS_TELEMETRY_SOCKET or NODUS_TELEMETRY_BIND, not both".into())
@@ -217,7 +211,7 @@ impl Config {
     }
 }
 
-fn app(store: &Store, config: &Config) -> Router {
+fn app(store: &Store, config: &Config, feed: Router) -> Router {
     let api = nodus_server_api::root_router(AppState::new(store.clone(), config.instance.clone()));
     let auth = nodus_auth::router(nodus_auth::AppState::new(
         PgAuthStore::new(store.pool().clone()),
@@ -228,7 +222,35 @@ fn app(store: &Store, config: &Config) -> Router {
             registrations_open: config.registrations_open,
         },
     ));
-    api.merge(auth)
+    api.merge(auth).merge(feed)
+}
+
+/// The recommendation engine, mounted in this process.
+///
+/// It is the same router the standalone service serves; the difference is that this
+/// process already owns a pool, a listener and the health probes, so a monolith needs
+/// no second deployable and no address to discover. An empty router when the role is
+/// off keeps `app` a single shape for every role combination.
+async fn feed(config: &Config) -> Router {
+    if !config.roles.has(Role::Feed) {
+        return Router::new();
+    }
+    match nodus_feeds::mount(
+        &config.database_url,
+        &config.instance.base_url,
+        config.database_connections,
+    )
+    .await
+    {
+        Ok(router) => router,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "the recommendation engine could not start, so its routes stay closed"
+            );
+            Router::new()
+        }
+    }
 }
 
 async fn provision_bootstrap(store: &Store, bootstrap: &Bootstrap) -> Result<(), Box<dyn Error>> {
@@ -392,19 +414,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let config = Config::from_env()?;
-    if let Some(target) = config.telemetry.clone() {
+    if let Some(address) = config.telemetry.clone() {
         let serving = std::sync::Arc::clone(&agent);
         tokio::spawn(async move {
-            let stopped = match target {
-                TelemetryTarget::Socket(path) => {
-                    tracing::info!(path = %path.display(), "telemetry listening");
-                    nodus_server_telemetry::serve_uds(serving, path).await
-                }
-                TelemetryTarget::Bind(address) => {
-                    tracing::info!(%address, "telemetry listening");
-                    nodus_server_telemetry::serve_tcp(serving, address).await
-                }
-            };
+            tracing::info!(listen = %address, "telemetry listening");
+            let stopped =
+                nodus_server_telemetry::serve(serving, &address, std::future::pending()).await;
             if let Err(error) = stopped {
                 tracing::error!(%error, "the telemetry service stopped");
             }
@@ -414,11 +429,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     if config.migrate_only {
         store.migrate().await?;
+        if config.roles.has(Role::Feed) {
+            nodus_feeds::prepare(&config.database_url, config.database_connections).await?;
+        }
         tracing::info!("migrations applied");
         return Ok(());
     }
 
     store.migrate().await?;
+    let feed = feed(&config).await;
     if let Some(bootstrap) = &config.bootstrap {
         provision_bootstrap(&store, bootstrap).await?;
     }
@@ -449,18 +468,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::spawn(nodus_server_api::schedules::run(state.clone()));
         tokio::spawn(nodus_server_api::outbox::run(state));
     }
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(
         address = %config.bind,
         domain = %config.instance.domain,
         "nodus server listening"
     );
-    axum::serve(
-        listener,
-        app(&store, &config).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown())
-    .await?;
+    nodus_server_transport::serve_http(&config.bind, app(&store, &config, feed), shutdown()).await?;
     Ok(())
 }
 
@@ -474,7 +487,7 @@ mod tests {
 
     fn config() -> Config {
         Config {
-            bind: "127.0.0.1:0".parse().expect("bind"),
+            bind: nodus_server_transport::parse("127.0.0.1:0").expect("bind"),
             database_url: "postgres://nodus:nodus@127.0.0.1:1/nodus".to_owned(),
             database_connections: 1,
             instance: InstanceConfig {
@@ -496,10 +509,21 @@ mod tests {
         }
     }
 
+    /// The mount as the process builds it, without a database to reach: these tests are
+    /// about which router answers which path, not about what the engine stores.
+    fn feeds(store: &Store, config: &Config) -> Router {
+        nodus_feeds::core_router(nodus_feeds::in_process(
+            store.pool().clone(),
+            &config.instance.base_url,
+            1,
+        ))
+    }
+
     #[tokio::test]
     async fn the_monolith_router_serves_health_and_auth_metadata() {
         let store = Store::connect_lazy(&config().database_url, 1);
-        let app = app(&store, &config());
+        let config = config();
+        let app = app(&store, &config, feeds(&store, &config));
 
         let health = app
             .clone()
@@ -523,6 +547,39 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(metadata.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_monolith_router_answers_the_feeds_surface() {
+        let store = Store::connect_lazy(&config().database_url, 1);
+        let config = config();
+        let app = app(&store, &config, feeds(&store, &config));
+
+        // Without a database the handler can only fail, and that is the point: a 404
+        // would mean the router was never mounted, while any other status proves the
+        // request reached the recommendation engine.
+        let meta = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/meta")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_ne!(meta.status(), StatusCode::NOT_FOUND);
+
+        let feed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/feed/accounts?limit=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_ne!(feed.status(), StatusCode::NOT_FOUND);
     }
 
     async fn connect_isolated_store() -> Option<(Store, Store, String)> {
@@ -1052,7 +1109,7 @@ mod tests {
         for role in Role::all() {
             assert!(roles.has(role), "{} must run by default", role.name());
         }
-        assert_eq!(roles.names(), "api,scan,prune");
+        assert_eq!(roles.names(), "api,feed,scan,prune");
     }
 
     #[test]
