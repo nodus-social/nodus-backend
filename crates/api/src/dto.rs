@@ -16,6 +16,33 @@ use nodus_server_store::statuses::StatusRow;
 
 use crate::state::InstanceConfig;
 
+/// The page a reader should open for an account, in the place that actually holds it.
+///
+/// A remote account's page lives on the instance that minted it: printing our own address
+/// with its name in it would point at a profile we do not have.
+fn account_url(row: &AccountRow, instance: &InstanceConfig) -> String {
+    match row.domain.as_deref() {
+        Some(domain) => format!("https://{domain}/@{}", row.username),
+        None => instance.url(&format!("/@{}", row.username)),
+    }
+}
+
+/// The page a reader should open for a status, in the place that actually holds it.
+///
+/// A remote status keeps its own permalink: its id here is our numbering, so a link built
+/// from it would name a post our instance never had.
+fn status_url(row: &StatusRow, account: &AccountRow, instance: &InstanceConfig) -> String {
+    if !row.local {
+        if let Some(uri) = row.uri.as_deref().filter(|uri| uri.starts_with("http")) {
+            return uri.to_owned();
+        }
+    }
+    match account.domain.as_deref() {
+        Some(domain) => format!("https://{domain}/@{}/{}", account.username, row.id),
+        None => instance.url(&format!("/@{}/{}", account.username, row.id)),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AccountDto {
     pub id: String,
@@ -78,7 +105,7 @@ impl AccountDto {
             group: false,
             created_at: row.created_at,
             note: row.note.clone(),
-            url: instance.url(&format!("/@{}", row.username)),
+            url: account_url(row, instance),
             avatar: avatar.clone(),
             avatar_static: avatar,
             header: header.clone(),
@@ -219,7 +246,7 @@ impl StatusDto {
         instance: &InstanceConfig,
         media: &[MediaRow],
     ) -> Self {
-        let url = instance.url(&format!("/@{}/{}", account.username, row.id));
+        let url = status_url(row, account, instance);
         Self {
             id: row.id.clone(),
             created_at: row.created_at,
