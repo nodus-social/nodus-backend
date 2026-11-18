@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use nodus_server_store::blocks as store_blocks;
 use nodus_server_store::moderation::{
     self, DomainBlockFilter, DomainBlockRow, EmailDomainBlockRow, NewDomainBlock,
 };
@@ -454,8 +455,80 @@ async fn delete_email_block(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Serialize)]
+pub struct RemoteBlockDto {
+    pub actor: String,
+    pub host: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RemoteBlocksDto {
+    pub blocks: Vec<RemoteBlockDto>,
+}
+
+async fn list_remote_blocks(
+    State(state): State<AppState>,
+    auth: Auth,
+) -> ApiResult<Json<RemoteBlocksDto>> {
+    auth.require_admin("admin:read")?;
+    let rows = store_blocks::remote_blocks(state.store().pool()).await?;
+    Ok(Json(RemoteBlocksDto {
+        blocks: rows
+            .into_iter()
+            .map(|row| RemoteBlockDto {
+                actor: row.actor,
+                host: row.host,
+                created_at: row.created_at,
+            })
+            .collect(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteBlockForm {
+    host: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteBlockQuery {
+    host: Option<String>,
+}
+
+async fn clear_remote_blocks(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<RemoteBlockQuery>,
+    Body(form): Body<RemoteBlockForm>,
+) -> ApiResult<axum::http::StatusCode> {
+    auth.require_admin("admin:write")?;
+    let host = form
+        .host
+        .or(query.host)
+        .map(|host| host.trim().to_owned())
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| ApiError::unprocessable("host is required"))?;
+    if store_blocks::clear_remote_blocks(state.store().pool(), &host).await? == 0 {
+        return Err(ApiError::not_found("no remote block names that host"));
+    }
+    super::audit_write_detail(
+        &state,
+        &auth,
+        "clear_remote_blocks",
+        "host",
+        &host,
+        json!({}),
+    )
+    .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/v1/admin/federation/remote-blocks",
+            get(list_remote_blocks).delete(clear_remote_blocks),
+        )
         .route(
             "/api/v1/admin/domain_blocks",
             get(blocks).post(create_block),

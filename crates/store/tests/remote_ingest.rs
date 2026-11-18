@@ -326,3 +326,67 @@ async fn a_block_stops_queueing_deliveries_to_that_host(pool: PgPool) {
         0
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn remote_blocks_are_listed_newest_first_and_clearing_frees_the_host(pool: PgPool) {
+    let alice = seed_account(&pool, "alice").await;
+    blocks::record_remote_block(&pool, "https://blocked.test/users/a")
+        .await
+        .expect("record block");
+    blocks::record_remote_block(&pool, "https://other.test/users/b")
+        .await
+        .expect("record another block");
+    sqlx::query(
+        "UPDATE remote_block SET created_at = now() - interval '1 hour' \
+         WHERE actor_uri = 'https://other.test/users/b'",
+    )
+    .execute(&pool)
+    .await
+    .expect("age one block");
+
+    let listed = blocks::remote_blocks(&pool).await.expect("list blocks");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].actor, "https://blocked.test/users/a");
+    assert_eq!(listed[0].host, "blocked.test");
+    assert_eq!(listed[1].host, "other.test");
+
+    let activity = serde_json::json!({
+        "id": "https://social.test/users/alice/statuses/1/activity",
+        "type": "Create",
+        "actor": "https://social.test/users/alice",
+        "object": { "id": "https://social.test/users/alice/statuses/1" },
+    });
+    let blocked_only = vec!["https://blocked.test/users/a/inbox".to_owned()];
+    assert_eq!(
+        delivery::enqueue(&pool, &alice, &activity, &blocked_only)
+            .await
+            .expect("enqueue"),
+        0
+    );
+
+    assert_eq!(
+        blocks::clear_remote_blocks(&pool, "Blocked.Test.")
+            .await
+            .expect("clear blocks"),
+        1
+    );
+    let listed = blocks::remote_blocks(&pool).await.expect("list blocks");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].host, "other.test");
+    assert_eq!(
+        delivery::enqueue(&pool, &alice, &activity, &blocked_only)
+            .await
+            .expect("enqueue"),
+        1
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn clearing_a_host_with_no_block_reports_zero(pool: PgPool) {
+    assert_eq!(
+        blocks::clear_remote_blocks(&pool, "nothing.test")
+            .await
+            .expect("clear blocks"),
+        0
+    );
+}

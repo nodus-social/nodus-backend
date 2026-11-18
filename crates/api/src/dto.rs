@@ -43,6 +43,37 @@ fn status_url(row: &StatusRow, account: &AccountRow, instance: &InstanceConfig) 
     }
 }
 
+/// The account a moved profile points at.
+///
+/// Only the identity is known here: the target is a cached actor, and loading its full
+/// profile would turn every status render into another query. A client needs the link and
+/// the handle to say where the account went.
+fn moved_account(uri: &str) -> serde_json::Value {
+    let parsed = url::Url::parse(uri).ok();
+    let host = parsed
+        .as_ref()
+        .and_then(url::Url::host_str)
+        .unwrap_or_default();
+    let username = parsed
+        .as_ref()
+        .and_then(url::Url::path_segments)
+        .and_then(|segments| {
+            segments
+                .rev()
+                .find(|segment| !segment.is_empty())
+                .map(|segment| segment.trim_start_matches('@'))
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "id": uri,
+        "uri": uri,
+        "url": uri,
+        "username": username,
+        "acct": format!("{username}@{host}"),
+        "domain": host,
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub struct AccountDto {
     pub id: String,
@@ -119,7 +150,7 @@ impl AccountDto {
             noindex: !row.indexable,
             emojis: Vec::new(),
             fields: row.fields.as_array().cloned().unwrap_or_default(),
-            moved: None,
+            moved: row.moved_to.as_deref().map(moved_account),
             suspended: row.suspended_at.is_some(),
             limited: false,
         }

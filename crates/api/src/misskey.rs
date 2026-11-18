@@ -122,8 +122,8 @@ async fn user_for(state: &AppState, account: &AccountRow) -> ApiResult<User> {
         notes_count: u64::try_from(account.statuses_count).unwrap_or_default(),
         created_at: Some(account.created_at.to_rfc3339()),
         uri: account.uri.clone(),
-        moved_to_uri: None,
-        also_known_as: Vec::new(),
+        moved_to_uri: account.moved_to.clone(),
+        also_known_as: account.also_known_as.clone(),
     })
 }
 

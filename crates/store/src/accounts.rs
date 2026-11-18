@@ -55,6 +55,8 @@ pub struct AccountRow {
     pub last_status_at: Option<DateTime<Utc>>,
     pub suspended_at: Option<DateTime<Utc>>,
     pub silenced_at: Option<DateTime<Utc>>,
+    pub moved_to: Option<String>,
+    pub also_known_as: Vec<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -62,13 +64,13 @@ pub(crate) const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS user
      a.display_name, a.note, a.avatar_ref, a.header_ref, a.avatar_url, a.header_url, a.fields, a.client_metadata, a.locked, a.bot, a.local, a.uri, \
      a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.approved, \
      a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
-     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.created_at";
+     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.moved_to, a.also_known_as, a.created_at";
 
 pub(crate) const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
      display_name, note, avatar_ref, header_ref, avatar_url, header_url, fields, client_metadata, locked, bot, local, uri, \
      inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, approved, \
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \
-     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, created_at";
+     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, moved_to, also_known_as, created_at";
 
 /// A token verified against an account.
 #[derive(Debug, Clone, FromRow)]
@@ -216,6 +218,39 @@ pub struct RemoteProfile<'a> {
     pub note: Option<&'a str>,
     pub avatar_url: Option<&'a str>,
     pub header_url: Option<&'a str>,
+}
+
+/// The aliases a remote actor published in its document, replacing what we had.
+pub async fn set_also_known_as(
+    pool: &PgPool,
+    uri: &str,
+    aliases: &[String],
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET also_known_as = $2 WHERE uri = $1 AND NOT local RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(uri)
+        .bind(aliases.to_vec())
+        .fetch_optional(pool)
+        .await
+}
+
+/// Records where a remote account moved, or clears it when `moved_to` is `None`.
+pub async fn set_moved_to(
+    pool: &PgPool,
+    id: &str,
+    moved_to: Option<&str>,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET moved_to = $2, updated_at = now() \
+          WHERE id = $1 AND NOT local RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(moved_to)
+        .fetch_optional(pool)
+        .await
 }
 
 /// Refreshes the profile of a remote actor we already know.

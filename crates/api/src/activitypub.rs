@@ -372,7 +372,8 @@ async fn verify_signature(
             return Ok(activity);
         }
     }
-    let actor = state.fediverse_client()
+    let actor = state
+        .fediverse_client()
         .actor_url(key_actor)
         .await
         .map_err(|error| ApiError::unauthorized(error.to_string()))?;
@@ -443,6 +444,7 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
                 .await?;
         }
         ActivityKind::Flag => report_remote_flag(state, &remote, activity).await?,
+        ActivityKind::Move => move_remote_actor(state, &remote, activity).await?,
         _ => {}
     }
     Ok(())
@@ -489,6 +491,27 @@ fn delete_target_id(activity: &Activity) -> Option<&str> {
         ActivityObject::Value(value) => value.get("id").and_then(Value::as_str),
         ActivityObject::Activity(_) => None,
     }
+}
+
+/// The actor URIs a document redirects to, as `alsoKnownAs`.
+fn also_known_as(actor: &Actor) -> Vec<String> {
+    let Some(value) = actor.extra.get("alsoKnownAs") else {
+        return Vec::new();
+    };
+    let items: Vec<&str> = match value {
+        Value::String(uri) => vec![uri.as_str()],
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    items
+        .into_iter()
+        .filter(|uri| validate_remote_url(uri).is_ok())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn names_actor(aliases: &[String], actor: &str) -> bool {
+    aliases.iter().any(|alias| alias == actor)
 }
 
 fn document_type(value: &Value) -> Option<&str> {
@@ -615,7 +638,61 @@ async fn update_remote_actor_document(
     .await?;
     if updated.is_none() {
         tracing::debug!(actor = %actor.id, "ignored an update for an unknown actor");
+        return Ok(());
     }
+    accounts::set_also_known_as(state.store().pool(), &actor.id, &also_known_as(actor)).await?;
+    Ok(())
+}
+
+/// A `Move` is a redirect the target has to confirm.
+///
+/// Without `alsoKnownAs` naming the mover on the target, any actor could point another
+/// actor's followers at itself. The target's own document is the only place that consent
+/// is expressed, so a move that fails the check is dropped rather than guessed at.
+async fn move_remote_actor(
+    state: &AppState,
+    remote: &AccountRow,
+    activity: &Activity,
+) -> ApiResult<()> {
+    let Some(target) = activity
+        .extra
+        .get("target")
+        .and_then(Value::as_str)
+        .filter(|target| !target.is_empty())
+    else {
+        return Ok(());
+    };
+    if target == activity.actor || validate_remote_url(target).is_err() {
+        tracing::info!(actor = %activity.actor, target = %target, "ignored a move to an unusable target");
+        return Ok(());
+    }
+    let pool = state.store().pool();
+    let confirmed = match accounts::by_uri(pool, target).await? {
+        // A target that has already published aliases has answered the question; asking
+        // again would let a transient outage silently drop a consented redirect.
+        Some(row) if !row.also_known_as.is_empty() => {
+            names_actor(&row.also_known_as, &activity.actor)
+        }
+        _ => {
+            let parsed = validate_remote_url(target)?;
+            let domain = parsed
+                .host_str()
+                .ok_or_else(|| ApiError::unprocessable("move target has no host"))?;
+            ensure_domain_allowed(state, domain).await?;
+            match fetch_remote_actor(state, target, domain).await {
+                Ok(row) => names_actor(&row.also_known_as, &activity.actor),
+                Err(error) => {
+                    tracing::info!(actor = %activity.actor, target = %target, error = %error.message(), "could not verify a move");
+                    return Ok(());
+                }
+            }
+        }
+    };
+    if !confirmed {
+        tracing::info!(actor = %activity.actor, target = %target, "ignored a move the target does not confirm");
+        return Ok(());
+    }
+    accounts::set_moved_to(pool, &remote.id, Some(target)).await?;
     Ok(())
 }
 
@@ -720,6 +797,14 @@ pub(crate) async fn ensure_remote_actor(
     if let Some(row) = accounts::by_uri(state.store().pool(), actor_url).await? {
         return Ok(row);
     }
+    fetch_remote_actor(state, actor_url, domain).await
+}
+
+async fn fetch_remote_actor(
+    state: &AppState,
+    actor_url: &str,
+    domain: &str,
+) -> ApiResult<AccountRow> {
     let actor = state
         .fediverse_client()
         .actor_url(actor_url)
@@ -874,7 +959,7 @@ async fn upsert_remote_actor(
 ) -> ApiResult<AccountRow> {
     let display_name = crate::html::escape_text(&actor.name);
     let note = crate::html::sanitize_html(&actor.summary);
-    Ok(accounts::upsert_remote(
+    let row = accounts::upsert_remote(
         state.store().pool(),
         &accounts::RemoteAccount {
             uri: actor_url,
@@ -891,7 +976,12 @@ async fn upsert_remote_actor(
             bot: actor.kind == "Service" || actor.kind == "Application",
         },
     )
-    .await?)
+    .await?;
+    Ok(
+        accounts::set_also_known_as(state.store().pool(), actor_url, &also_known_as(actor))
+            .await?
+            .unwrap_or(row),
+    )
 }
 
 async fn local_target(state: &AppState, actor_url: &str) -> ApiResult<Option<AccountRow>> {
@@ -1659,6 +1749,135 @@ mod tests {
         )
         .await
         .expect("seed remote account")
+    }
+
+    fn move_activity(actor: &str, target: &str) -> Activity {
+        let mut extra = Map::new();
+        extra.insert("target".to_owned(), serde_json::json!(target));
+        Activity {
+            id: Some(format!("{actor}#moves/{}", Id::new())),
+            kind: ActivityKind::Move,
+            actor: actor.to_owned(),
+            object: ActivityObject::Id(actor.to_owned()),
+            to: Vec::new(),
+            cc: Vec::new(),
+            extra,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unverified_move_changes_nothing() {
+        with_isolated_state(|store, state| async move {
+            let mover_uri = "https://old.test/users/a";
+            let target_uri = "https://new.test/users/a";
+            seed_remote(&store, mover_uri).await;
+            seed_remote(&store, target_uri).await;
+            let stranger = "https://stranger.test/users/b".to_owned();
+            accounts::set_also_known_as(store.pool(), target_uri, &[stranger.clone()])
+                .await
+                .expect("seed target aliases");
+
+            ingest_activity(&state, &move_activity(mover_uri, target_uri))
+                .await
+                .expect("ingest move");
+
+            let stored = accounts::by_uri(store.pool(), mover_uri)
+                .await
+                .expect("read mover")
+                .expect("mover row");
+            assert!(stored.moved_to.is_none());
+            let target = accounts::by_uri(store.pool(), target_uri)
+                .await
+                .expect("read target")
+                .expect("target row");
+            assert_eq!(target.also_known_as, vec![stranger]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_move_the_target_acknowledges_is_recorded_without_deleting_anything() {
+        with_isolated_state(|store, state| async move {
+            let mover_uri = "https://old.test/users/a";
+            let target_uri = "https://new.test/users/a";
+            let mover = seed_remote(&store, mover_uri).await;
+            seed_remote(&store, target_uri).await;
+            accounts::set_also_known_as(store.pool(), target_uri, &[mover_uri.to_owned()])
+                .await
+                .expect("seed target aliases");
+            let status_uri = format!("https://old.test/notes/{}", Id::new());
+            statuses::upsert_remote(
+                store.pool(),
+                &statuses::NewRemoteStatus {
+                    id: &Id::new().to_string(),
+                    account_id: &mover.id,
+                    uri: &status_uri,
+                    content: "before the move",
+                    content_html: "<p>before the move</p>",
+                    spoiler_text: "",
+                    sensitive: false,
+                    visibility: "public",
+                    in_reply_to_id: None,
+                    in_reply_to_account_id: None,
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .expect("seed status");
+
+            ingest_activity(&state, &move_activity(mover_uri, target_uri))
+                .await
+                .expect("ingest move");
+
+            let stored = accounts::by_uri(store.pool(), mover_uri)
+                .await
+                .expect("read mover")
+                .expect("mover row");
+            assert_eq!(stored.moved_to.as_deref(), Some(target_uri));
+            assert!(statuses::by_uri(store.pool(), &status_uri)
+                .await
+                .expect("read status")
+                .is_some());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_move_to_an_uncached_actor_is_ignored() {
+        with_isolated_state(|store, state| async move {
+            let mover_uri = "https://old.test/users/a";
+            seed_remote(&store, mover_uri).await;
+            ingest_activity(
+                &state,
+                &move_activity(mover_uri, "https://missing.invalid/users/a"),
+            )
+            .await
+            .expect("an unverifiable move is ignored");
+
+            let stored = accounts::by_uri(store.pool(), mover_uri)
+                .await
+                .expect("read mover")
+                .expect("mover row");
+            assert!(stored.moved_to.is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_move_from_an_uncached_actor_is_rejected() {
+        with_isolated_state(|_store, state| async move {
+            let error = ingest_activity(
+                &state,
+                &move_activity(
+                    "https://missing.invalid/users/a",
+                    "https://new.test/users/a",
+                ),
+            )
+            .await
+            .expect_err("an actor we cannot fetch cannot move");
+            assert!(!error.message().is_empty());
+        })
+        .await;
     }
 
     #[test]
