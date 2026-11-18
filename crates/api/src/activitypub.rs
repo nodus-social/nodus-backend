@@ -769,6 +769,47 @@ pub(crate) async fn status_activity(
     Ok(Activity::create(actor_url(state, account), &note))
 }
 
+/// Who a note is addressed to.
+///
+/// A direct post is addressed to the accounts it names and to nobody else; a private one
+/// reaches the author's followers. Public and unlisted posts put the public collection at
+/// opposite ends of `to`/`cc`, which is how a peer tells them apart.
+fn audience(visibility: &str, actor: &str, mentioned: &[String]) -> (Vec<String>, Vec<String>) {
+    let public = String::from("https://www.w3.org/ns/activitystreams#Public");
+    let followers = format!("{actor}/followers");
+    let mentioned = mentioned.to_vec();
+    match visibility {
+        "public" => (
+            vec![public],
+            std::iter::once(followers).chain(mentioned).collect(),
+        ),
+        "unlisted" => (
+            std::iter::once(followers)
+                .chain(mentioned.clone())
+                .collect(),
+            vec![public],
+        ),
+        "private" => (vec![followers], mentioned),
+        _ => (mentioned, Vec::new()),
+    }
+}
+
+/// The actors named by a status, as `ActivityPub` ids.
+async fn mentioned_actors(state: &AppState, row: &StatusRow) -> Vec<String> {
+    let pool = state.store().pool();
+    let mut actors = Vec::new();
+    for id in statuses::mentions_of(pool, &row.id).await.unwrap_or_default() {
+        match nodus_server_store::accounts::by_id(pool, &id).await {
+            Ok(Some(account)) => actors.push(actor_url(state, &account)),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, mention = %id, "could not read a mentioned account");
+            }
+        }
+    }
+    actors
+}
+
 async fn note_document(state: &AppState, row: &StatusRow, account: &AccountRow) -> ApiResult<Note> {
     let actor = actor_url(state, account);
     let id = status_url(state, row);
@@ -778,17 +819,8 @@ async fn note_document(state: &AppState, row: &StatusRow, account: &AccountRow) 
             .map(|parent| status_url(state, &parent)),
         None => None,
     };
-    let (to, cc) = match row.visibility.as_str() {
-        "public" => (
-            vec![String::from("https://www.w3.org/ns/activitystreams#Public")],
-            vec![format!("{actor}/followers")],
-        ),
-        "unlisted" => (
-            vec![format!("{actor}/followers")],
-            vec![String::from("https://www.w3.org/ns/activitystreams#Public")],
-        ),
-        _ => return Err(ApiError::not_found("Record not found")),
-    };
+    let mentioned = mentioned_actors(state, row).await;
+    let (to, cc) = audience(row.visibility.as_str(), &actor, &mentioned);
     let media = nodus_server_store::media::by_status(state.store().pool(), &row.id).await?;
     let attachments = media
         .iter()
@@ -824,7 +856,7 @@ async fn note_document(state: &AppState, row: &StatusRow, account: &AccountRow) 
         attributed_to: Some(actor),
         to,
         cc,
-        mentions: Vec::new(),
+        mentions: mentioned,
         extra: Map::default(),
     })
 }
@@ -967,6 +999,40 @@ fn document_response<D: Document>(document: &D) -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_public_note_addresses_the_world_and_its_followers() {
+        let actor = "https://social.test/users/ada";
+        let (to, cc) = super::audience("public", actor, &[]);
+        assert_eq!(to, vec!["https://www.w3.org/ns/activitystreams#Public"]);
+        assert_eq!(cc, vec![format!("{actor}/followers")]);
+    }
+
+    #[test]
+    fn a_direct_note_addresses_only_the_people_it_names() {
+        let actor = "https://social.test/users/ada";
+        let mentioned = vec!["https://mastodon.test/users/eve".to_owned()];
+        let (to, cc) = super::audience("direct", actor, &mentioned);
+        assert_eq!(to, mentioned);
+        assert!(cc.is_empty());
+    }
+
+    #[test]
+    fn a_private_note_reaches_followers_and_names_its_mentions() {
+        let actor = "https://social.test/users/ada";
+        let mentioned = vec!["https://mastodon.test/users/eve".to_owned()];
+        let (to, cc) = super::audience("private", actor, &mentioned);
+        assert_eq!(to, vec![format!("{actor}/followers")]);
+        assert_eq!(cc, mentioned);
+    }
+
+    #[test]
+    fn an_unlisted_note_keeps_the_public_collection_out_of_to() {
+        let actor = "https://social.test/users/ada";
+        let (to, cc) = super::audience("unlisted", actor, &[]);
+        assert_eq!(to, vec![format!("{actor}/followers")]);
+        assert_eq!(cc, vec!["https://www.w3.org/ns/activitystreams#Public"]);
+    }
     use super::*;
     use nodus_server_core::Id;
     use nodus_server_store::Store;

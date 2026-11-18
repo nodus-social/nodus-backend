@@ -108,17 +108,34 @@ async fn follower_inboxes(state: &AppState, account_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The inboxes of the accounts a post names, so a reply reaches the person replied to.
+async fn mention_inboxes(
+    state: &AppState,
+    row: &nodus_server_store::statuses::StatusRow,
+) -> Vec<String> {
+    let pool = state.store().pool();
+    let mut inboxes = Vec::new();
+    for id in nodus_server_store::statuses::mentions_of(pool, &row.id)
+        .await
+        .unwrap_or_default()
+    {
+        match nodus_server_store::delivery::inbox_of(pool, &id).await {
+            Ok(Some(inbox)) => inboxes.push(inbox),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, mention = %id, "could not read a mention's inbox"),
+        }
+    }
+    inboxes
+}
+
 /// Announces a new post to the author's followers.
 pub async fn deliver_create(
     state: &AppState,
     account_id: &str,
     row: &nodus_server_store::statuses::StatusRow,
 ) {
-    // A direct or private post has no audience an ActivityPub peer would understand, and a
-    // reply is delivered by the mention fan-out instead of the follower list.
-    if !matches!(row.visibility.as_str(), "public" | "unlisted") {
-        return;
-    }
+    // A direct post is delivered to the accounts it names and to nobody else; everything
+    // else also reaches the followers the peer knows about.
     let account = match nodus_server_store::accounts::by_id(state.store().pool(), account_id).await
     {
         Ok(Some(account)) => account,
@@ -146,7 +163,14 @@ pub async fn deliver_create(
             return;
         }
     };
-    let inboxes = follower_inboxes(state, account_id).await;
+    let mut inboxes = if row.visibility == "direct" {
+        Vec::new()
+    } else {
+        follower_inboxes(state, account_id).await
+    };
+    inboxes.extend(mention_inboxes(state, row).await);
+    inboxes.sort_unstable();
+    inboxes.dedup();
     enqueue(state, account_id, value, inboxes).await;
 }
 
