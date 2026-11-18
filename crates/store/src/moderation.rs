@@ -7,7 +7,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgConnection, PgPool};
 
 use nodus_server_core::Id;
 
@@ -134,6 +134,16 @@ pub async fn assign_report(
     id: &str,
     account_id: Option<&str>,
 ) -> Result<Option<ReportRow>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    assign_report_in(&mut conn, id, account_id).await
+}
+
+/// The same assignment on a caller-owned connection, so a batch can share a transaction.
+pub async fn assign_report_in(
+    conn: &mut PgConnection,
+    id: &str,
+    account_id: Option<&str>,
+) -> Result<Option<ReportRow>, sqlx::Error> {
     let sql = format!(
         "UPDATE report SET assigned_account_id = $2, updated_at = now() WHERE id = $1 \
          RETURNING {REPORT_COLUMNS}"
@@ -141,13 +151,24 @@ pub async fn assign_report(
     sqlx::query_as(&sql)
         .bind(id)
         .bind(account_id)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await
 }
 
 /// Closes a report as actioned, recording who decided and why.
 pub async fn resolve_report(
     pool: &PgPool,
+    id: &str,
+    actor_id: &str,
+    note: &str,
+) -> Result<Option<ReportRow>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    resolve_report_in(&mut conn, id, actor_id, note).await
+}
+
+/// The same resolution on a caller-owned connection, so a batch can share a transaction.
+pub async fn resolve_report_in(
+    conn: &mut PgConnection,
     id: &str,
     actor_id: &str,
     note: &str,
@@ -161,23 +182,46 @@ pub async fn resolve_report(
         .bind(id)
         .bind(actor_id)
         .bind(note)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await
 }
 
 /// Reopens a closed report and clears the decision it recorded, so the queue never
 /// shows a resolved decision on an open case.
 pub async fn reopen_report(pool: &PgPool, id: &str) -> Result<Option<ReportRow>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    reopen_report_in(&mut conn, id).await
+}
+
+/// The same reopen on a caller-owned connection, so a batch can share a transaction.
+pub async fn reopen_report_in(
+    conn: &mut PgConnection,
+    id: &str,
+) -> Result<Option<ReportRow>, sqlx::Error> {
     let sql = format!(
         "UPDATE report SET state = 'open', action_taken = false, action_taken_note = '', \
              action_taken_by_account_id = NULL, action_taken_at = NULL, updated_at = now() \
          WHERE id = $1 RETURNING {REPORT_COLUMNS}"
     );
-    sqlx::query_as(&sql).bind(id).fetch_optional(pool).await
+    sqlx::query_as(&sql).bind(id).fetch_optional(conn).await
 }
 
 pub async fn audit(
     pool: &PgPool,
+    actor_id: &str,
+    action: &str,
+    target_type: &str,
+    target_id: Option<&str>,
+    detail: &Value,
+) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    audit_in(&mut conn, actor_id, action, target_type, target_id, detail).await
+}
+
+/// The same audit row on a caller-owned connection, so an action and its entry commit
+/// or roll back together.
+pub async fn audit_in(
+    conn: &mut PgConnection,
     actor_id: &str,
     action: &str,
     target_type: &str,
@@ -194,7 +238,7 @@ pub async fn audit(
     .bind(target_type)
     .bind(target_id)
     .bind(detail)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(())
 }
@@ -215,6 +259,10 @@ pub struct AuditFilter<'a> {
     pub action: Option<&'a str>,
     pub target_type: Option<&'a str>,
     pub actor_id: Option<&'a str>,
+    /// Inclusive lower bound on `created_at`, for the export window.
+    pub since: Option<DateTime<Utc>>,
+    /// Inclusive upper bound on `created_at`.
+    pub until: Option<DateTime<Utc>>,
     pub limit: i64,
     pub offset: i64,
 }
@@ -229,11 +277,15 @@ pub async fn audit_page(
          WHERE ($1::text IS NULL OR action = $1) \
              AND ($2::text IS NULL OR target_type = $2) \
              AND ($3::text IS NULL OR actor_id = $3) \
-         ORDER BY created_at DESC LIMIT $4 OFFSET $5",
+             AND ($4::timestamptz IS NULL OR created_at >= $4) \
+             AND ($5::timestamptz IS NULL OR created_at <= $5) \
+         ORDER BY created_at DESC, id DESC LIMIT $6 OFFSET $7",
     )
     .bind(filter.action)
     .bind(filter.target_type)
     .bind(filter.actor_id)
+    .bind(filter.since)
+    .bind(filter.until)
     .bind(filter.limit)
     .bind(filter.offset)
     .fetch_all(pool)
@@ -499,6 +551,15 @@ pub async fn admin_account(
     pool: &PgPool,
     id: &str,
 ) -> Result<Option<AdminAccountRow>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    admin_account_in(&mut conn, id).await
+}
+
+/// The same lookup on a caller-owned connection, so a batch can read inside its transaction.
+pub async fn admin_account_in(
+    conn: &mut PgConnection,
+    id: &str,
+) -> Result<Option<AdminAccountRow>, sqlx::Error> {
     let sql = format!(
         "SELECT {ACCOUNT_COLUMNS_ALIASED}, c.email::text AS email, \
              (SELECT count(*) FROM report r \
@@ -508,7 +569,7 @@ pub async fn admin_account(
          LEFT JOIN account_credential c ON c.account_id = a.id \
          WHERE a.id = $1"
     );
-    sqlx::query_as(&sql).bind(id).fetch_optional(pool).await
+    sqlx::query_as(&sql).bind(id).fetch_optional(conn).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -554,6 +615,16 @@ pub async fn apply_action(
     account_id: &str,
     action: Action,
 ) -> Result<Option<AccountRow>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    apply_action_in(&mut conn, account_id, action).await
+}
+
+/// The same enforcement on a caller-owned connection, so a batch can share a transaction.
+pub async fn apply_action_in(
+    conn: &mut PgConnection,
+    account_id: &str,
+    action: Action,
+) -> Result<Option<AccountRow>, sqlx::Error> {
     let set_clause = match action {
         Action::Approve | Action::Enable => {
             "approved = true, silenced_at = NULL, suspended_at = NULL"
@@ -567,7 +638,7 @@ pub async fn apply_action(
     let sql = format!("UPDATE account SET {set_clause} WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}");
     sqlx::query_as::<_, AccountRow>(&sql)
         .bind(account_id)
-        .fetch_optional(pool)
+        .fetch_optional(conn)
         .await
 }
 

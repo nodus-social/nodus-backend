@@ -24,6 +24,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 use super::{audit_write_detail, offset, page};
+use super::{check_batch, BulkFailure, BulkItemDto, BulkResponseDto};
 
 #[derive(Debug, Serialize)]
 pub struct AdminAccountDto {
@@ -538,9 +539,119 @@ async fn purge(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BulkActionForm {
+    /// The accounts the moderator selected. Order is preserved in the results.
+    #[serde(default)]
+    ids: Vec<String>,
+    /// `action` is the console's spelling; `type` is what the single-account endpoint and
+    /// Mastodon clients send. Both mean the same thing.
+    #[serde(rename = "action", alias = "type")]
+    kind: String,
+    #[serde(default, alias = "text")]
+    reason: String,
+    /// Accepted for compatibility; this instance does not send mail yet.
+    #[serde(default, alias = "send_email_notification")]
+    notify: bool,
+}
+
+/// One id's outcome, applied on the request's own transaction.
+async fn apply_bulk_one(
+    conn: &mut sqlx::PgConnection,
+    auth: &Auth,
+    id: &str,
+    action: Action,
+    reason: &str,
+    notify: bool,
+) -> Result<(), BulkFailure> {
+    let Some(target) = moderation::admin_account_in(conn, id).await? else {
+        return Err(BulkFailure::Rejected(
+            "that account does not exist".to_owned(),
+        ));
+    };
+    // The same refusals as the single-row path: those are decisions about one account,
+    // so they belong in that account's result rather than failing the other 199.
+    if target.account.id == auth.0.account.id && action != Action::Enable {
+        return Err(BulkFailure::Rejected(
+            "you cannot take that action against your own account".to_owned(),
+        ));
+    }
+    if target.account.admin && matches!(action, Action::Suspend | Action::Silence | Action::Reject)
+    {
+        return Err(BulkFailure::Rejected(
+            "demote an administrator before taking action against them".to_owned(),
+        ));
+    }
+    if moderation::apply_action_in(conn, id, action)
+        .await?
+        .is_none()
+    {
+        return Err(BulkFailure::Rejected(
+            "that account does not exist".to_owned(),
+        ));
+    }
+    moderation::audit_in(
+        conn,
+        &auth.0.account.id,
+        &format!("account_{}", action.as_str()),
+        "account",
+        Some(id),
+        &json!({
+            "type": action.as_str(),
+            "text": reason,
+            "report_id": null,
+            "email": notify,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// `POST /api/v1/admin/accounts/bulk` — one action against many accounts.
+///
+/// One transaction, one audit row per applied account, and a result per id: a moderator
+/// who selected 200 accounts needs to know which three did not go through, not just that
+/// the request was rejected.
+async fn bulk_action(
+    State(state): State<AppState>,
+    auth: Auth,
+    Body(form): Body<BulkActionForm>,
+) -> ApiResult<Json<BulkResponseDto>> {
+    auth.require_admin("admin:write")?;
+    check_batch(&form.ids, "account")?;
+    let action = Action::parse(form.kind.trim())
+        .ok_or_else(|| ApiError::unprocessable(format!("unknown action: {}", form.kind)))?;
+    let reason = form.reason.trim();
+    let mut tx = state.store().pool().begin().await?;
+    let mut results = Vec::with_capacity(form.ids.len());
+    let mut applied = 0i64;
+    for id in &form.ids {
+        match apply_bulk_one(&mut tx, &auth, id, action, reason, form.notify).await {
+            Ok(()) => {
+                applied += 1;
+                results.push(BulkItemDto {
+                    id: id.clone(),
+                    ok: true,
+                    error: None,
+                });
+            }
+            Err(BulkFailure::Rejected(message)) => results.push(BulkItemDto {
+                id: id.clone(),
+                ok: false,
+                error: Some(message),
+            }),
+            // Dropping the transaction rolls back every id already applied.
+            Err(BulkFailure::Database(error)) => return Err(error.into()),
+        }
+    }
+    tx.commit().await?;
+    Ok(Json(BulkResponseDto { results, applied }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/admin/accounts", get(list))
+        .route("/api/v1/admin/accounts/bulk", post(bulk_action))
         .route("/api/v2/admin/accounts", get(pending))
         .route("/api/v1/admin/accounts/{id}", get(detail).delete(purge))
         .route("/api/v1/admin/accounts/{id}/action", post(action))

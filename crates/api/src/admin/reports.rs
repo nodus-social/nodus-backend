@@ -21,6 +21,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 use super::{audit_write_detail, offset, page};
+use super::{check_batch, BulkFailure, BulkItemDto, BulkResponseDto};
 
 #[derive(Debug, Serialize)]
 pub struct ReportDto {
@@ -292,9 +293,135 @@ async fn create(
     Ok(Json(report_dto(&state, row).await?))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BulkReportForm {
+    #[serde(default)]
+    ids: Vec<String>,
+    action: String,
+    /// Required by `assign`, ignored otherwise; `null` leaves the report unclaimed.
+    assignee_id: Option<String>,
+    /// The decision's reason, recorded exactly as the single-report route records it.
+    #[serde(default)]
+    note: String,
+}
+
+/// Applies one queue action and writes its audit row on the request's transaction.
+async fn apply_bulk_report(
+    conn: &mut sqlx::PgConnection,
+    auth: &Auth,
+    id: &str,
+    action: &str,
+    assignee: Option<&str>,
+    note: &str,
+) -> Result<(), BulkFailure> {
+    let missing = || BulkFailure::Rejected("that report does not exist".to_owned());
+    let (audit_action, detail) = match action {
+        "assign" => {
+            if moderation::assign_report_in(conn, id, assignee)
+                .await?
+                .is_none()
+            {
+                return Err(missing());
+            }
+            ("assign_report", json!({ "account_id": assignee }))
+        }
+        "resolve" => {
+            let reviewer = auth.0.account.id.clone();
+            if moderation::resolve_report_in(conn, id, &reviewer, note)
+                .await?
+                .is_none()
+            {
+                return Err(missing());
+            }
+            let audit_action = if note.is_empty() {
+                "resolve_report"
+            } else {
+                "resolve_report_with_note"
+            };
+            (audit_action, json!({ "note": note }))
+        }
+        _ => {
+            if moderation::reopen_report_in(conn, id).await?.is_none() {
+                return Err(missing());
+            }
+            ("reopen_report", json!({}))
+        }
+    };
+    moderation::audit_in(
+        conn,
+        &auth.0.account.id,
+        audit_action,
+        "report",
+        Some(id),
+        &detail,
+    )
+    .await?;
+    Ok(())
+}
+
+/// `POST /api/v1/admin/reports/bulk` — claim, close or reopen a selection of reports.
+///
+/// Same contract as the account batch: one transaction, per-id results, one audit row per
+/// report actually changed. An unknown assignee is a request-level mistake (422) because
+/// it is the same person for every id in the batch.
+async fn bulk_reports(
+    State(state): State<AppState>,
+    auth: Auth,
+    Json(form): Json<BulkReportForm>,
+) -> ApiResult<Json<BulkResponseDto>> {
+    auth.require_admin("admin:write")?;
+    check_batch(&form.ids, "report")?;
+    let action = form.action.trim();
+    if !matches!(action, "assign" | "resolve" | "reopen") {
+        return Err(ApiError::unprocessable(format!(
+            "unknown report action: {action}; use assign, resolve or reopen"
+        )));
+    }
+    let assignee = form
+        .assignee_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if action == "assign" {
+        if let Some(assignee) = assignee {
+            let exists = accounts::by_id(state.store().pool(), assignee)
+                .await?
+                .is_some();
+            if !exists {
+                return Err(ApiError::unprocessable("that account does not exist"));
+            }
+        }
+    }
+    let note = form.note.trim();
+    let mut tx = state.store().pool().begin().await?;
+    let mut results = Vec::with_capacity(form.ids.len());
+    let mut applied = 0i64;
+    for id in &form.ids {
+        match apply_bulk_report(&mut tx, &auth, id, action, assignee, note).await {
+            Ok(()) => {
+                applied += 1;
+                results.push(BulkItemDto {
+                    id: id.clone(),
+                    ok: true,
+                    error: None,
+                });
+            }
+            Err(BulkFailure::Rejected(message)) => results.push(BulkItemDto {
+                id: id.clone(),
+                ok: false,
+                error: Some(message),
+            }),
+            Err(BulkFailure::Database(error)) => return Err(error.into()),
+        }
+    }
+    tx.commit().await?;
+    Ok(Json(BulkResponseDto { results, applied }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/admin/reports", get(list))
+        .route("/api/v1/admin/reports/bulk", post(bulk_reports))
         .route("/api/v1/admin/reports/{id}", get(detail))
         .route("/api/v1/admin/reports/{id}/resolve", post(resolve))
         .route("/api/v1/admin/reports/{id}/reopen", post(reopen))

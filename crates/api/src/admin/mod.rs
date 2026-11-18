@@ -14,11 +14,13 @@ mod reports;
 mod scanners;
 mod topology;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::Response;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use nodus_server_core::limits::PAGE_MAX;
@@ -80,6 +82,59 @@ where
         };
         decoded.map(Self)
     }
+}
+
+/// The largest batch one moderation request may carry.
+///
+/// A moderator selects a page of names; a request that looks like a table dump is refused
+/// rather than held open for minutes, because a transaction that long blocks everyone.
+pub(super) const BULK_LIMIT: usize = 500;
+
+/// Why one id in a batch did not go through.
+///
+/// A rejected id is a fact about that id — usually that it does not exist — and belongs in
+/// the per-id results. A database failure is a fact about the request, so it aborts the
+/// transaction and the whole batch rolls back.
+pub(super) enum BulkFailure {
+    Rejected(String),
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for BulkFailure {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct BulkItemDto {
+    pub id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct BulkResponseDto {
+    pub results: Vec<BulkItemDto>,
+    pub applied: i64,
+}
+
+/// Refuses an empty or oversized batch before anything is touched.
+pub(super) fn check_batch(ids: &[String], what: &str) -> ApiResult<()> {
+    if ids.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("a batch needs at least one {what} id"),
+        ));
+    }
+    if ids.len() > BULK_LIMIT {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("a batch may name at most {BULK_LIMIT} {what} ids"),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -327,8 +382,25 @@ pub struct AuditQuery {
     action: Option<String>,
     target_type: Option<String>,
     actor_id: Option<String>,
+    /// RFC 3339. Inclusive, and honest about the zone or it is a 422.
+    since: Option<String>,
+    until: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+/// Turns an optional query timestamp into a bound the database can compare against.
+fn timestamp(value: Option<&str>, field: &str) -> ApiResult<Option<DateTime<Utc>>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(value) => DateTime::parse_from_rfc3339(value)
+            .map(|at| Some(at.with_timezone(&Utc)))
+            .map_err(|_| {
+                ApiError::unprocessable(format!(
+                    "{field} must be an RFC 3339 timestamp, like 2024-01-31T12:00:00Z"
+                ))
+            }),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -354,6 +426,8 @@ async fn audit(
             action: query.action.as_deref(),
             target_type: query.target_type.as_deref(),
             actor_id: query.actor_id.as_deref(),
+            since: timestamp(query.since.as_deref(), "since")?,
+            until: timestamp(query.until.as_deref(), "until")?,
             limit: page(query.limit),
             offset: offset(query.offset),
         },
@@ -372,6 +446,153 @@ async fn audit(
             })
             .collect(),
     ))
+}
+
+// ---------------------------------------------------------------------------------------
+// Audit export
+// ---------------------------------------------------------------------------------------
+
+/// How much audit history one streamed chunk carries. The export is meant to open in a
+/// spreadsheet, not to sit in a `String`: each page is formatted as it is read and dropped
+/// as soon as the body has it.
+const AUDIT_CSV_PAGE: i64 = 500;
+
+/// One CSV cell.
+///
+/// RFC 4180 quoting, applied only when the value would otherwise break the row: a reason
+/// is free text, and a comma or a newline in it must stay inside the column it belongs to.
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// The human-readable reason out of an audit detail, for the column a moderator scans.
+fn audit_reason(detail: &serde_json::Value) -> &str {
+    ["text", "note", "reason", "comment"]
+        .iter()
+        .find_map(|key| detail.get(*key).and_then(serde_json::Value::as_str))
+        .unwrap_or("")
+}
+
+fn csv_row(row: &moderation::AuditRow) -> String {
+    let detail = row.detail.to_string();
+    let cells = [
+        csv_cell(&row.id),
+        csv_cell(&row.created_at.to_rfc3339()),
+        csv_cell(row.actor_id.as_deref().unwrap_or("")),
+        csv_cell(&row.action),
+        csv_cell(&row.target_type),
+        csv_cell(row.target_id.as_deref().unwrap_or("")),
+        csv_cell(audit_reason(&row.detail)),
+        csv_cell(&detail),
+    ];
+    let mut line = cells.join(",");
+    line.push_str("\r\n");
+    line
+}
+
+/// The state the stream carries between chunks: the filter, and how far it has read.
+struct CsvCursor {
+    pool: sqlx::PgPool,
+    action: Option<String>,
+    target_type: Option<String>,
+    actor_id: Option<String>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    offset: i64,
+    header_sent: bool,
+    done: bool,
+}
+
+/// `GET /api/v1/admin/audit.csv` — the audit trail as a file.
+///
+/// The same filters as the JSON route, plus a time window, and the same `admin:read`
+/// grant. The header is the first chunk; every page after it is one more chunk.
+async fn audit_csv(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Response> {
+    auth.require_admin("admin:read")?;
+    let cursor = CsvCursor {
+        pool: state.store().pool().clone(),
+        action: query.action,
+        target_type: query.target_type,
+        actor_id: query.actor_id,
+        since: timestamp(query.since.as_deref(), "since")?,
+        until: timestamp(query.until.as_deref(), "until")?,
+        offset: 0,
+        header_sent: false,
+        done: false,
+    };
+    let stream = futures_util::stream::unfold(cursor, |mut cursor| async move {
+        if !cursor.header_sent {
+            cursor.header_sent = true;
+            let header = "id,created_at,actor_id,action,target_type,target_id,reason,detail\r\n";
+            return Some((
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(header.as_bytes())),
+                cursor,
+            ));
+        }
+        if cursor.done {
+            return None;
+        }
+        let rows = moderation::audit_page(
+            &cursor.pool,
+            &AuditFilter {
+                action: cursor.action.as_deref(),
+                target_type: cursor.target_type.as_deref(),
+                actor_id: cursor.actor_id.as_deref(),
+                since: cursor.since,
+                until: cursor.until,
+                limit: AUDIT_CSV_PAGE,
+                offset: cursor.offset,
+            },
+        )
+        .await;
+        match rows {
+            // A failed read has to break the transfer: a stream that ends quietly would
+            // hand the console a truncated file that looks complete.
+            Err(error) => {
+                tracing::error!(error = %error, "audit export read failed");
+                Some((
+                    Err::<Bytes, std::io::Error>(std::io::Error::other("audit export read failed")),
+                    cursor,
+                ))
+            }
+            Ok(rows) if rows.is_empty() => None,
+            Ok(rows) => {
+                if i64::try_from(rows.len()).unwrap_or(i64::MAX) < AUDIT_CSV_PAGE {
+                    cursor.done = true;
+                }
+                cursor.offset += i64::try_from(rows.len()).unwrap_or(i64::MAX);
+                let mut chunk = String::new();
+                for row in &rows {
+                    chunk.push_str(&csv_row(row));
+                }
+                Some((Ok::<Bytes, std::io::Error>(Bytes::from(chunk)), cursor))
+            }
+        }
+    });
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"audit.csv\"",
+        )
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|error| {
+            tracing::error!(error = %error, "audit export response failed");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not build the export",
+            )
+        })?;
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -652,6 +873,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/admin/overview", get(overview))
         .route("/api/v1/admin/measures", get(measures))
         .route("/api/v1/admin/audit", get(audit))
+        .route("/api/v1/admin/audit.csv", get(audit_csv))
         .route("/api/v1/admin/alerts", get(alerts_list))
         .route("/api/v1/admin/alerts/{id}/ack", post(alert_acknowledge))
         .route("/api/v1/admin/accounts/{id}/lossless", post(set_lossless))
