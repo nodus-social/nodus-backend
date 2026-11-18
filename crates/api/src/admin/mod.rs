@@ -110,8 +110,14 @@ pub struct ScanSummaryDto {
 #[derive(Debug, Serialize)]
 pub struct MetaDto {
     pub account: AccountDto,
-    /// The account behind the grant is an administrator, not merely a moderator.
+    /// Whether the account behind the grant is staff at all.
+    ///
+    /// The console's navigation rail asks one question — show the moderation doors or not —
+    /// and a moderator and an administrator both answer yes. `role` below is which of those
+    /// doors actually opens; the two fields exist because a boolean cannot say "moderator".
     pub staff: bool,
+    /// `moderator` or `admin` for staff, `none` otherwise.
+    pub role: String,
     pub scopes: Vec<String>,
     pub counts: CountsDto,
     pub domain: String,
@@ -158,7 +164,8 @@ async fn meta(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<MetaD
     }
     Ok(Json(MetaDto {
         account: AccountDto::from_row(&auth.0.account, state.instance()),
-        staff: auth.0.account.admin,
+        staff: auth.0.account.staff_role != "none",
+        role: auth.0.account.staff_role.clone(),
         scopes: auth.0.scopes.clone(),
         counts: CountsDto {
             open_reports: overview.open_reports,
@@ -491,7 +498,7 @@ async fn create_warning(
     auth: Auth,
     Json(form): Json<WarningForm>,
 ) -> ApiResult<Json<WarningPresetDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let title = form.title.trim();
     if title.is_empty() || form.text.trim().is_empty() {
         return Err(ApiError::unprocessable("a preset needs a title and a text"));
@@ -515,7 +522,7 @@ async fn update_warning(
     Path(id): Path<String>,
     Json(form): Json<WarningForm>,
 ) -> ApiResult<Json<WarningPresetDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let row = moderation::update_warning_preset(
         state.store().pool(),
         &id,
@@ -540,7 +547,7 @@ async fn delete_warning(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     if !moderation::delete_warning_preset(state.store().pool(), &id).await? {
         return Err(ApiError::not_found("that preset does not exist"));
     }
@@ -619,7 +626,7 @@ async fn set_lossless(
     Path(id): Path<String>,
     Json(body): Json<LosslessBody>,
 ) -> ApiResult<StatusCode> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let changed = nodus_server_store::accounts::set_lossless_permissions(
         state.store().pool(),
         &id,

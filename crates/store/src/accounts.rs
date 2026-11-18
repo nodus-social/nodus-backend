@@ -44,6 +44,9 @@ pub struct AccountRow {
     pub discoverable: bool,
     pub indexable: bool,
     pub admin: bool,
+    /// `none`, `moderator` or `admin`. The role decides which doors open; the token's
+    /// scopes say what may be done once one does. `admin` above is kept as its mirror.
+    pub staff_role: String,
     pub approved: bool,
     pub lossless_images_default: bool,
     pub lossless_videos_default: bool,
@@ -62,13 +65,13 @@ pub struct AccountRow {
 
 pub(crate) const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS username, a.domain::text AS domain, \
      a.display_name, a.note, a.avatar_ref, a.header_ref, a.avatar_url, a.header_url, a.fields, a.client_metadata, a.locked, a.bot, a.local, a.uri, \
-     a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.approved, \
+     a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.staff_role, a.approved, \
      a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
      a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.moved_to, a.also_known_as, a.created_at";
 
 pub(crate) const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
      display_name, note, avatar_ref, header_ref, avatar_url, header_url, fields, client_metadata, locked, bot, local, uri, \
-     inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, approved, \
+     inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, staff_role, approved, \
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \
      lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, moved_to, also_known_as, created_at";
 
@@ -392,17 +395,47 @@ pub async fn set_media_preferences(
 }
 
 /// Grant or revoke administrator access.
+///
+/// The boolean is no longer the grant: it mirrors the role, so granting means
+/// administrator and revoking means no staff role at all.
 pub async fn set_admin<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     id: &str,
     admin: bool,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE account SET admin = $2 WHERE id = $1")
-        .bind(id)
-        .bind(admin)
-        .execute(executor)
-        .await?;
+    let result = sqlx::query(
+        "UPDATE account SET admin = $2, \
+             staff_role = CASE WHEN $2 THEN 'admin' ELSE 'none' END \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(admin)
+    .execute(executor)
+    .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Sets the staff role and keeps the `admin` mirror in step.
+pub async fn set_staff_role<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    id: &str,
+    role: &str,
+) -> Result<bool, sqlx::Error> {
+    let result =
+        sqlx::query("UPDATE account SET admin = $2 <> 'none', staff_role = $2 WHERE id = $1")
+            .bind(id)
+            .bind(role)
+            .execute(executor)
+            .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// How many accounts hold a role, used to refuse the last administrator's demotion.
+pub async fn count_role(pool: &PgPool, role: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*)::bigint FROM account WHERE staff_role = $1")
+        .bind(role)
+        .fetch_one(pool)
+        .await
 }
 
 /// Limit or grant lossless uploads per media kind.

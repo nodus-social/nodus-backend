@@ -574,12 +574,16 @@ pub async fn apply_action(
 /// Grants or revokes the staff flag. Kept apart from [`apply_action`] because it is the
 /// one account change that can lock the console's own operators out.
 pub async fn set_staff(pool: &PgPool, account_id: &str, staff: bool) -> Result<bool, sqlx::Error> {
-    Ok(sqlx::query("UPDATE account SET admin = $2 WHERE id = $1")
-        .bind(account_id)
-        .bind(staff)
-        .execute(pool)
-        .await?
-        .rows_affected()
+    Ok(sqlx::query(
+        "UPDATE account SET admin = $2, \
+             staff_role = CASE WHEN $2 THEN 'admin' ELSE 'none' END \
+         WHERE id = $1",
+    )
+    .bind(account_id)
+    .bind(staff)
+    .execute(pool)
+    .await?
+    .rows_affected()
         == 1)
 }
 

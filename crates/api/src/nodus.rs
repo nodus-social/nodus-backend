@@ -33,7 +33,29 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/nodus/sync/root", get(root))
         .route("/api/v1/nodus/sync/diff", post(diff))
         .route("/api/v1/nodus/sync/snapshot", get(snapshot))
+        .route("/api/v1/nodus/account/role", get(account_role))
         .merge(crate::client_metadata::router())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AccountRoleDto {
+    /// `none`, `moderator` or `admin`.
+    role: String,
+    /// What this particular token may do, which can be narrower than the role: an
+    /// administrator whose token only asked for `read` cannot write with it either.
+    scopes: Vec<String>,
+}
+
+/// Which door this account walks through, so a console can offer the right one before it
+/// tries an admin route at all.
+///
+/// Any signed-in account may ask: a plain user is told `none` and to ask an administrator,
+/// rather than being walked into a permission error that only a database edit could fix.
+async fn account_role(auth: Auth) -> Json<AccountRoleDto> {
+    Json(AccountRoleDto {
+        role: auth.0.account.staff_role.clone(),
+        scopes: auth.0.scopes.clone(),
+    })
 }
 
 enum AuthorizedCollection<'a> {

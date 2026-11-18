@@ -7,14 +7,15 @@
 //! its reason is a decision nobody can review later.
 
 use axum::extract::{Path, Query, State};
-use axum::routing::{delete, get, post};
+use axum::http::StatusCode;
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use nodus_server_store::moderation::{self, AccountFilter, Action, AdminAccountRow};
-use nodus_server_store::scanners;
+use nodus_server_store::{accounts, scanners};
 
 use super::Body;
 use crate::auth::Auth;
@@ -39,6 +40,9 @@ pub struct AdminAccountDto {
     pub suspended: bool,
     pub disabled: bool,
     pub admin: bool,
+    /// `none`, `moderator` or `admin` — which door this account walks through. `admin`
+    /// above stays for clients that only understand the boolean.
+    pub role: String,
     pub created_at: DateTime<Utc>,
     pub open_reports: i64,
     pub notes_count: i64,
@@ -64,6 +68,7 @@ impl AdminAccountDto {
             suspended: row.account.suspended_at.is_some(),
             disabled: !row.account.approved,
             admin: row.account.admin,
+            role: row.account.staff_role,
             created_at: row.account.created_at,
             open_reports: row.open_reports,
             notes_count: row.notes,
@@ -358,13 +363,68 @@ pub struct StaffBody {
     staff: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RoleBody {
+    role: String,
+}
+
+/// Changes a staff account's role, mirroring the legacy `admin` boolean in the same write.
+///
+/// The last administrator cannot be demoted: an instance whose only administrator became
+/// a moderator would have nobody left who could appoint one, and no way to fix it from
+/// the console.
+async fn set_role(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    Body(body): Body<RoleBody>,
+) -> ApiResult<Json<AdminAccountDto>> {
+    auth.require_administrator("admin:write")?;
+    let role = body.role.trim();
+    if !matches!(role, "none" | "moderator" | "admin") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "role must be none, moderator or admin",
+        ));
+    }
+    let target = moderation::admin_account(state.store().pool(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
+    let previous = target.account.staff_role.clone();
+    if previous == "admin" && role != "admin" {
+        let administrators = accounts::count_role(state.store().pool(), "admin").await?;
+        if administrators <= 1 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "the last administrator cannot be demoted; appoint another administrator first",
+            ));
+        }
+    }
+    if !accounts::set_staff_role(state.store().pool(), &id, role).await? {
+        return Err(ApiError::not_found("that account does not exist"));
+    }
+    audit_write_detail(
+        &state,
+        &auth,
+        "change_staff_role",
+        "account",
+        &id,
+        json!({ "previous_role": previous, "role": role }),
+    )
+    .await?;
+    let row = moderation::admin_account(state.store().pool(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
+    Ok(Json(AdminAccountDto::from_row(row, &state)))
+}
+
 async fn staff(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
     Json(body): Json<StaffBody>,
 ) -> ApiResult<Json<AdminAccountDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let target = moderation::admin_account(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
@@ -487,6 +547,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/admin/accounts/{id}/approve", post(approve))
         .route("/api/v1/admin/accounts/{id}/reject", post(reject))
         .route("/api/v1/admin/accounts/{id}/staff", post(staff))
+        .route("/api/v1/admin/accounts/{id}/role", put(set_role))
         .route("/api/v1/admin/accounts/{id}/notes", post(add_note))
         .route(
             "/api/v1/admin/accounts/{id}/notes/{note_id}",

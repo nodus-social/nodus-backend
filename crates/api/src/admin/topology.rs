@@ -245,7 +245,7 @@ async fn trigger(
     Path(name): Path<String>,
     Json(body): Json<TriggerBody>,
 ) -> ApiResult<Json<TriggerDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let target = targets()
         .iter()
         .find(|target| target.name() == name)

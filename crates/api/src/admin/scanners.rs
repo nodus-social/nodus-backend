@@ -144,7 +144,7 @@ impl ScannerForm {
 }
 
 async fn list(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<ScannerDto>>> {
-    auth.require_admin("admin:read")?;
+    auth.require_administrator("admin:read")?;
     let mut out = Vec::new();
     for row in scanners::scanners(state.store().pool()).await? {
         out.push(scanner_dto(&state, row).await?);
@@ -157,7 +157,7 @@ async fn show(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ScannerDto>> {
-    auth.require_admin("admin:read")?;
+    auth.require_administrator("admin:read")?;
     let row = scanners::scanner(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("that scanner does not exist"))?;
@@ -169,7 +169,7 @@ async fn create(
     auth: Auth,
     Body(form): Body<ScannerForm>,
 ) -> ApiResult<Json<ScannerDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     form.check()?;
     let row = scanners::create_scanner(state.store().pool(), &form.new_scanner()).await?;
     audit_write_detail(
@@ -190,7 +190,7 @@ async fn update(
     Path(id): Path<String>,
     Body(form): Body<ScannerForm>,
 ) -> ApiResult<Json<ScannerDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     form.check()?;
     let row = scanners::update_scanner(state.store().pool(), &id, &form.new_scanner())
         .await?
@@ -212,7 +212,7 @@ async fn remove(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     if !scanners::delete_scanner(state.store().pool(), &id).await? {
         return Err(ApiError::not_found("that scanner does not exist"));
     }
@@ -229,7 +229,7 @@ async fn refresh(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ScannerDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let row = scanners::scanner(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("that scanner does not exist"))?;
@@ -289,7 +289,7 @@ async fn put_rule(
     Path(id): Path<String>,
     Body(form): Body<RuleForm>,
 ) -> ApiResult<Json<RuleDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let label = form.label.trim();
     if label.is_empty() {
         return Err(ApiError::unprocessable("a rule needs a label"));
@@ -331,7 +331,7 @@ async fn delete_rule(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     if !scanners::delete_rule(state.store().pool(), &id).await? {
         return Err(ApiError::not_found("that rule does not exist"));
     }
@@ -365,7 +365,7 @@ impl From<AssetRow> for AssetDto {
 }
 
 async fn assets(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<AssetDto>>> {
-    auth.require_admin("admin:read")?;
+    auth.require_administrator("admin:read")?;
     Ok(Json(
         scanners::assets(state.store().pool())
             .await?
@@ -397,7 +397,7 @@ async fn upload_asset(
     auth: Auth,
     Json(form): Json<AssetForm>,
 ) -> ApiResult<Json<AssetDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     if !matches!(form.kind.as_str(), "hashes" | "weights" | "words") {
         return Err(ApiError::unprocessable("kind is hashes, weights or words"));
     }
@@ -442,7 +442,7 @@ async fn delete_asset(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     if scanners::asset_in_use(state.store().pool(), &id).await? {
         return Err(ApiError::unprocessable(
             "a scanner still points at that set; point it elsewhere first",
@@ -469,7 +469,7 @@ async fn download_asset(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<impl axum::response::IntoResponse> {
-    auth.require_admin("admin:read")?;
+    auth.require_administrator("admin:read")?;
     let row = scanners::asset(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("that set does not exist"))?;

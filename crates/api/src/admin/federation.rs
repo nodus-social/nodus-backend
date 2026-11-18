@@ -391,7 +391,7 @@ async fn email_blocks(
     auth: Auth,
     Query(query): Query<EmailQuery>,
 ) -> ApiResult<Json<Vec<EmailDomainBlockDto>>> {
-    auth.require_admin("admin:read")?;
+    auth.require_administrator("admin:read")?;
     let rows = moderation::email_domain_blocks(
         state.store().pool(),
         query.domain.as_deref().filter(|value| !value.is_empty()),
@@ -409,7 +409,7 @@ async fn create_email_block(
     auth: Auth,
     Body(form): Body<EmailDomainForm>,
 ) -> ApiResult<Json<EmailDomainBlockDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let domain = form.domain.trim();
     if domain.is_empty() || !domain.contains('.') || domain.contains('@') {
         return Err(ApiError::unprocessable(
@@ -439,7 +439,7 @@ async fn delete_email_block(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<axum::http::StatusCode> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     if !moderation::delete_email_domain_block(state.store().pool(), &id).await? {
         return Err(ApiError::not_found("that mail block does not exist"));
     }

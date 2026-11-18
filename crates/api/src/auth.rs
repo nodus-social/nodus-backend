@@ -31,10 +31,29 @@ impl Auth {
         }
     }
 
-    /// Requires both an administrator account and the given admin scope.
+    /// Requires a staff account — moderator or administrator — holding the given scope.
+    ///
+    /// The role decides which routes a staff member reaches; the scope decides what this
+    /// particular token may do once they are there. A moderator token carries
+    /// `admin:read`/`admin:write` exactly like an administrator's, so this check alone
+    /// never tells the two apart.
     pub fn require_admin(&self, scope: &str) -> Result<(), ApiError> {
-        if !self.0.account.admin {
+        if self.0.account.staff_role == "none" {
             return Err(ApiError::forbidden("Administrator access is required"));
+        }
+        self.require_scope(scope)
+    }
+
+    /// Requires an administrator, not merely a moderator, holding the given scope.
+    ///
+    /// This is the second door: a role grant, a scanner, or an email-domain block is not
+    /// moderation work, and a moderator who reaches it is told so rather than silently
+    /// allowed through.
+    pub fn require_administrator(&self, scope: &str) -> Result<(), ApiError> {
+        if self.0.account.staff_role != "admin" {
+            return Err(ApiError::forbidden(
+                "Administrator access is required for this action",
+            ));
         }
         self.require_scope(scope)
     }

@@ -145,7 +145,7 @@ async fn create(
     auth: Auth,
     JsonOrForm(form): JsonOrForm<AnnouncementForm>,
 ) -> ApiResult<Json<AnnouncementDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let entry = entry(&form)?;
     let row = announcements::create(state.store().pool(), &entry.as_new()).await?;
     Ok(Json(dto(row)))
@@ -157,7 +157,7 @@ async fn update(
     Path(id): Path<String>,
     JsonOrForm(form): JsonOrForm<AnnouncementForm>,
 ) -> ApiResult<Json<AnnouncementDto>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     let entry = entry(&form)?;
     let row = announcements::update(state.store().pool(), &id, &entry.as_new())
         .await?
@@ -170,7 +170,7 @@ async fn remove(
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    auth.require_admin("admin:write")?;
+    auth.require_administrator("admin:write")?;
     if !announcements::delete(state.store().pool(), &id).await? {
         return Err(ApiError::not_found("announcement does not exist"));
     }
