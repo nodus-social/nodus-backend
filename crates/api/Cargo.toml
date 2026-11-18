@@ -20,6 +20,7 @@ nodus-server-media = { workspace = true }
 nodus-server-proto = { path = "../proto" }
 nodus-server-scan = { path = "../scan" }
 nodus-server-store = { workspace = true }
+nodus-shared = { path = "../../../sdk/crates/shared", version = "0.1.0" }
 nodus-auth = { workspace = true }
 axum-extra = { workspace = true }
 leptos = { workspace = true }

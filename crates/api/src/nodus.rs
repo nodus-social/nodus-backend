@@ -15,8 +15,7 @@ use serde::Deserialize;
 use nodus_server_core::id::Id;
 use nodus_server_core::pagination::PageParams;
 use nodus_server_sdk::nodus::{
-    BatchCall, BatchResponse, BatchResult, Capabilities, SyncDiff, SyncEvent, SyncRoot, Verb,
-    CONTRACT_VERSION,
+    BatchCall, BatchResponse, BatchResult, SyncDiff, SyncEvent, SyncRoot, Verb, CONTRACT_VERSION,
 };
 use nodus_server_store::{accounts, events, statuses};
 
@@ -133,8 +132,21 @@ async fn events_stream(
     )
 }
 
-async fn capabilities() -> Json<Capabilities> {
-    Json(Capabilities::default())
+/// The capability vocabulary, as `GET /api/v1/meta` publishes it.
+///
+/// A protocol screen and a door must not disagree, so this is read from the one constant
+/// instead of keeping a second, staler list beside it.
+#[derive(Debug, serde::Serialize)]
+struct CapabilitiesDto {
+    contract: String,
+    features: Vec<String>,
+}
+
+async fn capabilities() -> Json<CapabilitiesDto> {
+    Json(CapabilitiesDto {
+        contract: CONTRACT.to_owned(),
+        features: crate::meta::features(),
+    })
 }
 
 async fn batch(

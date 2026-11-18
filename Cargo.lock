@@ -2650,6 +2650,7 @@ dependencies = [
  "nodus-server-scan",
  "nodus-server-sdk",
  "nodus-server-store",
+ "nodus-shared",
  "rand 0.9.5",
  "reqwest",
  "rsa",

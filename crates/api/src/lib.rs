@@ -29,6 +29,7 @@ pub mod lists;
 pub mod markers;
 pub mod mastodon;
 pub mod media;
+pub mod meta;
 pub mod miauth;
 pub mod misskey;
 pub mod nodus;
@@ -56,6 +57,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/api/v1/apps", axum::routing::post(apps::register))
         .route("/api/v1/instance", get(mastodon::instance_v1))
         .route("/api/v2/instance", get(mastodon::instance_v2))
+        .route("/api/v1/meta", get(meta::meta))
         .route("/api/v1/timelines/public", get(mastodon::public_timeline))
         .route("/api/v1/timelines/home", get(mastodon::home_timeline))
         .route(
