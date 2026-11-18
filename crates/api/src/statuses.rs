@@ -16,7 +16,7 @@ use nodus_server_store::social::ViewerFlags;
 use nodus_server_store::statuses::{NewStatus, StatusRow};
 
 use crate::auth::{Auth, MaybeAuth};
-use crate::dto::StatusDto;
+use crate::dto::{account_url, StatusDto};
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
 use crate::state::AppState;
@@ -486,7 +486,7 @@ async fn decorate(
             "id": account.id,
             "username": account.username,
             "acct": acct,
-            "url": instance.url(&format!("/@{}", account.username)),
+            "url": account_url(&account, instance),
         }));
     }
     Ok(())

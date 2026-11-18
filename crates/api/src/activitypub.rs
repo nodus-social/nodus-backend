@@ -605,7 +605,7 @@ async fn update_remote_note(
     else {
         return Ok(());
     };
-    store_note_extras(state, remote, note, &row).await?;
+    store_note_extras(state, remote, note, value, &row).await?;
     store_note_poll(state, value, &row).await
 }
 
@@ -1110,7 +1110,7 @@ pub(crate) async fn ingest_note(
         },
     )
     .await?;
-    store_note_extras(state, remote, &note, &row).await?;
+    store_note_extras(state, remote, &note, value, &row).await?;
     store_note_poll(state, value, &row).await
 }
 
@@ -1150,6 +1150,7 @@ async fn store_note_extras(
     state: &AppState,
     remote: &AccountRow,
     note: &Note,
+    value: &Value,
     row: &StatusRow,
 ) -> ApiResult<()> {
     let pool = state.store().pool();
@@ -1171,7 +1172,7 @@ async fn store_note_extras(
         &row.id,
         &remote.id,
         note.sensitive,
-        &remote_attachments(note),
+        &remote_attachments(note, value),
     )
     .await?;
     Ok(())
@@ -1293,10 +1294,12 @@ fn poll_tally(option: &Value) -> i64 {
 
 /// Stores a federated poll as the same rows a local poll uses, with the peer's counts.
 async fn store_note_poll(state: &AppState, value: &Value, row: &StatusRow) -> ApiResult<()> {
-    let Some(question) = question_document(value) else {
-        return Ok(());
-    };
-    let Some(poll) = remote_poll_of(question) else {
+    let poll = question_document(value).and_then(remote_poll_of);
+    let Some(poll) = poll else {
+        // The note arrives without a `Question` — a peer that withdrew its poll, or an
+        // `Update` that never had one. Either way the status has no poll now, so the
+        // stored one and its tallies must not outlive the document that brought them.
+        polls::delete_for_status(state.store().pool(), &row.id).await?;
         return Ok(());
     };
     polls::upsert_remote(
@@ -1314,7 +1317,25 @@ async fn store_note_poll(state: &AppState, value: &Value, row: &StatusRow) -> Ap
     Ok(())
 }
 
-fn remote_attachments(note: &Note) -> Vec<media::RemoteAttachment<'_>> {
+/// The `blurhash` a peer put on an attachment.
+///
+/// The typed `Attachment` does not model the placeholder, so it is read back from the
+/// document by URL; a peer that sends none keeps `None` rather than an empty string.
+fn raw_blurhash<'a>(value: &'a Value, url: &str) -> Option<&'a str> {
+    let attachments = match value.get("attachment") {
+        Some(Value::Array(items)) => items.as_slice(),
+        Some(item @ Value::Object(_)) => std::slice::from_ref(item),
+        _ => return None,
+    };
+    attachments
+        .iter()
+        .find(|item| item.get("url").and_then(Value::as_str) == Some(url))
+        .and_then(|item| item.get("blurhash"))
+        .and_then(Value::as_str)
+        .filter(|hash| !hash.is_empty())
+}
+
+fn remote_attachments<'a>(note: &'a Note, value: &'a Value) -> Vec<media::RemoteAttachment<'a>> {
     note.attachments
         .iter()
         .filter(|attachment| validate_remote_url(&attachment.url).is_ok())
@@ -1323,6 +1344,10 @@ fn remote_attachments(note: &Note) -> Vec<media::RemoteAttachment<'_>> {
                 "Image" => "image/jpeg",
                 "Video" => "video/mp4",
                 "Audio" => "audio/mpeg",
+                // A `Document` is a PDF or a plain file; Mastodon has no type of its own
+                // for it and reports an unclassified upload as `unknown`, which the DTO
+                // derives from this content type.
+                "Document" => "application/octet-stream",
                 _ => return None,
             };
             Some(media::RemoteAttachment {
@@ -1333,6 +1358,7 @@ fn remote_attachments(note: &Note) -> Vec<media::RemoteAttachment<'_>> {
                 height: attachment
                     .height
                     .and_then(|value| i32::try_from(value).ok()),
+                blurhash: raw_blurhash(value, &attachment.url),
             })
         })
         .collect()
@@ -2161,6 +2187,10 @@ mod tests {
             assert_eq!(body["tags"][0]["name"], "fedi");
             assert_eq!(body["tags"][1]["name"], "rust");
             assert_eq!(body["mentions"][0]["username"], "eve");
+            assert_eq!(
+                body["mentions"][0]["url"], "https://remote.test/@eve",
+                "a remote mention links to the profile the peer holds"
+            );
             assert_eq!(body["emojis"][0]["shortcode"], "ferris");
             assert_eq!(
                 body["emojis"][0]["url"],
@@ -2171,6 +2201,113 @@ mod tests {
                 "https://remote.test/media/1.png"
             );
             assert_eq!(body["media_attachments"][0]["type"], "image");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_document_attachment_ingests_as_an_unknown_file() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let note_uri = format!("https://remote.test/notes/{}", Id::new());
+            let note = serde_json::json!({
+                "id": note_uri,
+                "type": "Note",
+                "published": "2026-01-01T00:00:00Z",
+                "content": "<p>a paper</p>",
+                "attachment": [{
+                    "type": "Document",
+                    "url": "https://remote.test/media/paper.pdf",
+                    "name": "the paper",
+                    "width": 612,
+                    "height": 792,
+                    "blurhash": "LEHV6nWB2yk8pyo0adR*.7kCMdnj"
+                }]
+            });
+
+            ingest_note(&state, &author, &note)
+                .await
+                .expect("ingest note");
+            let row = statuses::by_uri(store.pool(), &note_uri)
+                .await
+                .expect("lookup")
+                .expect("stored status");
+            let dto = crate::statuses::dto(&state, &row, None)
+                .await
+                .expect("build status dto");
+            let body = serde_json::to_value(dto).expect("serialize status dto");
+
+            assert_eq!(body["media_attachments"][0]["type"], "unknown");
+            assert_eq!(
+                body["media_attachments"][0]["url"],
+                "https://remote.test/media/paper.pdf"
+            );
+            assert_eq!(body["media_attachments"][0]["description"], "the paper");
+            assert_eq!(
+                body["media_attachments"][0]["blurhash"],
+                "LEHV6nWB2yk8pyo0adR*.7kCMdnj"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_update_without_a_question_clears_the_stored_poll() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let question_uri = format!("https://remote.test/questions/{}", Id::new());
+            let question = serde_json::json!({
+                "id": question_uri,
+                "type": "Question",
+                "published": "2026-01-01T00:00:00Z",
+                "content": "<p>which?</p>",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"],
+                "oneOf": [
+                    {"type": "Note", "name": "yes", "replies": {"type": "Collection", "totalItems": 3}},
+                    {"type": "Note", "name": "no", "replies": {"type": "Collection", "totalItems": 2}}
+                ],
+                "votersCount": 5
+            });
+            ingest_note(&state, &author, &question)
+                .await
+                .expect("ingest question");
+            let row = statuses::by_uri(store.pool(), &question_uri)
+                .await
+                .expect("lookup")
+                .expect("stored status");
+            let poll = polls::by_status(store.pool(), &row.id)
+                .await
+                .expect("read poll")
+                .expect("question became a poll");
+
+            let activity = Activity::new(
+                ActivityKind::Update,
+                author.uri.clone().unwrap(),
+                serde_json::json!({
+                    "id": question_uri,
+                    "type": "Note",
+                    "content": "<p>never mind</p>",
+                    "to": ["https://www.w3.org/ns/activitystreams#Public"]
+                }),
+            );
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest poll-less update");
+
+            assert!(
+                polls::by_status(store.pool(), &row.id)
+                    .await
+                    .expect("read poll")
+                    .is_none(),
+                "a note that no longer asks a question has no poll"
+            );
+            assert!(
+                polls::tally_counts(store.pool(), &poll.id)
+                    .await
+                    .expect("read tallies")
+                    .is_empty(),
+                "the withdrawn poll's tallies go with it"
+            );
         })
         .await;
     }

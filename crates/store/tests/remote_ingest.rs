@@ -368,6 +368,7 @@ async fn remote_attachments_are_recorded_as_urls(pool: PgPool) {
             description: "a picture",
             width: Some(640),
             height: Some(480),
+            blurhash: Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj"),
         }],
     )
     .await

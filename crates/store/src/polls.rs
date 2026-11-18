@@ -117,6 +117,19 @@ pub async fn upsert_remote(
     by_id(pool, &poll_id).await?.ok_or(sqlx::Error::RowNotFound)
 }
 
+/// Removes the poll attached to a federated status.
+///
+/// A peer that drops its `Question` in an `Update` has withdrawn the poll; leaving the old
+/// row behind would serve its options and tallies forever. The `poll_tally` and
+/// `poll_vote` rows go with it through their foreign keys.
+pub async fn delete_for_status(pool: &PgPool, status_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM poll WHERE status_id = $1")
+        .bind(status_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// The peer-reported votes per option, for the options that have at least one.
 pub async fn tally_counts(pool: &PgPool, poll_id: &str) -> Result<Vec<OptionCount>, sqlx::Error> {
     sqlx::query_as::<_, OptionCount>(

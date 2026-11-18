@@ -20,7 +20,7 @@ use crate::state::InstanceConfig;
 ///
 /// A remote account's page lives on the instance that minted it: printing our own address
 /// with its name in it would point at a profile we do not have.
-fn account_url(row: &AccountRow, instance: &InstanceConfig) -> String {
+pub(crate) fn account_url(row: &AccountRow, instance: &InstanceConfig) -> String {
     match row.domain.as_deref() {
         Some(domain) => format!("https://{domain}/@{}", row.username),
         None => instance.url(&format!("/@{}", row.username)),

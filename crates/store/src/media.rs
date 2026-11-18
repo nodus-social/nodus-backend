@@ -140,6 +140,8 @@ pub struct RemoteAttachment<'a> {
     pub description: &'a str,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    /// The peer's placeholder, when it sent one; the bytes were never decoded here.
+    pub blurhash: Option<&'a str>,
 }
 
 /// Replaces the remote attachments of a status.
@@ -162,10 +164,10 @@ pub async fn replace_remote(
     for (index, attachment) in attachments.iter().enumerate() {
         sqlx::query(
             "INSERT INTO media_attachment (id, account_id, status_id, digest, content_type, \
-                 size, width, height, description, sensitive, remote, processing_state, \
-                 processing_progress, meta, created_at) \
-             VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, true, 'ready', 100, \
-                 jsonb_build_object('url', $10::text), now())",
+                 size, width, height, blurhash, description, sensitive, remote, \
+                 processing_state, processing_progress, meta, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10, true, 'ready', 100, \
+                 jsonb_build_object('url', $11::text), now())",
         )
         .bind(nodus_server_core::Id::new().to_string())
         .bind(account_id)
@@ -174,6 +176,7 @@ pub async fn replace_remote(
         .bind(attachment.content_type)
         .bind(attachment.width)
         .bind(attachment.height)
+        .bind(attachment.blurhash)
         .bind(attachment.description)
         .bind(sensitive)
         .bind(attachment.url)
