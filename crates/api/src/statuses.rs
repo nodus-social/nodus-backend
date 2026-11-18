@@ -388,7 +388,8 @@ pub(crate) async fn dto(
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     let media = nodus_server_store::media::by_status(state.store().pool(), &row.id).await?;
     let mut dto = StatusDto::from_row_with_media(row, &account, state.instance(), &media);
-    decorate(state, &mut dto, &row.id).await?;
+    let viewer_id = viewer.map(|auth| auth.0.account.id.as_str());
+    decorate(state, &mut dto, &row.id, viewer_id).await?;
     if let Some(original_id) = &row.reblog_of_id {
         if let Some(original) =
             nodus_server_store::statuses::by_id(state.store().pool(), original_id).await?
@@ -405,7 +406,7 @@ pub(crate) async fn dto(
                 state.instance(),
                 &original_media,
             );
-            decorate(state, &mut boost, &original.id).await?;
+            decorate(state, &mut boost, &original.id, viewer_id).await?;
             dto.reblog = Some(Box::new(boost));
         }
     }
@@ -441,9 +442,15 @@ fn apply_flags(dto: &mut StatusDto, flags: ViewerFlags) {
 /// Hashtags and mentions are rows beside the status, not columns on it, so a payload built
 /// from the status row alone renders `#nodus` as plain text and `@someone` as neither a
 /// link nor a notification — which is what clients were getting before this ran.
-async fn decorate(state: &AppState, dto: &mut StatusDto, status_id: &str) -> ApiResult<()> {
+async fn decorate(
+    state: &AppState,
+    dto: &mut StatusDto,
+    status_id: &str,
+    viewer_id: Option<&str>,
+) -> ApiResult<()> {
     let pool = state.store().pool();
     let instance = state.instance();
+    dto.poll = crate::polls::status_poll(state, status_id, viewer_id).await?;
     let tags = nodus_server_store::statuses::tags_of(pool, status_id).await?;
     dto.tags = tags
         .iter()

@@ -191,6 +191,29 @@ pub struct StatusDto {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PollDto {
+    pub id: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub expired: bool,
+    pub multiple: bool,
+    pub votes_count: i64,
+    pub voters_count: i64,
+    /// Present only for a signed-in reader: Mastodon omits both this and `own_votes`
+    /// otherwise, and a client that sees `false` cannot tell "not voted" from "anonymous".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_votes: Option<Vec<usize>>,
+    pub options: Vec<PollOptionDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PollOptionDto {
+    pub title: String,
+    pub votes_count: i64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct MediaAttachmentDto {
     pub id: String,
     #[serde(rename = "type")]

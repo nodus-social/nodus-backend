@@ -13,7 +13,7 @@ use serde::Deserialize;
 use nodus_server_core::id::Id;
 use nodus_server_core::{PageParams, PageSize};
 
-use crate::auth::Auth;
+use crate::auth::{Auth, MaybeAuth};
 use crate::dto::{
     AccountDto, ConfigurationDto, InstanceV1Dto, InstanceV2Dto, RegistrationsDto, StatusDto,
 };
@@ -111,6 +111,7 @@ pub async fn instance_v2(State(state): State<AppState>) -> ApiResult<Json<Instan
 /// `GET /api/v1/timelines/public`
 pub async fn public_timeline(
     State(state): State<AppState>,
+    MaybeAuth(auth): MaybeAuth,
     Query(query): Query<PageQuery>,
 ) -> ApiResult<Response> {
     let params = query.params()?;
@@ -126,6 +127,7 @@ pub async fn public_timeline(
         page.next_max_id,
         params,
         "/api/v1/timelines/public",
+        auth.as_ref().map(|auth| auth.0.account.id.as_str()),
     )
     .await
 }
@@ -147,6 +149,7 @@ pub async fn home_timeline(
         page.next_max_id,
         params,
         "/api/v1/timelines/home",
+        Some(auth.0.account.id.as_str()),
     )
     .await
 }
@@ -185,6 +188,7 @@ async fn timeline_response(
     next_max_id: Option<String>,
     params: PageParams,
     path: &str,
+    viewer: Option<&str>,
 ) -> ApiResult<Response> {
     let instance = state.instance();
     // The account of each status is loaded per row for now; one join in the page query
@@ -192,6 +196,7 @@ async fn timeline_response(
     let mut items = Vec::with_capacity(rows.len());
     let status_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
     let media = nodus_server_store::media::by_statuses(state.store().pool(), &status_ids).await?;
+    let polls = nodus_server_store::polls::by_status_ids(state.store().pool(), &status_ids).await?;
     for row in rows {
         let Some(account) =
             nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id).await?
@@ -203,12 +208,14 @@ async fn timeline_response(
             .filter(|attachment| attachment.status_id.as_deref() == Some(row.id.as_str()))
             .cloned()
             .collect();
-        items.push(StatusDto::from_row_with_media(
-            &row,
-            &account,
-            instance,
-            &attachments,
-        ));
+        let mut dto = StatusDto::from_row_with_media(&row, &account, instance, &attachments);
+        if let Some(poll) = polls.get(&row.id) {
+            let document = crate::polls::document(state, poll, viewer).await?;
+            dto.poll = Some(serde_json::to_value(document).map_err(|error| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            })?);
+        }
+        items.push(dto);
     }
 
     let mut response = Json(items).into_response();

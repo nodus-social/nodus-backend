@@ -34,6 +34,7 @@ pub mod misskey;
 pub mod nodus;
 pub mod notifications;
 pub mod outbox;
+pub mod polls;
 pub mod preferences;
 pub mod reactions;
 pub mod remote;
@@ -47,6 +48,7 @@ use axum::routing::{get, patch, post, put};
 
 /// Builds the router. No port, no listener: the binary owns the process, this owns the
 /// surface.
+#[allow(clippy::too_many_lines)] // a route table reads better as one list than as helpers
 pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/healthz", get(mastodon::healthz))
@@ -140,6 +142,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(discovery::router())
         .merge(preferences::router())
         .merge(markers::router())
+        .merge(polls::router())
         .merge(follow_requests::router())
         .fallback(error::not_found_fallback)
         .layer(axum::middleware::from_fn_with_state(
