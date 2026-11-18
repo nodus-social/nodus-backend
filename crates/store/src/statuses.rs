@@ -105,6 +105,8 @@ pub struct NewRemoteStatus<'a> {
     pub content_html: &'a str,
     pub spoiler_text: &'a str,
     pub sensitive: bool,
+    /// `public`, `unlisted`, `private` or `direct`, derived from the note's addressing.
+    pub visibility: &'a str,
     pub in_reply_to_id: Option<&'a str>,
     pub in_reply_to_account_id: Option<&'a str>,
     pub created_at: DateTime<Utc>,
@@ -119,7 +121,7 @@ pub async fn upsert_remote(
     let sql = format!(
         "INSERT INTO status (id, account_id, uri, content, content_html, spoiler_text, \
              visibility, sensitive, in_reply_to_id, in_reply_to_account_id, local, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, 'public', $7, $8, $9, false, $10) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false, $11) \
          ON CONFLICT (uri) DO UPDATE SET content = EXCLUDED.content, \
              content_html = EXCLUDED.content_html, spoiler_text = EXCLUDED.spoiler_text, \
              sensitive = EXCLUDED.sensitive, edited_at = now() \
@@ -132,6 +134,7 @@ pub async fn upsert_remote(
         .bind(new.content)
         .bind(new.content_html)
         .bind(new.spoiler_text)
+        .bind(new.visibility)
         .bind(new.sensitive)
         .bind(new.in_reply_to_id)
         .bind(new.in_reply_to_account_id)

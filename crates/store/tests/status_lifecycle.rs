@@ -133,6 +133,7 @@ async fn replies_count_is_maintained_across_create_insert_upsert_and_delete(pool
         content_html: "<p>remote reply</p>",
         spoiler_text: "",
         sensitive: false,
+        visibility: "public",
         in_reply_to_id: Some(&parent_id),
         in_reply_to_account_id: Some(&alice),
         created_at: Utc::now(),

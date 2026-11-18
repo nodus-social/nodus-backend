@@ -577,6 +577,26 @@ pub(crate) fn is_disallowed_ipv6(v6: Ipv6Addr) -> bool {
         || segments[0] == 0x0100
 }
 
+/// What a peer told us about who may read their note.
+///
+/// Reading the addressing rather than guessing keeps a direct message private on our side
+/// too: a post stored as public would be served to anybody who asks for the thread.
+fn addressed(to: &[String], cc: &[String]) -> &'static str {
+    let public = "https://www.w3.org/ns/activitystreams#Public";
+    let has = |list: &[String]| list.iter().any(|value| value == public);
+    match (has(to), has(cc)) {
+        (true, _) => "public",
+        (false, true) => "unlisted",
+        _ => {
+            if to.iter().any(|value| value.ends_with("/followers")) {
+                "private"
+            } else {
+                "direct"
+            }
+        }
+    }
+}
+
 async fn upsert_remote_actor(
     state: &AppState,
     actor_url: &str,
@@ -737,6 +757,7 @@ pub(crate) async fn ingest_note(
             content_html: &content_html,
             spoiler_text: &spoiler_text,
             sensitive: note.sensitive,
+            visibility: addressed(&note.to, &note.cc),
             in_reply_to_id: parent.as_ref().map(|row| row.id.as_str()),
             in_reply_to_account_id: parent.as_ref().map(|row| row.account_id.as_str()),
             created_at,
@@ -999,6 +1020,35 @@ fn document_response<D: Document>(document: &D) -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn public_and_unlisted_notes_copy_the_peers_addressing() {
+        let public = "https://www.w3.org/ns/activitystreams#Public";
+        let followers = "https://social.test/users/ada/followers";
+        assert_eq!(
+            super::addressed(&strings(&[public]), &strings(&[followers])),
+            "public"
+        );
+        assert_eq!(
+            super::addressed(&strings(&[followers]), &strings(&[public])),
+            "unlisted"
+        );
+    }
+
+    #[test]
+    fn a_note_without_the_public_collection_stays_as_private_as_it_arrived() {
+        let followers = "https://social.test/users/ada/followers";
+        let eve = "https://mastodon.test/users/eve";
+        assert_eq!(
+            super::addressed(&strings(&[followers]), &strings(&[eve])),
+            "private"
+        );
+        assert_eq!(super::addressed(&strings(&[eve]), &[]), "direct");
+    }
 
     #[test]
     fn a_public_note_addresses_the_world_and_its_followers() {
