@@ -45,6 +45,30 @@ pub async fn enqueue(
     activity: &Value,
     inboxes: &[String],
 ) -> Result<u64, sqlx::Error> {
+    enqueue_with(pool, account_id, activity, inboxes, false).await
+}
+
+/// Writes an activity down even for an inbox whose actor is suspended.
+///
+/// The `Block` and `Undo(Block)` that apply or lift a suspension are the one thing that
+/// must still reach the peer, so the suspension filter is skipped for them; a host that
+/// blocked this instance is still not written to.
+pub async fn enqueue_ignoring_suspension(
+    pool: &PgPool,
+    account_id: &str,
+    activity: &Value,
+    inboxes: &[String],
+) -> Result<u64, sqlx::Error> {
+    enqueue_with(pool, account_id, activity, inboxes, true).await
+}
+
+async fn enqueue_with(
+    pool: &PgPool,
+    account_id: &str,
+    activity: &Value,
+    inboxes: &[String],
+    keep_suspended: bool,
+) -> Result<u64, sqlx::Error> {
     let activity_id = activity
         .get("id")
         .and_then(Value::as_str)
@@ -54,7 +78,11 @@ pub async fn enqueue(
         return Ok(0);
     }
     let blocked = crate::blocks::blocked_hosts(pool).await?;
-    let inboxes = allowed_inboxes(inboxes, &blocked);
+    let mut inboxes = allowed_inboxes(inboxes, &blocked);
+    if !keep_suspended {
+        let suspended = crate::remote_moderation::suspended_inboxes(pool).await?;
+        inboxes.retain(|inbox| !suspended.contains(inbox));
+    }
     if inboxes.is_empty() {
         return Ok(0);
     }

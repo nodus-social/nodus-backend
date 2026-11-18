@@ -87,7 +87,7 @@ pub async fn clear_remote_blocks(pool: &PgPool, host: &str) -> Result<u64, sqlx:
 ///
 /// Delivery compares only hosts, so userinfo and the port are dropped: an inbox on
 /// `example.test:8443` still belongs to `example.test`.
-pub(crate) fn host_of(uri: &str) -> Option<String> {
+pub fn host_of(uri: &str) -> Option<String> {
     let rest = uri.split_once("://")?.1;
     let authority = rest.split(['/', '?', '#']).next()?;
     let authority = authority.rsplit('@').next()?;

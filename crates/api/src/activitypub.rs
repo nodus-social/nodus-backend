@@ -407,6 +407,19 @@ async fn verify_signature(
 }
 
 async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()> {
+    // A suspended actor is not talked to and does not get to talk: its activities are
+    // acknowledged (so the sender stops retrying) and dropped before they touch anything.
+    let action =
+        nodus_server_store::remote_moderation::active_action(state.store().pool(), &activity.actor)
+            .await?;
+    if action.as_deref() == Some(nodus_server_store::remote_moderation::SUSPEND) {
+        tracing::info!(
+            actor = %activity.actor,
+            kind = %activity.kind.as_str(),
+            "dropped inbound activity from a suspended remote account"
+        );
+        return Ok(());
+    }
     let remote = ensure_remote_actor(state, &activity.actor).await?;
     match activity.kind {
         ActivityKind::Follow => {
@@ -1584,7 +1597,10 @@ async fn note_document(state: &AppState, row: &StatusRow, account: &AccountRow) 
 /// A local account has to be its own actor before it can be fetched. Keys are generated
 /// once and written beside the account; a later request reuses them so the key id stays
 /// stable for remote caches.
-async fn ensure_identity(state: &AppState, account: AccountRow) -> ApiResult<AccountRow> {
+pub(crate) async fn ensure_identity(
+    state: &AppState,
+    account: AccountRow,
+) -> ApiResult<AccountRow> {
     if account.uri.is_some()
         && account.public_key_pem.is_some()
         && account.private_key_pem.is_some()

@@ -81,17 +81,32 @@ fn undoing(actor: &str, inner: Value) -> Value {
 /// Failures are logged rather than returned: the reader's action has already been stored,
 /// and a queue that cannot be written is a server problem, not a reason to undo a post.
 async fn enqueue(state: &AppState, account_id: &str, activity: Value, inboxes: Vec<String>) {
+    enqueue_with(state, account_id, activity, inboxes, false).await;
+}
+
+async fn enqueue_with(
+    state: &AppState,
+    account_id: &str,
+    activity: Value,
+    inboxes: Vec<String>,
+    keep_suspended: bool,
+) {
     if inboxes.is_empty() {
         return;
     }
-    match nodus_server_store::delivery::enqueue(
-        state.store().pool(),
-        account_id,
-        &activity,
-        &inboxes,
-    )
-    .await
-    {
+    let queued = if keep_suspended {
+        nodus_server_store::delivery::enqueue_ignoring_suspension(
+            state.store().pool(),
+            account_id,
+            &activity,
+            &inboxes,
+        )
+        .await
+    } else {
+        nodus_server_store::delivery::enqueue(state.store().pool(), account_id, &activity, &inboxes)
+            .await
+    };
+    match queued {
         Ok(queued) => {
             tracing::debug!(inboxes = inboxes.len(), queued, "activity queued");
         }
@@ -279,6 +294,45 @@ pub async fn deliver_follow(state: &AppState, account_id: &str, target_id: &str,
     {
         enqueue(state, account_id, activity, vec![inbox]).await;
     }
+}
+
+/// Tells a peer that this instance has blocked one of its actors, or that it no longer has.
+///
+/// `Block` and `Undo(Block)` are the one pair that must reach an inbox even while the
+/// actor on the other side is suspended, so they are queued past the suspension filter.
+/// The sender has to be a real local account: the delivery row is signed with its key, and
+/// the admin who made the decision is the actor named in the activity.
+pub async fn deliver_remote_block(
+    state: &AppState,
+    sender_id: &str,
+    sender_username: &str,
+    target_actor: &str,
+    blocking: bool,
+) {
+    let pool = state.store().pool();
+    let Ok(Some(sender)) = nodus_server_store::accounts::by_id(pool, sender_id).await else {
+        return;
+    };
+    let actor = actor_of(state, sender_username, sender.uri.as_deref());
+    let Some(inbox) = nodus_server_store::accounts::by_uri(pool, target_actor)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|target| target.shared_inbox_url.or(target.inbox_url))
+    else {
+        tracing::debug!(
+            %target_actor,
+            "no inbox known for a moderated remote account, nothing to deliver"
+        );
+        return;
+    };
+    let block = pointing(ActivityKind::Block, "blocks", &actor, target_actor);
+    let activity = if blocking {
+        block
+    } else {
+        undoing(&actor, block)
+    };
+    enqueue_with(state, sender_id, activity, vec![inbox], true).await;
 }
 
 /// Answers a pending follow request.

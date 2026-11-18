@@ -353,6 +353,9 @@ pub async fn public_page(
            AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
            AND NOT EXISTS (SELECT 1 FROM instance_block b WHERE b.domain = a.domain \
                            AND b.severity IN ('suspend', 'silence')) \
+           AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
+                           AND m.action IN ('silence', 'suspend') \
+                           AND (m.expires_at IS NULL OR m.expires_at > now())) \
            AND ($1::text IS NULL OR s.id < $1) \
            AND ($2::text IS NULL OR s.id > $2) \
            AND (NOT $3 OR s.local) \
@@ -384,6 +387,11 @@ pub async fn account_page(
         "SELECT {STATUS_COLUMNS} FROM status s \
          WHERE s.account_id = $1 AND s.deleted_at IS NULL \
            AND s.visibility IN ('public', 'unlisted') \
+           AND NOT EXISTS (SELECT 1 FROM account a JOIN remote_moderation m \
+                            ON m.actor_uri = a.uri \
+                           WHERE a.id = s.account_id \
+                             AND m.action IN ('silence', 'suspend') \
+                             AND (m.expires_at IS NULL OR m.expires_at > now())) \
            AND ($2::text IS NULL OR s.id < $2) \
            AND ($3::text IS NULL OR s.id > $3) \
          ORDER BY s.id {order} LIMIT $4"
@@ -418,6 +426,9 @@ pub async fn home_page(
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
+            AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
+                            AND m.action = 'suspend' \
+                            AND (m.expires_at IS NULL OR m.expires_at > now())) \
             AND ($2::text IS NULL OR s.id < $2) \
             AND ($3::text IS NULL OR s.id > $3) \
          UNION \
@@ -432,6 +443,9 @@ pub async fn home_page(
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
+            AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
+                            AND m.action = 'suspend' \
+                            AND (m.expires_at IS NULL OR m.expires_at > now())) \
             AND ($2::text IS NULL OR s.id < $2) \
             AND ($3::text IS NULL OR s.id > $3) \
          ORDER BY id {order} LIMIT $4"

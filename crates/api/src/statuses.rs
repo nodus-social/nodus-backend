@@ -769,6 +769,17 @@ pub(crate) async fn can_view_for_viewer(
     viewer_id: Option<&str>,
     row: &StatusRow,
 ) -> ApiResult<bool> {
+    // A suspended remote account disappears everywhere, its threads included, whether or
+    // not a link pointed at it. Silence only keeps it off the public listings, so a status
+    // URL it was linked by still resolves for whoever already has the link.
+    let action = nodus_server_store::remote_moderation::action_for_account(
+        state.store().pool(),
+        &row.account_id,
+    )
+    .await?;
+    if action.as_deref() == Some(nodus_server_store::remote_moderation::SUSPEND) {
+        return Ok(false);
+    }
     if row.visibility == "public" || row.visibility == "unlisted" {
         return Ok(true);
     }

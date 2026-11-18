@@ -16,6 +16,7 @@ use nodus_server_store::blocks as store_blocks;
 use nodus_server_store::moderation::{
     self, DomainBlockFilter, DomainBlockRow, EmailDomainBlockRow, NewDomainBlock,
 };
+use nodus_server_store::remote_moderation;
 
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult};
@@ -523,11 +524,191 @@ async fn clear_remote_blocks(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// A moderation decision on one remote account, as the console reads it back.
+#[derive(Debug, Serialize)]
+pub struct RemoteModerationDto {
+    pub actor_uri: String,
+    pub handle: String,
+    pub domain: Option<String>,
+    pub action: String,
+    pub reason: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub expired: bool,
+    pub created_at: DateTime<Utc>,
+    pub created_by: Option<String>,
+    pub created_by_handle: Option<String>,
+}
+
+impl RemoteModerationDto {
+    fn new(listed: &remote_moderation::ListedRemoteModeration, now: DateTime<Utc>) -> Self {
+        Self {
+            actor_uri: listed.row.actor_uri.clone(),
+            handle: listed.handle.clone(),
+            domain: listed.domain.clone(),
+            action: listed.row.action.clone(),
+            reason: listed.row.reason.clone(),
+            expires_at: listed.row.expires_at,
+            expired: !listed.row.is_active(now),
+            created_at: listed.row.created_at,
+            created_by: listed.row.created_by.clone(),
+            created_by_handle: listed.created_by_handle.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteModerationForm {
+    action: Option<String>,
+    reason: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteModerationQuery {
+    domain: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// `GET /api/v1/admin/federation/remote-accounts` — every decision, expired included.
+///
+/// An expired row is still shown, marked expired: the console needs to say that the
+/// account was once moderated, by whom and why, without the row still applying.
+async fn remote_accounts(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<RemoteModerationQuery>,
+) -> ApiResult<Json<Vec<RemoteModerationDto>>> {
+    auth.require_admin("admin:read")?;
+    let rows = remote_moderation::list(
+        state.store().pool(),
+        query.domain.as_deref(),
+        page(query.limit),
+        offset(query.offset),
+    )
+    .await?;
+    let now = Utc::now();
+    Ok(Json(
+        rows.iter()
+            .map(|row| RemoteModerationDto::new(row, now))
+            .collect(),
+    ))
+}
+
+/// `PUT /api/v1/admin/federation/remote-accounts/{actor_uri}` — apply or change one.
+async fn apply_remote_account(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(actor_uri): Path<String>,
+    Body(form): Body<RemoteModerationForm>,
+) -> ApiResult<(axum::http::StatusCode, Json<RemoteModerationDto>)> {
+    auth.require_admin("admin:write")?;
+    let actor_uri = actor_uri.trim().to_owned();
+    crate::activitypub::validate_remote_url(&actor_uri)?;
+    let action = form
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|action| {
+            *action == remote_moderation::SILENCE || *action == remote_moderation::SUSPEND
+        })
+        .ok_or_else(|| ApiError::unprocessable("action must be silence or suspend"))?;
+    let reason = form
+        .reason
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty());
+    let (row, inserted) = remote_moderation::upsert(
+        state.store().pool(),
+        &remote_moderation::NewRemoteModeration {
+            actor_uri: &actor_uri,
+            action,
+            reason: reason.as_deref(),
+            expires_at: form.expires_at,
+            created_by: Some(auth.0.account.id.as_str()),
+        },
+    )
+    .await?;
+    super::audit_write_detail(
+        &state,
+        &auth,
+        "remote_account_moderation",
+        "actor",
+        &actor_uri,
+        json!({
+            "action": action,
+            "reason": reason,
+            "expires_at": form.expires_at,
+        }),
+    )
+    .await?;
+    // The peer hears about the block from the admin who made the decision, which is also
+    // what signs the delivery. Blocking is still delivered while the actor is suspended
+    // (the decision has to reach them, if only so they can see it), and lifting is an Undo.
+    let sender = crate::activitypub::ensure_identity(&state, auth.0.account.clone()).await?;
+    crate::outbox::deliver_remote_block(&state, &sender.id, &sender.username, &actor_uri, true)
+        .await;
+    let dto = RemoteModerationDto::new(
+        &remote_moderation::ListedRemoteModeration {
+            row,
+            handle: actor_uri
+                .rsplit('/')
+                .next()
+                .unwrap_or(&actor_uri)
+                .to_owned(),
+            domain: store_blocks::host_of(&actor_uri),
+            created_by_handle: Some(sender.username),
+        },
+        Utc::now(),
+    );
+    let status = if inserted {
+        axum::http::StatusCode::CREATED
+    } else {
+        axum::http::StatusCode::OK
+    };
+    Ok((status, Json(dto)))
+}
+
+/// `DELETE /api/v1/admin/federation/remote-accounts/{actor_uri}` — lift the action.
+async fn lift_remote_account(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(actor_uri): Path<String>,
+) -> ApiResult<axum::http::StatusCode> {
+    auth.require_admin("admin:write")?;
+    let actor_uri = actor_uri.trim().to_owned();
+    if !remote_moderation::lift(state.store().pool(), &actor_uri).await? {
+        return Err(ApiError::not_found("that account is not moderated"));
+    }
+    super::audit_write_detail(
+        &state,
+        &auth,
+        "lift_remote_account_moderation",
+        "actor",
+        &actor_uri,
+        json!({}),
+    )
+    .await?;
+    let sender = crate::activitypub::ensure_identity(&state, auth.0.account.clone()).await?;
+    crate::outbox::deliver_remote_block(&state, &sender.id, &sender.username, &actor_uri, false)
+        .await;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
             "/api/v1/admin/federation/remote-blocks",
             get(list_remote_blocks).delete(clear_remote_blocks),
+        )
+        .route(
+            "/api/v1/admin/federation/remote-accounts",
+            get(remote_accounts),
+        )
+        // The actor URI contains slashes, so the wildcard takes the rest of the path and
+        // the handler trims it; a percent-encoded URI works too because axum decodes it.
+        .route(
+            "/api/v1/admin/federation/remote-accounts/{*actor_uri}",
+            axum::routing::put(apply_remote_account).delete(lift_remote_account),
         )
         .route(
             "/api/v1/admin/domain_blocks",

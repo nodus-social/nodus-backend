@@ -119,6 +119,9 @@ pub async fn serve(State(serving): State<Arc<Serving>>, Path(id): Path<String>) 
     let Some(row) = catalogue(&serving, &id).await else {
         return not_found();
     };
+    if suspended(&serving, &row.account_id).await {
+        return not_found();
+    }
     if !row.original_pruned {
         if let Ok(bytes) = tokio::fs::read(serving.root.join(&row.digest)).await {
             return with_cache(
@@ -147,6 +150,13 @@ pub async fn serve_variant(
         "lossless" => Layer::Lossless,
         _ => return not_found(),
     };
+    // A variant is the same picture as its original, so a suspended account's media is
+    // gone at every layer, not only at the one /media/{id} happens to answer.
+    match catalogue(&serving, &id).await {
+        Some(row) if suspended(&serving, &row.account_id).await => return not_found(),
+        Some(_) => {}
+        None => return not_found(),
+    }
     if let Some(variant) = variant(&serving, &id, layer.as_str()).await {
         return variant_response(&serving, variant, layer).await;
     }
@@ -159,6 +169,19 @@ async fn catalogue(serving: &Serving, id: &str) -> Option<media::MediaRow> {
         Err(error) => {
             tracing::error!(%error, %id, "the media catalogue could not be read");
             None
+        }
+    }
+}
+
+/// Whether the account that posted this media is suspended, in which case the bytes are
+/// not served at all — a suspended account's pictures are part of what it posted.
+async fn suspended(serving: &Serving, account_id: &str) -> bool {
+    match nodus_server_store::remote_moderation::action_for_account(&serving.pool, account_id).await
+    {
+        Ok(action) => action.as_deref() == Some(nodus_server_store::remote_moderation::SUSPEND),
+        Err(error) => {
+            tracing::error!(%error, "the remote moderation table could not be read");
+            false
         }
     }
 }
