@@ -4,8 +4,6 @@
 //! the console already renders (`web`'s `PollBlock` and the SDK's `Poll` model), so the
 //! same shape is used inside a status and at `/api/v1/polls/{id}`.
 
-use std::collections::HashMap;
-
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap};
@@ -15,6 +13,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use nodus_server_store::polls::{self, PollRow};
+use nodus_server_store::statuses;
 
 use crate::auth::{Auth, MaybeAuth};
 use crate::dto::{PollDto, PollOptionDto};
@@ -29,24 +28,8 @@ pub(crate) async fn document(
     viewer: Option<&str>,
 ) -> ApiResult<PollDto> {
     let pool = state.store().pool();
-    // A local poll counts its own `poll_vote` rows; a federated poll keeps the snapshot
-    // the peer sent, because nobody here voted and inventing voters would double count.
-    let (counts, voter_count) = if row.local {
-        let counts: HashMap<i32, i64> = polls::option_counts(pool, &row.id)
-            .await?
-            .into_iter()
-            .map(|count| (count.option_index, count.votes))
-            .collect();
-        (counts, polls::voters_count(pool, &row.id).await?)
-    } else {
-        let counts: HashMap<i32, i64> = polls::tally_counts(pool, &row.id)
-            .await?
-            .into_iter()
-            .map(|count| (count.option_index, count.votes))
-            .collect();
-        (counts, row.voters_count)
-    };
-    let total_votes = counts.values().sum();
+    let (counts, voter_count) = counts(state, row).await?;
+    let total_votes: i64 = counts.iter().sum();
     let expired = row.expires_at.is_some_and(|at| at <= Utc::now());
     let (voted, own_votes) = match viewer {
         Some(account_id) => (
@@ -61,13 +44,16 @@ pub(crate) async fn document(
         ),
         None => (None, None),
     };
+    // `hide_totals` is not decoration: until the poll closes, only someone who has
+    // already voted may see the running tally. Signed-out readers never have.
+    let hidden = row.hide_totals && !expired && !voted.unwrap_or(false);
     Ok(PollDto {
         id: row.id.clone(),
         expires_at: row.expires_at,
         expired,
         multiple: row.multiple,
-        votes_count: total_votes,
-        voters_count: voter_count,
+        votes_count: (!hidden).then_some(total_votes),
+        voters_count: (!hidden).then_some(voter_count),
         voted,
         own_votes,
         options: row
@@ -77,13 +63,38 @@ pub(crate) async fn document(
             .enumerate()
             .map(|(index, title)| PollOptionDto {
                 title: title.clone(),
-                votes_count: counts
-                    .get(&i32::try_from(index).unwrap_or(i32::MAX))
-                    .copied()
-                    .unwrap_or(0),
+                votes_count: (!hidden).then_some(counts.get(index).copied().unwrap_or(0)),
             })
             .collect(),
     })
+}
+
+/// The stored tally in option order, plus the voter count.
+///
+/// A local poll counts its own `poll_vote` rows; a federated poll keeps the snapshot the
+/// peer sent, because nobody here voted and inventing voters would double count.
+pub(crate) async fn counts(state: &AppState, row: &PollRow) -> ApiResult<(Vec<i64>, i64)> {
+    let pool = state.store().pool();
+    let mut counts = vec![0; row.options.0.len()];
+    if row.local {
+        for count in polls::option_counts(pool, &row.id).await? {
+            if let Ok(index) = usize::try_from(count.option_index) {
+                if let Some(slot) = counts.get_mut(index) {
+                    *slot = count.votes;
+                }
+            }
+        }
+        Ok((counts, polls::voters_count(pool, &row.id).await?))
+    } else {
+        for count in polls::tally_counts(pool, &row.id).await? {
+            if let Ok(index) = usize::try_from(count.option_index) {
+                if let Some(slot) = counts.get_mut(index) {
+                    *slot = count.votes;
+                }
+            }
+        }
+        Ok((counts, row.voters_count))
+    }
 }
 
 /// The `poll` field of a status, or `None` when the status has no poll.
@@ -166,7 +177,24 @@ pub async fn vote(
         .into_iter()
         .map(|choice| i32::try_from(choice).unwrap_or(0))
         .collect();
-    polls::vote(state.store().pool(), &row.id, account_id, &choices).await?;
+    let counted = polls::vote(state.store().pool(), &row.id, account_id, &choices).await?;
+    if counted {
+        if let Some(status) = statuses::by_id(state.store().pool(), &row.status_id).await? {
+            // A vote on your own poll is a notification like a favourite; a second vote
+            // from the same account changes nothing and must not notify twice.
+            nodus_server_store::social::notify(
+                state.store().pool(),
+                &status.account_id,
+                "poll",
+                account_id,
+                Some(&status.id),
+            )
+            .await?;
+            // The peer's copy of the poll has votes now; an `Update` carries the tally
+            // through the same outbox that delivered the original `Question`.
+            crate::outbox::deliver_update(&state, &status.account_id, &status).await;
+        }
+    }
     Ok(Json(document(&state, &row, Some(account_id)).await?))
 }
 

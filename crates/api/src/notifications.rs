@@ -24,7 +24,7 @@ use crate::statuses;
 
 /// Every kind this server can produce. Mastodon also has `update` (an edited status) and
 /// `admin.sign_up`; both are accepted as filters and simply match nothing.
-const KINDS: [&str; 5] = ["follow", "favourite", "reblog", "mention", "status"];
+const KINDS: [&str; 6] = ["follow", "favourite", "reblog", "mention", "status", "poll"];
 
 /// One notification, in Mastodon's shape.
 #[derive(Debug, Serialize)]

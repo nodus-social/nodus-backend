@@ -57,6 +57,14 @@ impl Document for Note {
     }
 }
 
+impl Document for Value {
+    const CONTENT_TYPE: &'static str = "application/activity+json";
+
+    fn document(&self) -> Value {
+        self.clone()
+    }
+}
+
 impl Document for Collection {
     const CONTENT_TYPE: &'static str = "application/activity+json";
 
@@ -278,9 +286,8 @@ async fn note(State(state): State<AppState>, Path(id): Path<String>) -> ApiResul
     let account = accounts::by_id(state.store().pool(), &row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    Ok(document_response(
-        &note_document(&state, &row, &account).await?,
-    ))
+    let (value, _) = status_object(&state, &row, &account).await?;
+    Ok(document_response(&value))
 }
 
 async fn inbox(
@@ -1393,8 +1400,84 @@ pub(crate) async fn status_activity(
     row: &StatusRow,
     account: &AccountRow,
 ) -> ApiResult<Activity> {
+    let (value, note) = status_object(state, row, account).await?;
+    Ok(Activity::new(
+        ActivityKind::Create,
+        actor_url(state, account),
+        ActivityObject::Value(value),
+    )
+    .addressed_to(note.to.clone(), note.cc.clone())
+    .with_id(format!("{}/activity", note.id.trim_end_matches('/'))))
+}
+
+/// An `Update` carrying the status as it stands now.
+///
+/// Poll tallies move after publication, and an `Update` is how a peer hears the new
+/// counts without a second sender or a second queue.
+pub(crate) async fn status_update(
+    state: &AppState,
+    row: &StatusRow,
+    account: &AccountRow,
+) -> ApiResult<Activity> {
+    let (value, note) = status_object(state, row, account).await?;
+    Ok(Activity::new(
+        ActivityKind::Update,
+        actor_url(state, account),
+        ActivityObject::Value(value),
+    )
+    .addressed_to(note.to.clone(), note.cc.clone())
+    .with_id(format!(
+        "{}/activity#updates/{}",
+        note.id.trim_end_matches('/'),
+        nodus_server_core::Id::new()
+    )))
+}
+
+/// The object a `Create` or `Update` carries: a `Question` when the status has a poll,
+/// otherwise the plain note.
+async fn status_object(
+    state: &AppState,
+    row: &StatusRow,
+    account: &AccountRow,
+) -> ApiResult<(Value, Note)> {
     let note = note_document(state, row, account).await?;
-    Ok(Activity::create(actor_url(state, account), &note))
+    let Some(poll) = polls::by_status(state.store().pool(), &row.id).await? else {
+        return Ok((note.to_json(), note));
+    };
+    let (counts, voters_count) = crate::polls::counts(state, &poll).await?;
+    let mut value = note.to_json();
+    let Some(map) = value.as_object_mut() else {
+        return Ok((value, note));
+    };
+    map.insert("type".to_owned(), Value::String("Question".to_owned()));
+    let options: Vec<Value> = poll
+        .options
+        .0
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            json!({
+                "type": "Note",
+                "name": name,
+                "replies": {
+                    "type": "Collection",
+                    "totalItems": counts.get(index).copied().unwrap_or(0),
+                },
+            })
+        })
+        .collect();
+    map.insert(
+        if poll.multiple { "anyOf" } else { "oneOf" }.to_owned(),
+        Value::Array(options),
+    );
+    if let Some(expires_at) = poll.expires_at {
+        map.insert(
+            "endTime".to_owned(),
+            Value::String(expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        );
+    }
+    map.insert("votersCount".to_owned(), json!(voters_count));
+    Ok((value, note))
 }
 
 /// Who a note is addressed to.
@@ -2637,6 +2720,180 @@ mod tests {
             assert_eq!(reports[0].account_id, reporter.id);
             assert_eq!(reports[0].target_account_id, target.id);
             assert_eq!(reports[0].comment, "spam & abuse");
+        })
+        .await;
+    }
+
+    async fn seed_local_poll(
+        store: &Store,
+        options: &[&str],
+        multiple: bool,
+        hide_totals: bool,
+    ) -> (AccountRow, StatusRow, String) {
+        let username = format!("ada_{}", Id::new());
+        let account = accounts::insert(
+            store.pool(),
+            &accounts::NewAccount {
+                username: &username,
+                display_name: &username,
+                note: "",
+                bot: false,
+                locked: false,
+            },
+        )
+        .await
+        .expect("insert local account");
+        let status_id = Id::new().to_string();
+        let options: Vec<String> = options.iter().map(|option| (*option).to_owned()).collect();
+        let poll_id = format!("{status_id}:poll");
+        let row = statuses::create_with_poll(
+            store.pool(),
+            &statuses::NewStatus {
+                id: &status_id,
+                account_id: &account.id,
+                content: "which one",
+                content_html: "<p>which one</p>",
+                content_source: Some("which one"),
+                content_format: "html",
+                spoiler_text: "",
+                visibility: "public",
+                sensitive: false,
+                in_reply_to_id: None,
+                in_reply_to_account_id: None,
+                reblog_of_id: None,
+                language: Some("en"),
+            },
+            &[],
+            &[],
+            &[],
+            Some(&polls::NewPoll {
+                id: &poll_id,
+                status_id: &status_id,
+                options: &options,
+                multiple,
+                hide_totals,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            }),
+        )
+        .await
+        .expect("insert status and poll");
+        (account, row, poll_id)
+    }
+
+    #[tokio::test]
+    async fn a_single_choice_poll_is_a_question_with_one_of() {
+        with_isolated_state(|store, state| async move {
+            let (account, row, _) = seed_local_poll(&store, &["tea", "coffee"], false, false).await;
+            let activity = status_activity(&state, &row, &account)
+                .await
+                .expect("build create");
+            let value = activity.to_json();
+            assert_eq!(value["type"], "Create");
+            let object = &value["object"];
+            assert_eq!(object["type"], "Question");
+            assert!(object.get("oneOf").is_some(), "single uses oneOf");
+            assert!(object.get("anyOf").is_none(), "single does not use anyOf");
+            assert_eq!(
+                object["oneOf"][0],
+                json!({
+                    "type": "Note",
+                    "name": "tea",
+                    "replies": {"type": "Collection", "totalItems": 0},
+                })
+            );
+            assert_eq!(object["votersCount"], 0);
+            assert!(object["endTime"]
+                .as_str()
+                .is_some_and(|end| end.ends_with('Z')));
+            assert_eq!(
+                object["to"],
+                json!(["https://www.w3.org/ns/activitystreams#Public"])
+            );
+            assert_eq!(
+                object["cc"],
+                json!([format!(
+                    "https://social.test/users/{}/followers",
+                    account.username
+                )])
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_multiple_choice_poll_uses_any_of_and_updates_carry_tallies() {
+        with_isolated_state(|store, state| async move {
+            let (account, row, poll) =
+                seed_local_poll(&store, &["tea", "coffee"], true, false).await;
+            let create = status_activity(&state, &row, &account)
+                .await
+                .expect("build create");
+            let value = create.to_json();
+            let object = &value["object"];
+            assert!(object.get("anyOf").is_some(), "multiple uses anyOf");
+            assert!(object.get("oneOf").is_none(), "multiple does not use oneOf");
+
+            let voter = accounts::insert(
+                store.pool(),
+                &accounts::NewAccount {
+                    username: &format!("voter_{}", Id::new()),
+                    display_name: "voter",
+                    note: "",
+                    bot: false,
+                    locked: false,
+                },
+            )
+            .await
+            .expect("insert voter");
+            assert!(polls::vote(store.pool(), &poll, &voter.id, &[1])
+                .await
+                .expect("vote"));
+
+            let update = status_update(&state, &row, &account)
+                .await
+                .expect("build update");
+            let value = update.to_json();
+            assert_eq!(value["type"], "Update");
+            let object = &value["object"];
+            assert_eq!(object["anyOf"][1]["replies"]["totalItems"], 1);
+            assert_eq!(object["anyOf"][0]["replies"]["totalItems"], 0);
+            assert_eq!(object["votersCount"], 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_echoed_question_cannot_take_over_a_local_poll() {
+        with_isolated_state(|store, state| async move {
+            let (_account, row, _) = seed_local_poll(&store, &["tea", "coffee"], false, false).await;
+            let remote = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let echoed = json!({
+                "id": status_url(&state, &row),
+                "type": "Question",
+                "attributedTo": "https://remote.test/users/mallory",
+                "content": "<p>stolen</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "oneOf": [
+                    {"type": "Note", "name": "stolen", "replies": {"type": "Collection", "totalItems": 9}},
+                    {"type": "Note", "name": "also stolen", "replies": {"type": "Collection", "totalItems": 1}},
+                ],
+            });
+            assert!(
+                ingest_note(&state, &remote, &echoed).await.is_err(),
+                "a remote account cannot own a local status URI"
+            );
+
+            let poll = polls::by_status(store.pool(), &row.id)
+                .await
+                .expect("read poll")
+                .expect("poll remains");
+            assert!(poll.local, "the poll is still local");
+            assert_eq!(poll.options.0, vec!["tea", "coffee"]);
+            let status = statuses::by_id(store.pool(), &row.id)
+                .await
+                .expect("read status")
+                .expect("status remains");
+            assert_eq!(status.content, "which one");
         })
         .await;
     }

@@ -5,7 +5,9 @@
 
 use std::collections::HashSet;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,75 @@ pub struct CreateStatus {
     /// Set to queue the post instead of publishing it.
     #[serde(default)]
     pub scheduled_at: Option<String>,
+    /// Mastodon's nested `poll` object: `{"options": [...], "expires_in": 300, ...}`.
+    #[serde(default)]
+    pub poll: Option<PollForm>,
+    /// The same fields as a form body spells them: `poll[options][]=yes`.
+    #[serde(default, rename = "poll[options][]")]
+    pub(crate) poll_options: Vec<String>,
+    #[serde(default, rename = "poll[options]")]
+    pub(crate) poll_options_unbracketed: Vec<String>,
+    #[serde(default, rename = "poll[expires_in]")]
+    pub(crate) poll_expires_in: Option<i64>,
+    #[serde(default, rename = "poll[expires_at]")]
+    pub(crate) poll_expires_at: Option<String>,
+    #[serde(default, rename = "poll[multiple]")]
+    pub(crate) poll_multiple: Option<bool>,
+    #[serde(default, rename = "poll[hide_totals]")]
+    pub(crate) poll_hide_totals: Option<bool>,
+}
+
+/// The `poll` a status is composed with.
+///
+/// Both JSON (`"poll": {...}`) and Mastodon's bracket form (`poll[options][]`) land in
+/// this shape, because a client that posts form-encoded is not making a mistake.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PollForm {
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub multiple: Option<bool>,
+    #[serde(default)]
+    pub hide_totals: Option<bool>,
+}
+
+impl CreateStatus {
+    /// The poll parameters, whichever spelling carried them.
+    fn poll_form(&self) -> Option<PollForm> {
+        if let Some(poll) = &self.poll {
+            return Some(poll.clone());
+        }
+        let bracketed = !self.poll_options.is_empty()
+            || !self.poll_options_unbracketed.is_empty()
+            || self.poll_expires_in.is_some()
+            || self.poll_expires_at.is_some()
+            || self.poll_multiple.is_some()
+            || self.poll_hide_totals.is_some();
+        bracketed.then(|| PollForm {
+            options: self
+                .poll_options
+                .iter()
+                .chain(self.poll_options_unbracketed.iter())
+                .cloned()
+                .collect(),
+            expires_in: self.poll_expires_in,
+            expires_at: self.poll_expires_at.clone(),
+            multiple: self.poll_multiple,
+            hide_totals: self.poll_hide_totals,
+        })
+    }
+}
+
+/// A poll that passed the compose rules, ready to write.
+struct NewPollRequest {
+    options: Vec<String>,
+    multiple: bool,
+    hide_totals: bool,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,9 +124,11 @@ pub struct ContextDto {
 pub async fn create(
     State(state): State<AppState>,
     auth: Auth,
-    Json(request): Json<CreateStatus>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> ApiResult<Response> {
     auth.require_scope("write:statuses")?;
+    let request = parse_create_request(&headers, &body)?;
     if let Some(at) = request.scheduled_at.as_deref() {
         let at = chrono::DateTime::parse_from_rfc3339(at.trim())
             .map_err(|_| ApiError::unprocessable("scheduled_at must be an ISO 8601 timestamp"))?
@@ -75,6 +148,92 @@ pub async fn create(
     Ok(Json(dto(&state, &row, Some(&auth)).await?).into_response())
 }
 
+/// Reads a compose request from JSON or Mastodon's bracket form encoding.
+///
+/// `serde_urlencoded` cannot collect repeated `poll[options][]` keys into a list, so the
+/// form is expanded here: bracket keys become the nested `poll` object the JSON body
+/// already uses, and repeated keys become arrays.
+fn parse_create_request(headers: &HeaderMap, body: &Bytes) -> ApiResult<CreateStatus> {
+    let form_encoded = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("application/x-www-form-urlencoded")
+        });
+    if !form_encoded {
+        return serde_json::from_slice(body)
+            .map_err(|error| ApiError::unprocessable(format!("invalid request body: {error}")));
+    }
+    let mut root = serde_json::Map::new();
+    let mut media_ids = Vec::new();
+    let mut poll = serde_json::Map::new();
+    for (key, value) in url::form_urlencoded::parse(body) {
+        let key = key.as_ref();
+        match key {
+            "media_ids[]" | "media_ids" => {
+                media_ids.push(serde_json::Value::String(value.into_owned()));
+            }
+            _ if key.starts_with("poll[") && key.ends_with(']') => {
+                let inner = &key["poll[".len()..key.len() - 1];
+                let inner = inner.strip_suffix("][").unwrap_or(inner);
+                match inner {
+                    "options[]" | "options" => {
+                        let entry = poll
+                            .entry("options")
+                            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                        if let serde_json::Value::Array(options) = entry {
+                            options.push(serde_json::Value::String(value.into_owned()));
+                        }
+                    }
+                    "multiple" | "hide_totals" => {
+                        poll.insert(inner.to_owned(), serde_json::Value::Bool(truthy(&value)));
+                    }
+                    "expires_in" => {
+                        let seconds = value.parse::<i64>().map_err(|_| {
+                            ApiError::unprocessable(
+                                "Validation failed: poll expiry must be between 5 minutes and 7 days",
+                            )
+                        })?;
+                        poll.insert(inner.to_owned(), serde_json::json!(seconds));
+                    }
+                    _ => {
+                        poll.insert(
+                            inner.to_owned(),
+                            serde_json::Value::String(value.into_owned()),
+                        );
+                    }
+                }
+            }
+            _ => {
+                let value = if key == "sensitive" {
+                    serde_json::Value::Bool(truthy(&value))
+                } else {
+                    serde_json::Value::String(value.into_owned())
+                };
+                root.insert(key.to_owned(), value);
+            }
+        }
+    }
+    if !media_ids.is_empty() {
+        root.insert("media_ids".to_owned(), serde_json::Value::Array(media_ids));
+    }
+    if !poll.is_empty() {
+        root.insert("poll".to_owned(), serde_json::Value::Object(poll));
+    }
+    serde_json::from_value(serde_json::Value::Object(root))
+        .map_err(|error| ApiError::unprocessable(format!("invalid request body: {error}")))
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "on"
+    )
+}
+
 /// Publishes a post for `account_id`.
 ///
 /// Kept apart from [`create`] because the scheduler publishes posts that no request asked
@@ -85,6 +244,7 @@ pub(crate) async fn publish(
     request: CreateStatus,
 ) -> ApiResult<StatusRow> {
     let visibility = validated(&request)?;
+    let poll = validated_poll(&request)?;
     let text = request.status.trim();
     let media_ids = validate_media(state, account_id, &request.media_ids).await?;
     let mention_ids = resolve_mentions(state, text).await?;
@@ -100,7 +260,19 @@ pub(crate) async fn publish(
     };
     let id = Id::new().to_string();
     let rendered = render(text);
-    let row = nodus_server_store::statuses::create(
+    let poll_id = poll.as_ref().map(|_| format!("{id}:poll"));
+    let new_poll = match (&poll, &poll_id) {
+        (Some(poll), Some(poll_id)) => Some(nodus_server_store::polls::NewPoll {
+            id: poll_id,
+            status_id: &id,
+            options: &poll.options,
+            multiple: poll.multiple,
+            hide_totals: poll.hide_totals,
+            expires_at: poll.expires_at,
+        }),
+        _ => None,
+    };
+    let row = nodus_server_store::statuses::create_with_poll(
         state.store().pool(),
         &NewStatus {
             id: &id,
@@ -123,6 +295,7 @@ pub(crate) async fn publish(
         &media_ids,
         &mention_ids,
         &tags,
+        new_poll.as_ref(),
     )
     .await?;
     notify_mentions(
@@ -150,8 +323,10 @@ fn validated(request: &CreateStatus) -> ApiResult<String> {
             "status must be at most {STATUS_MAX_CHARS} characters"
         )));
     }
-    if text.is_empty() && request.media_ids.is_empty() {
-        return Err(ApiError::unprocessable("status must contain text or media"));
+    if text.is_empty() && request.media_ids.is_empty() && request.poll_form().is_none() {
+        return Err(ApiError::unprocessable(
+            "status must contain text, media or a poll",
+        ));
     }
     // A scheduled post is stored with its visibility, so it has to be normalised before
     // it is written, not when it is published.
@@ -167,6 +342,72 @@ fn validated(request: &CreateStatus) -> ApiResult<String> {
         return Err(ApiError::unprocessable("invalid visibility"));
     }
     Ok(visibility)
+}
+
+/// Checks the compose rules Mastodon enforces on a poll, and resolves its expiry.
+fn validated_poll(request: &CreateStatus) -> ApiResult<Option<NewPollRequest>> {
+    let Some(form) = request.poll_form() else {
+        return Ok(None);
+    };
+    if form.options.is_empty() || form.options.iter().any(|option| option.trim().is_empty()) {
+        return Err(ApiError::unprocessable(
+            "Validation failed: poll options must not be empty",
+        ));
+    }
+    if form.options.len() < 2 {
+        return Err(ApiError::unprocessable(
+            "Validation failed: poll needs at least 2 options",
+        ));
+    }
+    if form.options.len() > 4 {
+        return Err(ApiError::unprocessable(
+            "Validation failed: poll needs at most 4 options",
+        ));
+    }
+    let options: Vec<String> = form
+        .options
+        .iter()
+        .map(|option| option.trim().to_owned())
+        .collect();
+    if options.iter().any(|option| option.chars().count() > 50) {
+        return Err(ApiError::unprocessable(
+            "Validation failed: poll option is too long",
+        ));
+    }
+    let now = chrono::Utc::now();
+    let min = chrono::Duration::minutes(5);
+    let max = chrono::Duration::days(7);
+    let expires_at = if let Some(seconds) = form.expires_in {
+        let seconds = chrono::Duration::seconds(seconds);
+        if seconds < min || seconds > max {
+            return Err(ApiError::unprocessable(
+                "Validation failed: poll expiry must be between 5 minutes and 7 days",
+            ));
+        }
+        Some(now + seconds)
+    } else if let Some(raw) = form.expires_at.as_deref() {
+        let at = chrono::DateTime::parse_from_rfc3339(raw.trim())
+            .map_err(|_| {
+                ApiError::unprocessable(
+                    "Validation failed: poll expiry must be between 5 minutes and 7 days",
+                )
+            })?
+            .with_timezone(&chrono::Utc);
+        if at < now + min || at > now + max {
+            return Err(ApiError::unprocessable(
+                "Validation failed: poll expiry must be between 5 minutes and 7 days",
+            ));
+        }
+        Some(at)
+    } else {
+        None
+    };
+    Ok(Some(NewPollRequest {
+        options,
+        multiple: form.multiple.unwrap_or(false),
+        hide_totals: form.hide_totals.unwrap_or(false),
+        expires_at,
+    }))
 }
 
 pub async fn show(

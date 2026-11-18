@@ -174,6 +174,53 @@ pub async fn deliver_create(
     enqueue(state, account_id, value, inboxes).await;
 }
 
+/// Tells the followers that a post changed.
+///
+/// Poll tallies move after publication, so the same outbox that carried the `Create`
+/// carries the `Update`: one queue, one retry policy, one dedupe rule.
+pub async fn deliver_update(
+    state: &AppState,
+    account_id: &str,
+    row: &nodus_server_store::statuses::StatusRow,
+) {
+    let account = match nodus_server_store::accounts::by_id(state.store().pool(), account_id).await
+    {
+        Ok(Some(account)) => account,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "could not read the author of an updated post");
+            return;
+        }
+    };
+    let activity = match crate::activitypub::status_update(state, row, &account).await {
+        Ok(activity) => activity,
+        Err(error) => {
+            tracing::warn!(error = %error.message(), "could not build an Update activity");
+            return;
+        }
+    };
+    let value = match serde_json::to_value(&activity) {
+        Ok(value) => identified(
+            value,
+            &crate::activitypub::actor_url(state, &account),
+            "activities",
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "could not serialise an Update activity");
+            return;
+        }
+    };
+    let mut inboxes = if row.visibility == "direct" {
+        Vec::new()
+    } else {
+        follower_inboxes(state, account_id).await
+    };
+    inboxes.extend(mention_inboxes(state, row).await);
+    inboxes.sort_unstable();
+    inboxes.dedup();
+    enqueue(state, account_id, value, inboxes).await;
+}
+
 /// Tells the followers that a post is gone.
 pub async fn deliver_delete(
     state: &AppState,

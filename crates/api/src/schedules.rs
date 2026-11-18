@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use crate::statuses::CreateStatus;
+use crate::statuses::{CreateStatus, PollForm};
 
 /// The composed post, echoed back exactly as stored.
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +33,9 @@ pub struct ScheduledParams {
     pub in_reply_to_id: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
+    /// Kept as the nested shape so a scheduled poll round-trips through the queue.
+    #[serde(default)]
+    pub poll: Option<PollForm>,
 }
 
 /// One queued post, as Mastodon shapes it.
@@ -56,6 +59,7 @@ impl ScheduledStatusDto {
                 media_ids: Vec::new(),
                 in_reply_to_id: None,
                 language: None,
+                poll: None,
             },
         );
         Self {
@@ -115,6 +119,7 @@ pub(crate) async fn store(
         media_ids: request.media_ids.clone(),
         in_reply_to_id: request.in_reply_to_id.clone(),
         language: request.language.clone().filter(|value| !value.is_empty()),
+        poll: request.poll.clone(),
     };
     let value = serde_json::to_value(&params)
         .map_err(|error| ApiError::unprocessable(format!("could not store the post: {error}")))?;
@@ -151,6 +156,13 @@ pub async fn publish_due(state: &AppState) -> ApiResult<usize> {
             media_ids: params.media_ids,
             content_type: None,
             scheduled_at: None,
+            poll: params.poll,
+            poll_options: Vec::new(),
+            poll_options_unbracketed: Vec::new(),
+            poll_expires_in: None,
+            poll_expires_at: None,
+            poll_multiple: None,
+            poll_hide_totals: None,
         };
         match crate::statuses::publish(state, &row.account_id, request).await {
             Ok(status) => {

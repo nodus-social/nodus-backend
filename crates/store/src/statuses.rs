@@ -759,8 +759,26 @@ pub async fn create(
     mention_ids: &[String],
     tags: &[String],
 ) -> Result<StatusRow, sqlx::Error> {
+    create_with_poll(pool, new, media_ids, mention_ids, tags, None).await
+}
+
+/// Inserts a status and, when one was composed with it, its poll.
+///
+/// Both rows commit together: a status that survived without the poll the reader attached
+/// would be a post whose question vanished between request and response.
+pub async fn create_with_poll(
+    pool: &PgPool,
+    new: &NewStatus<'_>,
+    media_ids: &[String],
+    mention_ids: &[String],
+    tags: &[String],
+    poll: Option<&crate::polls::NewPoll<'_>>,
+) -> Result<StatusRow, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let row = insert_row(&mut tx, new).await?;
+    if let Some(poll) = poll {
+        crate::polls::create_in_tx(&mut tx, poll).await?;
+    }
 
     if !media_ids.is_empty() {
         sqlx::query(

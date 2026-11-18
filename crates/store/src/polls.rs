@@ -41,6 +41,20 @@ const COLUMNS: &str = "p.id, p.status_id, p.options, p.multiple, p.hide_totals, 
 
 /// Inserts the poll attached to an existing status.
 pub async fn create(pool: &PgPool, new: &NewPoll<'_>) -> Result<PollRow, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    create_in_tx(&mut tx, new).await?;
+    tx.commit().await?;
+    by_id(pool, new.id).await?.ok_or(sqlx::Error::RowNotFound)
+}
+
+/// Inserts the poll inside the caller's transaction.
+///
+/// A status and its poll are one write: a committed status whose poll insert failed would
+/// be a post that silently lost its question, so the status path calls this before commit.
+pub async fn create_in_tx(
+    conn: &mut sqlx::PgConnection,
+    new: &NewPoll<'_>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO poll (id, status_id, options, multiple, hide_totals, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6)",
@@ -51,9 +65,9 @@ pub async fn create(pool: &PgPool, new: &NewPoll<'_>) -> Result<PollRow, sqlx::E
     .bind(new.multiple)
     .bind(new.hide_totals)
     .bind(new.expires_at)
-    .execute(pool)
+    .execute(conn)
     .await?;
-    by_id(pool, new.id).await?.ok_or(sqlx::Error::RowNotFound)
+    Ok(())
 }
 
 /// A poll the peer already voted on. Its counts are the peer's snapshot, not rows here,
@@ -70,10 +84,7 @@ pub struct NewRemotePoll<'a> {
 }
 
 /// Inserts or refreshes the poll attached to an ingested status.
-pub async fn upsert_remote(
-    pool: &PgPool,
-    new: &NewRemotePoll<'_>,
-) -> Result<PollRow, sqlx::Error> {
+pub async fn upsert_remote(pool: &PgPool, new: &NewRemotePoll<'_>) -> Result<PollRow, sqlx::Error> {
     let id = format!("{}:poll", new.status_id);
     let mut tx = pool.begin().await?;
     sqlx::query(
