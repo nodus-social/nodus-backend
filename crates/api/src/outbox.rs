@@ -205,6 +205,7 @@ pub async fn deliver_follow_response(
     account_id: &str,
     requester_id: &str,
     accepted: bool,
+    follow_id: Option<&str>,
 ) {
     let (Ok(Some(actor_row)), Ok(Some(requester))) = (
         nodus_server_store::accounts::by_id(state.store().pool(), account_id).await,
@@ -213,19 +214,37 @@ pub async fn deliver_follow_response(
         return;
     };
     let actor = crate::activitypub::actor_url(state, &actor_row);
-    let object = crate::activitypub::actor_url(state, &requester);
+    // The object of an Accept is the Follow that asked, not the follower: Mastodon matches
+    // the answer to the request by that activity, and a bare actor URL resolves nothing.
+    let follower = crate::activitypub::actor_url(state, &requester);
     let kind = if accepted {
         ActivityKind::Accept
     } else {
         ActivityKind::Reject
     };
-    let label = if accepted { "accepts" } else { "rejects" };
-    let value = pointing(kind, label, &actor, &object);
+    let value = follow_answer(kind, &actor, &follower, follow_id);
     if let Ok(Some(inbox)) =
         nodus_server_store::delivery::inbox_of(state.store().pool(), requester_id).await
     {
         enqueue(state, account_id, value, vec![inbox]).await;
     }
+}
+
+/// The Accept or Reject that answers a follow, carrying the request it answers.
+fn follow_answer(
+    kind: ActivityKind,
+    actor: &str,
+    follower: &str,
+    follow_id: Option<&str>,
+) -> Value {
+    let object = follow_id.map_or_else(
+        || json!({ "type": "Follow", "actor": follower, "object": actor }),
+        |id| json!({ "id": id, "type": "Follow", "actor": follower, "object": actor }),
+    );
+    let activity = Activity::new(kind, actor, follower);
+    let mut value = serde_json::to_value(&activity).unwrap_or_else(|_| json!({}));
+    value["object"] = object;
+    identified(value, actor, if kind == ActivityKind::Accept { "accepts" } else { "rejects" })
 }
 
 /// Tells the author of a post that it was favourited or boosted, or that it was not.
@@ -382,5 +401,52 @@ pub async fn run(state: AppState) {
         if sent > 0 {
             tracing::debug!(sent, "delivery round finished");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{follow_answer, ActivityKind};
+
+    #[test]
+    fn an_accept_answers_the_follow_it_received() {
+        let value = follow_answer(
+            ActivityKind::Accept,
+            "https://social.test/users/ada",
+            "https://mastodon.test/users/eve",
+            Some("https://mastodon.test/users/eve#follows/7"),
+        );
+        assert_eq!(value["type"], "Accept");
+        assert_eq!(value["actor"], "https://social.test/users/ada");
+        assert_eq!(value["object"]["type"], "Follow");
+        assert_eq!(
+            value["object"]["id"],
+            "https://mastodon.test/users/eve#follows/7"
+        );
+        assert_eq!(value["object"]["actor"], "https://mastodon.test/users/eve");
+        assert_eq!(value["object"]["object"], "https://social.test/users/ada");
+    }
+
+    #[test]
+    fn an_accept_without_an_id_still_names_the_follow() {
+        let value = follow_answer(
+            ActivityKind::Accept,
+            "https://social.test/users/ada",
+            "https://mastodon.test/users/eve",
+            None,
+        );
+        assert_eq!(value["object"]["type"], "Follow");
+        assert!(value["object"].get("id").is_none());
+    }
+
+    #[test]
+    fn a_reject_says_so() {
+        let value = follow_answer(
+            ActivityKind::Reject,
+            "https://social.test/users/ada",
+            "https://mastodon.test/users/eve",
+            None,
+        );
+        assert_eq!(value["type"], "Reject");
     }
 }

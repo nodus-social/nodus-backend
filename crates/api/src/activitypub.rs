@@ -365,7 +365,7 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
     match activity.kind {
         ActivityKind::Follow => {
             if let Some(target) = activity_target_id(activity) {
-                follow_local(state, &remote, target).await?;
+                follow_local(state, &remote, target, activity.id.as_deref()).await?;
             }
         }
         ActivityKind::Undo => {
@@ -608,7 +608,12 @@ async fn local_target(state: &AppState, actor_url: &str) -> ApiResult<Option<Acc
         .map_err(Into::into)
 }
 
-async fn follow_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiResult<()> {
+async fn follow_local(
+    state: &AppState,
+    remote: &AccountRow,
+    target: &str,
+    follow_id: Option<&str>,
+) -> ApiResult<()> {
     let Some(local) = local_target(state, target).await? else {
         return Ok(());
     };
@@ -616,6 +621,11 @@ async fn follow_local(state: &AppState, remote: &AccountRow, target: &str) -> Ap
         .await?;
     nodus_server_store::social::notify(state.store().pool(), &local.id, "follow", &remote.id, None)
         .await?;
+    // An unlocked account has already accepted: the remote server is waiting for the
+    // answer, and until it arrives the follow is stuck at "requested" on their side.
+    if !local.locked {
+        crate::outbox::deliver_follow_response(state, &local.id, &remote.id, true, follow_id).await;
+    }
     Ok(())
 }
 

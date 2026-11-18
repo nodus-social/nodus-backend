@@ -47,7 +47,7 @@ pub async fn authorize(
         nodus_server_store::social::accept_follow(state.store().pool(), &auth.0.account.id, &id)
             .await?;
     if accepted {
-        crate::outbox::deliver_follow_response(&state, &auth.0.account.id, &id, true).await;
+        crate::outbox::deliver_follow_response(&state, &auth.0.account.id, &id, true, None).await;
     }
     Ok(Json(serde_json::json!({})))
 }
@@ -63,7 +63,7 @@ pub async fn reject(
         nodus_server_store::social::reject_follow(state.store().pool(), &auth.0.account.id, &id)
             .await?;
     if rejected {
-        crate::outbox::deliver_follow_response(&state, &auth.0.account.id, &id, false).await;
+        crate::outbox::deliver_follow_response(&state, &auth.0.account.id, &id, false, None).await;
     }
     Ok(Json(serde_json::json!({})))
 }
