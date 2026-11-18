@@ -4,7 +4,8 @@ use nodus_server_store::accounts::{self, NewAccount, RemoteAccount};
 use nodus_server_store::blocks;
 use nodus_server_store::delivery;
 use nodus_server_store::media::{self, RemoteAttachment};
-use nodus_server_store::statuses::{self, NewRemoteStatus, NewStatus};
+use nodus_server_store::polls::{self, NewRemotePoll};
+use nodus_server_store::statuses::{self, NewRemoteStatus, NewStatus, StatusEmoji};
 use sqlx::PgPool;
 
 async fn seed_account(pool: &PgPool, username: &str) -> String {
@@ -237,6 +238,118 @@ async fn deleting_a_remote_actor_soft_deletes_every_note_it_posted(pool: PgPool)
         0,
         "deleting twice must not fail or count the same rows again"
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_note_keeps_two_hashtags_one_mention_and_one_emoji(pool: PgPool) {
+    let eve = seed_remote(&pool, "https://remote.test/users/eve").await;
+    let mentioned = seed_remote(&pool, "https://remote.test/users/alice").await;
+    let row = ingest(&pool, &eve, "https://remote.test/notes/tags").await;
+
+    statuses::replace_tags(
+        &pool,
+        &row.id,
+        &["rust".to_owned(), "fedi".to_owned()],
+    )
+    .await
+    .expect("store hashtags");
+    statuses::replace_mentions(&pool, &row.id, std::slice::from_ref(&mentioned))
+        .await
+        .expect("store mention");
+    let emoji = StatusEmoji {
+        shortcode: "ferris".to_owned(),
+        url: "https://remote.test/emoji/ferris.png".to_owned(),
+    };
+    statuses::replace_emojis(&pool, &row.id, std::slice::from_ref(&emoji))
+        .await
+        .expect("store emoji");
+
+    assert_eq!(
+        statuses::tags_of(&pool, &row.id).await.expect("read tags"),
+        vec!["fedi".to_owned(), "rust".to_owned()]
+    );
+    assert_eq!(
+        statuses::mentions_of(&pool, &row.id)
+            .await
+            .expect("read mentions"),
+        vec![mentioned]
+    );
+    let emojis = statuses::emojis_of(&pool, &row.id)
+        .await
+        .expect("read emojis");
+    assert_eq!(emojis.len(), 1);
+    assert_eq!(emojis[0].shortcode, "ferris");
+    assert_eq!(emojis[0].url, "https://remote.test/emoji/ferris.png");
+
+    // A later delivery replaces the set; it must not append a second copy.
+    statuses::replace_emojis(&pool, &row.id, &[])
+        .await
+        .expect("clear emojis");
+    assert!(statuses::emojis_of(&pool, &row.id)
+        .await
+        .expect("read emojis")
+        .is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_remote_poll_keeps_the_peers_options_and_counts(pool: PgPool) {
+    let eve = seed_remote(&pool, "https://remote.test/users/eve").await;
+    let row = ingest(&pool, &eve, "https://remote.test/notes/poll").await;
+    let expires_at = Utc::now() + chrono::Duration::hours(1);
+    let poll = polls::upsert_remote(
+        &pool,
+        &NewRemotePoll {
+            status_id: &row.id,
+            options: &["yes".to_owned(), "no".to_owned()],
+            multiple: false,
+            expires_at: Some(expires_at),
+            voters_count: 5,
+            tallies: &[3, 2],
+        },
+    )
+    .await
+    .expect("store remote poll");
+
+    assert!(!poll.local, "a federated poll is read-only here");
+    assert_eq!(poll.options.0, vec!["yes".to_owned(), "no".to_owned()]);
+    assert_eq!(poll.voters_count, 5);
+    assert_eq!(
+        poll.expires_at.map(|at| at.timestamp()),
+        Some(expires_at.timestamp())
+    );
+    let counts = polls::tally_counts(&pool, &poll.id)
+        .await
+        .expect("read tallies");
+    assert_eq!(counts.len(), 2);
+    assert_eq!((counts[0].option_index, counts[0].votes), (0, 3));
+    assert_eq!((counts[1].option_index, counts[1].votes), (1, 2));
+
+    // An update carries the peer's new snapshot; the old numbers are replaced, not added.
+    let refreshed = polls::upsert_remote(
+        &pool,
+        &NewRemotePoll {
+            status_id: &row.id,
+            options: &["yes".to_owned(), "no".to_owned()],
+            multiple: false,
+            expires_at: Some(expires_at),
+            voters_count: 2,
+            tallies: &[1, 1],
+        },
+    )
+    .await
+    .expect("refresh remote poll");
+    assert_eq!(refreshed.id, poll.id);
+    let counts = polls::tally_counts(&pool, &poll.id)
+        .await
+        .expect("read tallies");
+    assert_eq!(counts.iter().map(|count| count.votes).sum::<i64>(), 2);
+    let local_votes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM poll_vote WHERE poll_id = $1")
+            .bind(&poll.id)
+            .fetch_one(&pool)
+            .await
+            .expect("count local votes");
+    assert_eq!(local_votes, 0, "peer votes must not become local accounts");
 }
 
 #[sqlx::test(migrations = "./migrations")]

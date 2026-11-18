@@ -29,13 +29,24 @@ pub(crate) async fn document(
     viewer: Option<&str>,
 ) -> ApiResult<PollDto> {
     let pool = state.store().pool();
-    let counts: HashMap<i32, i64> = polls::option_counts(pool, &row.id)
-        .await?
-        .into_iter()
-        .map(|count| (count.option_index, count.votes))
-        .collect();
+    // A local poll counts its own `poll_vote` rows; a federated poll keeps the snapshot
+    // the peer sent, because nobody here voted and inventing voters would double count.
+    let (counts, voter_count) = if row.local {
+        let counts: HashMap<i32, i64> = polls::option_counts(pool, &row.id)
+            .await?
+            .into_iter()
+            .map(|count| (count.option_index, count.votes))
+            .collect();
+        (counts, polls::voters_count(pool, &row.id).await?)
+    } else {
+        let counts: HashMap<i32, i64> = polls::tally_counts(pool, &row.id)
+            .await?
+            .into_iter()
+            .map(|count| (count.option_index, count.votes))
+            .collect();
+        (counts, row.voters_count)
+    };
     let total_votes = counts.values().sum();
-    let voter_count = polls::voters_count(pool, &row.id).await?;
     let expired = row.expires_at.is_some_and(|at| at <= Utc::now());
     let (voted, own_votes) = match viewer {
         Some(account_id) => (

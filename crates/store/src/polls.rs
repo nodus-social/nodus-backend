@@ -19,6 +19,9 @@ pub struct PollRow {
     pub multiple: bool,
     pub hide_totals: bool,
     pub expires_at: Option<DateTime<Utc>>,
+    /// The peer's `votersCount` on a federated poll; zero on a local poll, where the
+    /// distinct voters are counted from `poll_vote` instead.
+    pub voters_count: i64,
     /// False when the owning status was federated in; its poll is read-only here.
     pub local: bool,
 }
@@ -34,7 +37,7 @@ pub struct NewPoll<'a> {
 }
 
 const COLUMNS: &str = "p.id, p.status_id, p.options, p.multiple, p.hide_totals, \
-     p.expires_at, s.local";
+     p.expires_at, p.voters_count, s.local";
 
 /// Inserts the poll attached to an existing status.
 pub async fn create(pool: &PgPool, new: &NewPoll<'_>) -> Result<PollRow, sqlx::Error> {
@@ -51,6 +54,77 @@ pub async fn create(pool: &PgPool, new: &NewPoll<'_>) -> Result<PollRow, sqlx::E
     .execute(pool)
     .await?;
     by_id(pool, new.id).await?.ok_or(sqlx::Error::RowNotFound)
+}
+
+/// A poll the peer already voted on. Its counts are the peer's snapshot, not rows here,
+/// so an `Update` replaces them wholesale instead of adding a second tally.
+#[derive(Debug, Clone)]
+pub struct NewRemotePoll<'a> {
+    pub status_id: &'a str,
+    pub options: &'a [String],
+    pub multiple: bool,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub voters_count: i64,
+    /// Votes per option, in option order. Missing or extra indexes are tolerated.
+    pub tallies: &'a [i64],
+}
+
+/// Inserts or refreshes the poll attached to an ingested status.
+pub async fn upsert_remote(
+    pool: &PgPool,
+    new: &NewRemotePoll<'_>,
+) -> Result<PollRow, sqlx::Error> {
+    let id = format!("{}:poll", new.status_id);
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO poll (id, status_id, options, multiple, hide_totals, expires_at, \
+         voters_count) VALUES ($1, $2, $3, $4, false, $5, $6) \
+         ON CONFLICT (status_id) DO UPDATE SET options = EXCLUDED.options, \
+         multiple = EXCLUDED.multiple, hide_totals = EXCLUDED.hide_totals, \
+         expires_at = EXCLUDED.expires_at, voters_count = EXCLUDED.voters_count",
+    )
+    .bind(&id)
+    .bind(new.status_id)
+    .bind(Json(new.options.to_vec()))
+    .bind(new.multiple)
+    .bind(new.expires_at)
+    .bind(new.voters_count)
+    .execute(&mut *tx)
+    .await?;
+    let poll_id: String = sqlx::query_scalar("SELECT id FROM poll WHERE status_id = $1")
+        .bind(new.status_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM poll_tally WHERE poll_id = $1")
+        .bind(&poll_id)
+        .execute(&mut *tx)
+        .await?;
+    for (index, votes) in new.tallies.iter().enumerate() {
+        if *votes == 0 {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO poll_tally (poll_id, option_index, votes) VALUES ($1, $2, $3) \
+             ON CONFLICT (poll_id, option_index) DO UPDATE SET votes = EXCLUDED.votes",
+        )
+        .bind(&poll_id)
+        .bind(i32::try_from(index).unwrap_or(i32::MAX))
+        .bind(votes)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    by_id(pool, &poll_id).await?.ok_or(sqlx::Error::RowNotFound)
+}
+
+/// The peer-reported votes per option, for the options that have at least one.
+pub async fn tally_counts(pool: &PgPool, poll_id: &str) -> Result<Vec<OptionCount>, sqlx::Error> {
+    sqlx::query_as::<_, OptionCount>(
+        "SELECT option_index, votes FROM poll_tally WHERE poll_id = $1 ORDER BY option_index",
+    )
+    .bind(poll_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// A poll by its own id; deleted statuses take their polls with them.

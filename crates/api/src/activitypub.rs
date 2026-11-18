@@ -28,6 +28,7 @@ use nodus_server_sdk::activitypub::{
 };
 use nodus_server_store::accounts::{self, AccountRow};
 use nodus_server_store::media;
+use nodus_server_store::polls;
 use nodus_server_store::statuses::{self, StatusRow};
 
 use crate::error::{ApiError, ApiResult};
@@ -562,10 +563,10 @@ async fn update_remote_object(
         ));
     }
     match document_type(value) {
-        Some("Note") => {
+        Some("Note" | "Question") => {
             let note = Note::from_json(value)
                 .map_err(|error| ApiError::unprocessable(error.to_string()))?;
-            update_remote_note(state, remote, activity, &note).await
+            update_remote_note(state, remote, activity, value, &note).await
         }
         Some("Person" | "Service" | "Application" | "Organization" | "Group") => {
             let actor = Actor::from_json(value)
@@ -583,6 +584,7 @@ async fn update_remote_note(
     state: &AppState,
     remote: &AccountRow,
     activity: &Activity,
+    value: &Value,
     note: &Note,
 ) -> ApiResult<()> {
     let actor_uri = remote.uri.as_deref().unwrap_or(&activity.actor);
@@ -603,7 +605,8 @@ async fn update_remote_note(
     else {
         return Ok(());
     };
-    store_note_extras(state, remote, note, &row).await
+    store_note_extras(state, remote, note, &row).await?;
+    store_note_poll(state, value, &row).await
 }
 
 async fn update_remote_actor_document(
@@ -1107,7 +1110,8 @@ pub(crate) async fn ingest_note(
         },
     )
     .await?;
-    store_note_extras(state, remote, &note, &row).await
+    store_note_extras(state, remote, &note, &row).await?;
+    store_note_poll(state, value, &row).await
 }
 
 /// Checks that a note really is the sending actor's, and that no other account already
@@ -1141,7 +1145,7 @@ async fn ensure_note_from_actor(
 }
 
 /// Keeps the parts of an ingested note that live outside the status row: who it mentions,
-/// its hashtags and its media.
+/// its hashtags, its custom emoji and its media.
 async fn store_note_extras(
     state: &AppState,
     remote: &AccountRow,
@@ -1161,6 +1165,7 @@ async fn store_note_extras(
     mentions.dedup();
     statuses::replace_mentions(pool, &row.id, &mentions).await?;
     statuses::replace_tags(pool, &row.id, &hashtags_of(note)).await?;
+    statuses::replace_emojis(pool, &row.id, &emojis_of(note)).await?;
     media::replace_remote(
         pool,
         &row.id,
@@ -1186,6 +1191,127 @@ fn hashtags_of(note: &Note) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+fn emojis_of(note: &Note) -> Vec<statuses::StatusEmoji> {
+    let mut seen = std::collections::HashSet::new();
+    note.emojis
+        .iter()
+        .filter(|emoji| validate_remote_url(&emoji.url).is_ok())
+        .filter_map(|emoji| {
+            let shortcode = emoji.shortcode.trim_matches(':').to_owned();
+            (!shortcode.is_empty() && seen.insert(shortcode.clone())).then_some(
+                statuses::StatusEmoji {
+                    shortcode,
+                    url: emoji.url.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// A peer's `Question`, or a `Note` that carries one as an attachment or inline options.
+fn question_document(value: &Value) -> Option<&Value> {
+    if matches!(document_type(value), Some("Question"))
+        || value.get("oneOf").is_some()
+        || value.get("anyOf").is_some()
+    {
+        return Some(value);
+    }
+    value
+        .get("attachment")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| matches!(document_type(item), Some("Question")))
+        })
+}
+
+struct RemotePoll {
+    options: Vec<String>,
+    tallies: Vec<i64>,
+    multiple: bool,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    voters_count: i64,
+}
+
+fn remote_poll_of(value: &Value) -> Option<RemotePoll> {
+    let multiple = value.get("anyOf").is_some();
+    let options = value
+        .get("oneOf")
+        .or_else(|| value.get("anyOf"))?
+        .as_array()?;
+    if options.is_empty() || options.len() > 4 {
+        tracing::debug!(
+            options = options.len(),
+            "ignoring a poll this instance cannot hold"
+        );
+        return None;
+    }
+    let titles: Vec<String> = options
+        .iter()
+        .map(|option| {
+            option
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    let tallies: Vec<i64> = options.iter().map(poll_tally).collect();
+    let voters_count = value
+        .get("votersCount")
+        .or_else(|| value.get("voters_count"))
+        .and_then(Value::as_i64)
+        .filter(|count| *count >= 0)
+        .unwrap_or_else(|| tallies.iter().sum());
+    let expires_at = value
+        .get("endTime")
+        .and_then(Value::as_str)
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&chrono::Utc));
+    Some(RemotePoll {
+        options: titles,
+        tallies,
+        multiple,
+        expires_at,
+        voters_count,
+    })
+}
+
+fn poll_tally(option: &Value) -> i64 {
+    option
+        .get("replies")
+        .and_then(|replies| replies.get("totalItems"))
+        .or_else(|| option.get("votes_count"))
+        .or_else(|| option.get("votesCount"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0)
+}
+
+/// Stores a federated poll as the same rows a local poll uses, with the peer's counts.
+async fn store_note_poll(state: &AppState, value: &Value, row: &StatusRow) -> ApiResult<()> {
+    let Some(question) = question_document(value) else {
+        return Ok(());
+    };
+    let Some(poll) = remote_poll_of(question) else {
+        return Ok(());
+    };
+    polls::upsert_remote(
+        state.store().pool(),
+        &polls::NewRemotePoll {
+            status_id: &row.id,
+            options: &poll.options,
+            multiple: poll.multiple,
+            expires_at: poll.expires_at,
+            voters_count: poll.voters_count,
+            tallies: &poll.tallies,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 fn remote_attachments(note: &Note) -> Vec<media::RemoteAttachment<'_>> {
@@ -1990,6 +2116,133 @@ mod tests {
                 Some("https://remote.test/media/1.png")
             );
             assert_eq!(stored[0].description, "alt text");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_ingested_note_serves_tags_emoji_and_media_in_its_dto() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let mentioned = seed_remote(&store, "https://remote.test/users/eve").await;
+            let note_uri = format!("https://remote.test/notes/{}", Id::new());
+            let note = serde_json::json!({
+                "id": note_uri,
+                "type": "Note",
+                "published": "2026-01-01T00:00:00Z",
+                "content": "<p>:ferris: look #Rust</p>",
+                "tag": [
+                    {"type": "Mention", "href": mentioned.uri.clone().unwrap()},
+                    {"type": "Hashtag", "name": "#Rust"},
+                    {"type": "Hashtag", "name": "#fedi"},
+                    {"type": "Emoji", "name": ":ferris:", "icon": {"type": "Image", "url": "https://remote.test/emoji/ferris.png"}}
+                ],
+                "attachment": [{
+                    "type": "Image",
+                    "url": "https://remote.test/media/1.png",
+                    "name": "alt text",
+                    "width": 640,
+                    "height": 480
+                }]
+            });
+
+            ingest_note(&state, &author, &note)
+                .await
+                .expect("ingest note");
+            let row = statuses::by_uri(store.pool(), &note_uri)
+                .await
+                .expect("lookup")
+                .expect("stored status");
+            let dto = crate::statuses::dto(&state, &row, None)
+                .await
+                .expect("build status dto");
+            let body = serde_json::to_value(dto).expect("serialize status dto");
+
+            assert_eq!(body["tags"][0]["name"], "fedi");
+            assert_eq!(body["tags"][1]["name"], "rust");
+            assert_eq!(body["mentions"][0]["username"], "eve");
+            assert_eq!(body["emojis"][0]["shortcode"], "ferris");
+            assert_eq!(
+                body["emojis"][0]["url"],
+                "https://remote.test/emoji/ferris.png"
+            );
+            assert_eq!(
+                body["media_attachments"][0]["url"],
+                "https://remote.test/media/1.png"
+            );
+            assert_eq!(body["media_attachments"][0]["type"], "image");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_ingested_question_becomes_a_read_only_poll_with_the_peers_counts() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let question_uri = format!("https://remote.test/questions/{}", Id::new());
+            let question = serde_json::json!({
+                "id": question_uri,
+                "type": "Question",
+                "published": "2026-01-01T00:00:00Z",
+                "content": "<p>which?</p>",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"],
+                "oneOf": [
+                    {"type": "Note", "name": "yes", "replies": {"type": "Collection", "totalItems": 3}},
+                    {"type": "Note", "name": "no", "replies": {"type": "Collection", "totalItems": 2}}
+                ],
+                "endTime": "2030-01-01T00:00:00Z",
+                "votersCount": 5
+            });
+
+            ingest_note(&state, &author, &question)
+                .await
+                .expect("ingest question");
+            let row = statuses::by_uri(store.pool(), &question_uri)
+                .await
+                .expect("lookup")
+                .expect("stored status");
+            let poll = polls::by_status(store.pool(), &row.id)
+                .await
+                .expect("read poll")
+                .expect("question became a poll");
+            assert!(!poll.local);
+            assert!(!poll.multiple);
+            assert_eq!(poll.options.0, vec!["yes".to_owned(), "no".to_owned()]);
+            assert_eq!(poll.voters_count, 5);
+            let counts = polls::tally_counts(store.pool(), &poll.id)
+                .await
+                .expect("read tallies");
+            assert_eq!(counts.len(), 2);
+            assert_eq!((counts[0].option_index, counts[0].votes), (0, 3));
+            assert_eq!((counts[1].option_index, counts[1].votes), (1, 2));
+
+            let updated = serde_json::json!({
+                "id": question_uri,
+                "type": "Question",
+                "content": "<p>still which?</p>",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"],
+                "oneOf": [
+                    {"type": "Note", "name": "yes", "replies": {"type": "Collection", "totalItems": 1}},
+                    {"type": "Note", "name": "no", "replies": {"type": "Collection", "totalItems": 4}}
+                ],
+                "endTime": "2030-01-01T00:00:00Z",
+                "votersCount": 5
+            });
+            let activity = Activity::new(
+                ActivityKind::Update,
+                author.uri.clone().unwrap(),
+                updated,
+            );
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest poll update");
+
+            let counts = polls::tally_counts(store.pool(), &poll.id)
+                .await
+                .expect("read tallies");
+            assert_eq!(counts.len(), 2);
+            assert_eq!((counts[0].option_index, counts[0].votes), (0, 1));
+            assert_eq!((counts[1].option_index, counts[1].votes), (1, 4));
         })
         .await;
     }

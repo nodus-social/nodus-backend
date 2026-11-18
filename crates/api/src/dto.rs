@@ -181,6 +181,7 @@ pub struct StatusDto {
     pub media_attachments: Vec<MediaAttachmentDto>,
     pub mentions: Vec<serde_json::Value>,
     pub tags: Vec<serde_json::Value>,
+    pub emojis: Vec<serde_json::Value>,
     pub card: Option<serde_json::Value>,
     pub poll: Option<serde_json::Value>,
     pub application: Option<ApplicationDto>,
@@ -333,6 +334,7 @@ impl StatusDto {
                 .collect(),
             mentions: Vec::new(),
             tags: Vec::new(),
+            emojis: Vec::new(),
             card: None,
             poll: None,
             application: Some(ApplicationDto {

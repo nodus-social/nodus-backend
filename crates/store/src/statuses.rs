@@ -110,6 +110,50 @@ pub async fn replace_mentions(
     Ok(())
 }
 
+/// A custom emoji a status uses, without the surrounding colons.
+#[derive(Debug, Clone, FromRow)]
+pub struct StatusEmoji {
+    pub shortcode: String,
+    pub url: String,
+}
+
+/// The custom emoji a status uses, in the order the peer sent them.
+pub async fn emojis_of(pool: &PgPool, status_id: &str) -> Result<Vec<StatusEmoji>, sqlx::Error> {
+    sqlx::query_as::<_, StatusEmoji>(
+        "SELECT shortcode, url FROM status_emoji WHERE status_id = $1 ORDER BY position, shortcode",
+    )
+    .bind(status_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Replaces the custom emoji a remote status uses.
+pub async fn replace_emojis(
+    pool: &PgPool,
+    status_id: &str,
+    emojis: &[StatusEmoji],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM status_emoji WHERE status_id = $1")
+        .bind(status_id)
+        .execute(&mut *tx)
+        .await?;
+    for (position, emoji) in emojis.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO status_emoji (status_id, shortcode, url, position) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(status_id)
+        .bind(&emoji.shortcode)
+        .bind(&emoji.url)
+        .bind(i32::try_from(position).unwrap_or(i32::MAX))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Replaces the hashtags a remote status carries.
 pub async fn replace_tags(
     pool: &PgPool,

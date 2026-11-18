@@ -461,6 +461,18 @@ async fn decorate(
             })
         })
         .collect();
+    let emojis = nodus_server_store::statuses::emojis_of(pool, status_id).await?;
+    dto.emojis = emojis
+        .into_iter()
+        .map(|emoji| {
+            serde_json::json!({
+                "shortcode": emoji.shortcode,
+                "url": emoji.url,
+                "static_url": emoji.url,
+                "visible_in_picker": true,
+            })
+        })
+        .collect();
     let mentions = nodus_server_store::statuses::mentions_of(pool, status_id).await?;
     for account_id in mentions {
         let Some(account) = nodus_server_store::accounts::by_id(pool, &account_id).await? else {

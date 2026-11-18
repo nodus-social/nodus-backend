@@ -13,7 +13,7 @@ use tower::ServiceExt;
 use nodus_server_api::{root_router, AppState, InstanceConfig};
 use nodus_server_core::Id;
 use nodus_server_store::accounts::{self, NewAccount};
-use nodus_server_store::polls::{self, NewPoll};
+use nodus_server_store::polls::{self, NewPoll, NewRemotePoll};
 use nodus_server_store::statuses::{self, NewRemoteStatus, NewStatus};
 use nodus_server_store::{apps, Store};
 
@@ -405,7 +405,28 @@ async fn a_remote_poll_cannot_be_voted_on() {
         )
         .await
         .expect("insert remote status");
-        let poll = create_poll(pool, &status_id, &["yes", "no"], false, None).await;
+        let poll = polls::upsert_remote(
+            pool,
+            &NewRemotePoll {
+                status_id: &status_id,
+                options: &["yes".to_owned(), "no".to_owned()],
+                multiple: false,
+                expires_at: None,
+                voters_count: 5,
+                tallies: &[3, 2],
+            },
+        )
+        .await
+        .expect("insert remote poll")
+        .id;
+
+        let (status, body) = call(&app, "GET", &format!("/api/v1/polls/{poll}"), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["options"][0]["title"], "yes");
+        assert_eq!(body["options"][0]["votes_count"], 3);
+        assert_eq!(body["options"][1]["votes_count"], 2);
+        assert_eq!(body["votes_count"], 5);
+        assert_eq!(body["voters_count"], 5);
 
         let voter = create_account(pool, "voter").await;
         let token = create_token(pool, &voter, &["write"]).await;
