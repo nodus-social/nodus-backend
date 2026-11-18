@@ -11,7 +11,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::Router;
+use base64::Engine;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use nodus_server_api::state::AppState;
@@ -267,6 +269,12 @@ async fn a_queued_activity_arrives_signed_and_is_marked_delivered() {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_owned();
+        let date = headers
+            .get("date")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(!date.is_empty(), "a signed post is dated: {headers:?}");
         assert!(
             signature.contains(&format!(
                 "keyId=\"https://social.test/users/{username}#main-key\""
@@ -281,9 +289,19 @@ async fn a_queued_activity_arrives_signed_and_is_marked_delivered() {
             signature.contains("headers=\"(request-target) host date digest\""),
             "{signature}"
         );
-        assert!(
-            headers.get("digest").is_some(),
-            "the body is pinned by a digest"
+        let digest = headers
+            .get("digest")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            digest,
+            format!(
+                "SHA-256={}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(Sha256::digest(body.as_bytes()))
+            ),
+            "the digest has to cover the bytes on the wire"
         );
         let received: Value = serde_json::from_str(body).expect("json body");
         assert_eq!(received["type"], "Follow");

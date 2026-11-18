@@ -60,7 +60,7 @@ async fn account(
     } else {
         validate_remote_host(domain)?;
         ensure_domain_allowed(&state, domain).await?;
-        let client = ActivityPub::new();
+        let client = state.fediverse_client();
         let url = client
             .webfinger(acct)
             .await
@@ -86,7 +86,7 @@ async fn status(
         .ok_or_else(|| ApiError::unprocessable("url has no host"))?;
     ensure_domain_allowed(&state, domain).await?;
 
-    let client = ActivityPub::new();
+    let client = state.fediverse_client();
     let note = client
         .note(&query.url)
         .await

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use nodus_auth::store::PgAuthStore;
-use nodus_server_api::{root_router, AppState};
+use nodus_server_api::{root_router, AppState, FederationKey};
 use nodus_server_runtime::{self as runtime, Config};
 use nodus_server_store::Store;
 
@@ -32,7 +32,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Queued posts publish and outbound activities leave from the process that also
     // serves requests: one pool, one set of signing keys, and no second deployable to
     // keep in step with this one.
-    let state = AppState::new(store.clone(), config.instance.clone());
+    let federation = FederationKey::from_env(&config.instance);
+    let state = AppState::with_federation(
+        store.clone(),
+        config.instance.clone(),
+        federation.clone(),
+    );
     tokio::spawn(nodus_server_api::schedules::run(state.clone()));
     tokio::spawn(nodus_server_api::outbox::run(state));
 
@@ -41,15 +46,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         domain = %config.instance.domain,
         "api listening"
     );
-    nodus_server_transport::serve_http(&config.bind, router(&store, &config), runtime::shutdown())
-        .await?;
+    nodus_server_transport::serve_http(
+        &config.bind,
+        router(&store, &config, federation),
+        runtime::shutdown(),
+    )
+    .await?;
     runtime::stop_telemetry(telemetry).await;
     Ok(())
 }
 
 /// Everything this service answers, in the order the router sees it.
-fn router(store: &Store, config: &Config) -> Router {
-    let api = root_router(AppState::new(store.clone(), config.instance.clone()));
+fn router(store: &Store, config: &Config, federation: Option<FederationKey>) -> Router {
+    let api = root_router(AppState::with_federation(
+        store.clone(),
+        config.instance.clone(),
+        federation,
+    ));
     let auth = nodus_auth::router(nodus_auth::AppState::new(
         PgAuthStore::new(store.pool().clone()),
         nodus_auth::Config {

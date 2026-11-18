@@ -18,11 +18,10 @@ use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::OsRng;
 use rsa::RsaPrivateKey;
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use nodus_server_core::PageParams;
 use nodus_server_federation::{prepare, verify_prepared};
-use nodus_server_sdk::activitypub::ActivityPub;
 use nodus_server_sdk::activitypub::{
     Activity, ActivityKind, ActivityObject, Actor, Attachment, Collection, CollectionPage, Note,
     Webfinger,
@@ -85,12 +84,23 @@ impl Document for OutboxPage {
     }
 }
 
+struct InstanceActor(Value);
+
+impl Document for InstanceActor {
+    const CONTENT_TYPE: &'static str = "application/activity+json";
+
+    fn document(&self) -> Value {
+        self.0.clone()
+    }
+}
+
 /// Builds the routes an ActivityPub peer calls. They live at the domain root, not under
 /// `/api`, because a peer discovers them from WebFinger and the actor document.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/.well-known/webfinger", get(webfinger))
         .route("/inbox", post(shared_inbox))
+        .route("/actor", get(instance_actor))
         .route("/users/{username}", get(actor))
         .route("/users/{username}/outbox", get(outbox))
         .route("/users/{username}/followers", get(followers))
@@ -132,6 +142,31 @@ async fn actor(State(state): State<AppState>, Path(username): Path<String>) -> A
         .ok_or_else(|| ApiError::not_found("No such account"))?;
     let account = ensure_identity(&state, account).await?;
     Ok(document_response(&actor_document(&state, &account)))
+}
+
+/// The actor this instance signs as. It answers even before a key exists, because a peer
+/// that cached this URL must not get a 404 the day the operator adds one.
+async fn instance_actor(State(state): State<AppState>) -> Response {
+    let id = state.instance().url("/actor");
+    let inbox = state.instance().url("/inbox");
+    let mut document = json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": &id,
+        "type": "Application",
+        "preferredUsername": "instance.actor",
+        "name": state.instance().title,
+        "url": &id,
+        "inbox": &inbox,
+        "endpoints": { "sharedInbox": &inbox },
+    });
+    if let Some(key) = state.federation() {
+        document["publicKey"] = json!({
+            "id": key.key_id(),
+            "owner": &id,
+            "publicKeyPem": key.public_pem(),
+        });
+    }
+    document_response(&InstanceActor(document))
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,7 +372,7 @@ async fn verify_signature(
             return Ok(activity);
         }
     }
-    let actor = ActivityPub::new()
+    let actor = state.fediverse_client()
         .actor_url(key_actor)
         .await
         .map_err(|error| ApiError::unauthorized(error.to_string()))?;
@@ -685,7 +720,8 @@ pub(crate) async fn ensure_remote_actor(
     if let Some(row) = accounts::by_uri(state.store().pool(), actor_url).await? {
         return Ok(row);
     }
-    let actor = ActivityPub::new()
+    let actor = state
+        .fediverse_client()
         .actor_url(actor_url)
         .await
         .map_err(|error| ApiError::unprocessable(error.to_string()))?;

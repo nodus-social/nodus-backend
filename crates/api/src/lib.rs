@@ -41,7 +41,7 @@ pub mod schedules;
 pub mod state;
 pub mod statuses;
 
-pub use state::{AppState, InstanceConfig};
+pub use state::{AppState, FederationKey, InstanceConfig};
 
 use axum::routing::{get, patch, post, put};
 

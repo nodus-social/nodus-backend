@@ -2640,6 +2640,7 @@ dependencies = [
  "hyper-util",
  "image",
  "leptos",
+ "nodus-activitypub-client",
  "nodus-auth",
  "nodus-client-core",
  "nodus-server-core",
