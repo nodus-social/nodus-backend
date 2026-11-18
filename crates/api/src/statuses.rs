@@ -210,7 +210,7 @@ pub async fn favourite(
     crate::outbox::deliver_reaction(
         &state,
         &auth.0.account.id,
-        &row.account_id,
+        &row,
         nodus_server_sdk::activitypub::ActivityKind::Like,
         true,
     )
@@ -229,7 +229,7 @@ pub async fn unfavourite(
     crate::outbox::deliver_reaction(
         &state,
         &auth.0.account.id,
-        &row.account_id,
+        &row,
         nodus_server_sdk::activitypub::ActivityKind::Like,
         false,
     )
@@ -274,7 +274,7 @@ pub async fn reblog(
         crate::outbox::deliver_reaction(
             &state,
             &auth.0.account.id,
-            &original.account_id,
+            &original,
             nodus_server_sdk::activitypub::ActivityKind::Announce,
             true,
         )
@@ -305,7 +305,7 @@ pub async fn unreblog(
     crate::outbox::deliver_reaction(
         &state,
         &auth.0.account.id,
-        &original.account_id,
+        &original,
         nodus_server_sdk::activitypub::ActivityKind::Announce,
         false,
     )

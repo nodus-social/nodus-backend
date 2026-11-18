@@ -16,6 +16,7 @@ use reqwest::header::{HeaderValue, ACCEPT, CONTENT_TYPE};
 use serde_json::{json, Value};
 
 use nodus_server_sdk::activitypub::{Activity, ActivityKind};
+use nodus_server_store::statuses::StatusRow;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -52,10 +53,20 @@ fn identified(value: Value, actor: &str, kind: &str) -> Value {
 }
 
 /// A `Follow`, `Like` or `Announce`: one actor naming one object.
+///
+/// The id is derived from the relationship rather than minted, because a withdrawal has to
+/// name the very activity being withdrawn: a peer matches the `Undo` by its object's id, and
+/// a fresh id per attempt would leave the original standing on their side.
 fn pointing(kind: ActivityKind, label: &str, actor: &str, object: &str) -> Value {
     let activity = Activity::new(kind, actor, object);
-    let value = serde_json::to_value(&activity).unwrap_or_else(|_| json!({}));
-    identified(value, actor, label)
+    let mut value = serde_json::to_value(&activity).unwrap_or_else(|_| json!({}));
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "id".to_owned(),
+            Value::String(format!("{actor}#{label}/{object}")),
+        );
+    }
+    value
 }
 
 /// An `Undo` wrapping another activity, which is how a follow or a favourite is withdrawn.
@@ -251,13 +262,13 @@ fn follow_answer(
 pub async fn deliver_reaction(
     state: &AppState,
     account_id: &str,
-    target_id: &str,
+    status: &StatusRow,
     kind: ActivityKind,
     active: bool,
 ) {
     let (Ok(Some(actor_row)), Ok(Some(author))) = (
         nodus_server_store::accounts::by_id(state.store().pool(), account_id).await,
-        nodus_server_store::accounts::by_id(state.store().pool(), target_id).await,
+        nodus_server_store::accounts::by_id(state.store().pool(), &status.account_id).await,
     ) else {
         return;
     };
@@ -266,10 +277,9 @@ pub async fn deliver_reaction(
         return;
     }
     let actor = crate::activitypub::actor_url(state, &actor_row);
-    let target = author
-        .uri
-        .clone()
-        .unwrap_or_else(|| crate::activitypub::actor_url(state, &author));
+    // The object of a Like or an Announce is the post, not its author: a remote server can
+    // only attach a reaction it can resolve, and an actor URL resolves to nothing.
+    let target = crate::activitypub::status_url(state, status);
     let label = if kind == ActivityKind::Like {
         "likes"
     } else {
@@ -281,7 +291,7 @@ pub async fn deliver_reaction(
         undoing(&actor, pointing(kind, label, &actor, &target))
     };
     if let Ok(Some(inbox)) =
-        nodus_server_store::delivery::inbox_of(state.store().pool(), target_id).await
+        nodus_server_store::delivery::inbox_of(state.store().pool(), &author.id).await
     {
         enqueue(state, account_id, value, vec![inbox]).await;
     }
@@ -406,7 +416,26 @@ pub async fn run(state: AppState) {
 
 #[cfg(test)]
 mod tests {
-    use super::{follow_answer, ActivityKind};
+    use super::{follow_answer, pointing, undoing, ActivityKind};
+
+    #[test]
+    fn a_withdrawal_names_the_activity_it_withdrew() {
+        let actor = "https://social.test/users/ada";
+        let object = "https://mastodon.test/users/eve";
+        let follow = pointing(ActivityKind::Follow, "follows", actor, object);
+        let undo = undoing(actor, follow.clone());
+        assert_eq!(undo["type"], "Undo");
+        assert_eq!(undo["object"]["id"], follow["id"]);
+        assert_eq!(follow["id"], format!("{actor}#follows/{object}"));
+    }
+
+    #[test]
+    fn two_relationships_get_their_own_ids() {
+        let actor = "https://social.test/users/ada";
+        let eve = pointing(ActivityKind::Follow, "follows", actor, "https://a.test/users/eve");
+        let bob = pointing(ActivityKind::Follow, "follows", actor, "https://b.test/users/bob");
+        assert_ne!(eve["id"], bob["id"]);
+    }
 
     #[test]
     fn an_accept_answers_the_follow_it_received() {

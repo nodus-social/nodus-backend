@@ -384,6 +384,16 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
                 unfollow_local(state, &remote, target).await?;
             }
         }
+        ActivityKind::Like => {
+            if let Some(target) = activity_target_id(activity) {
+                like_local(state, &remote, target).await?;
+            }
+        }
+        ActivityKind::Announce => {
+            if let Some(target) = activity_target_id(activity) {
+                boost_local(state, &remote, target).await?;
+            }
+        }
         ActivityKind::Create => {
             if let ActivityObject::Value(value) = &activity.object {
                 ingest_note(state, &remote, value).await?;
@@ -626,6 +636,46 @@ async fn follow_local(
     if !local.locked {
         crate::outbox::deliver_follow_response(state, &local.id, &remote.id, true, follow_id).await;
     }
+    Ok(())
+}
+
+async fn like_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiResult<()> {
+    let Some(row) = nodus_server_store::statuses::by_uri(state.store().pool(), target).await? else {
+        return Ok(());
+    };
+    // Only a post this instance minted can be counted here: a remote post's favourite is
+    // the other server's business, and the count is read from its own payload.
+    if !row.local {
+        return Ok(());
+    }
+    nodus_server_store::social::favourite(state.store().pool(), &remote.id, &row.id).await?;
+    nodus_server_store::social::notify(
+        state.store().pool(),
+        &row.account_id,
+        "favourite",
+        &remote.id,
+        Some(&row.id),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn boost_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiResult<()> {
+    let Some(row) = nodus_server_store::statuses::by_uri(state.store().pool(), target).await? else {
+        return Ok(());
+    };
+    if !row.local {
+        return Ok(());
+    }
+    nodus_server_store::statuses::reblog(state.store().pool(), &remote.id, &row.id).await?;
+    nodus_server_store::social::notify(
+        state.store().pool(),
+        &row.account_id,
+        "reblog",
+        &remote.id,
+        Some(&row.id),
+    )
+    .await?;
     Ok(())
 }
 
