@@ -279,7 +279,15 @@ fn follow_answer(
     let activity = Activity::new(kind, actor, follower);
     let mut value = serde_json::to_value(&activity).unwrap_or_else(|_| json!({}));
     value["object"] = object;
-    identified(value, actor, if kind == ActivityKind::Accept { "accepts" } else { "rejects" })
+    identified(
+        value,
+        actor,
+        if kind == ActivityKind::Accept {
+            "accepts"
+        } else {
+            "rejects"
+        },
+    )
 }
 
 /// Tells the author of a post that it was favourited or boosted, or that it was not.
@@ -456,8 +464,18 @@ mod tests {
     #[test]
     fn two_relationships_get_their_own_ids() {
         let actor = "https://social.test/users/ada";
-        let eve = pointing(ActivityKind::Follow, "follows", actor, "https://a.test/users/eve");
-        let bob = pointing(ActivityKind::Follow, "follows", actor, "https://b.test/users/bob");
+        let eve = pointing(
+            ActivityKind::Follow,
+            "follows",
+            actor,
+            "https://a.test/users/eve",
+        );
+        let bob = pointing(
+            ActivityKind::Follow,
+            "follows",
+            actor,
+            "https://b.test/users/bob",
+        );
         assert_ne!(eve["id"], bob["id"]);
     }
 

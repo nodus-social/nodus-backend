@@ -2375,7 +2375,9 @@ dependencies = [
 name = "nodus-activitypub-client"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "nodus-activitypub-core",
+ "nodus-federation",
  "reqwest",
  "serde_json",
  "url",

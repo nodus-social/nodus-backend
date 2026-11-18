@@ -36,7 +36,9 @@ fn backoff(attempts: i32) -> Duration {
 /// Writes an activity down for every inbox it goes to.
 ///
 /// Returns how many deliveries were actually queued, so a caller can tell "nobody follows
-/// this account" (zero inboxes) from "the queue rejected it" (an error).
+/// this account" (zero inboxes) from "the queue rejected it" (an error). Inboxes on a host
+/// whose actor blocked this instance are dropped here rather than at send time, so the
+/// worker never has to know about blocks.
 pub async fn enqueue(
     pool: &PgPool,
     account_id: &str,
@@ -49,6 +51,11 @@ pub async fn enqueue(
         .unwrap_or_default()
         .to_owned();
     if activity_id.is_empty() || inboxes.is_empty() {
+        return Ok(0);
+    }
+    let blocked = crate::blocks::blocked_hosts(pool).await?;
+    let inboxes = allowed_inboxes(inboxes, &blocked);
+    if inboxes.is_empty() {
         return Ok(0);
     }
     let ids: Vec<String> = inboxes.iter().map(|_| Ulid::new().to_string()).collect();
@@ -193,6 +200,18 @@ pub async fn withdraw(pool: &PgPool, activity_id: &str) -> Result<u64, sqlx::Err
     Ok(removed)
 }
 
+/// The inboxes that do not belong to a host that blocked this instance.
+fn allowed_inboxes(inboxes: &[String], blocked_hosts: &[String]) -> Vec<String> {
+    inboxes
+        .iter()
+        .filter(|inbox| match crate::blocks::host_of(inbox) {
+            Some(host) => !blocked_hosts.contains(&host),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// The queue as an operator sees it: what is still owed, and when it is next tried.
 #[derive(Debug, Clone)]
 pub struct PendingDelivery {
@@ -228,4 +247,27 @@ pub async fn pending(pool: &PgPool, limit: i64) -> Result<Vec<PendingDelivery>, 
             },
         )
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn inboxes_of_a_blocked_host_are_dropped_before_queueing() {
+        let inboxes = vec![
+            "https://open.test/inbox".to_owned(),
+            "https://blocked.test/users/a/inbox".to_owned(),
+            "https://blocked.test/inbox".to_owned(),
+        ];
+        let allowed = super::allowed_inboxes(&inboxes, &["blocked.test".to_owned()]);
+        assert_eq!(allowed, vec!["https://open.test/inbox"]);
+    }
+
+    #[test]
+    fn an_inbox_without_a_readable_host_is_left_for_the_worker() {
+        let inboxes = vec!["not a url".to_owned()];
+        assert_eq!(
+            super::allowed_inboxes(&inboxes, &["blocked.test".to_owned()]),
+            inboxes
+        );
+    }
 }

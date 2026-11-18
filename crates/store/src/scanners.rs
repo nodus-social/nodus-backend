@@ -413,7 +413,8 @@ pub async fn unqueued_media(
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
     sqlx::query_as(
         "SELECT m.id, m.content_type FROM media_attachment m \
-         WHERE (CASE WHEN $2 = 'video' THEN m.content_type LIKE 'video/%' \
+         WHERE NOT m.remote \
+           AND (CASE WHEN $2 = 'video' THEN m.content_type LIKE 'video/%' \
                      ELSE m.content_type LIKE 'image/%' END) \
            AND EXISTS (SELECT 1 FROM scanner sc WHERE sc.enabled AND sc.kind = $2) \
            AND NOT EXISTS ( \

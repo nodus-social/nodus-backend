@@ -37,12 +37,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         domain = %config.instance.domain,
         "media listening"
     );
-    nodus_server_transport::serve_http(
-        &config.bind,
-        serving.router(),
-        runtime::shutdown(),
-    )
-    .await?;
+    nodus_server_transport::serve_http(&config.bind, serving.router(), runtime::shutdown()).await?;
     runtime::stop_telemetry(telemetry).await;
     Ok(())
 }

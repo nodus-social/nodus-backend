@@ -262,6 +262,7 @@ async fn rejects_actor_spoofing_when_key_id_differs_from_activity_actor() {
                 content_html: "<p>original</p>",
                 spoiler_text: "",
                 sensitive: false,
+                visibility: "public",
                 in_reply_to_id: None,
                 in_reply_to_account_id: None,
                 created_at: Utc::now(),
@@ -402,6 +403,7 @@ async fn rejects_cross_origin_create_and_cross_actor_delete() {
                 content_html: "<p>alice original</p>",
                 spoiler_text: "",
                 sensitive: false,
+                visibility: "public",
                 in_reply_to_id: None,
                 in_reply_to_account_id: None,
                 created_at: Utc::now(),
@@ -421,6 +423,7 @@ async fn rejects_cross_origin_create_and_cross_actor_delete() {
                 content_html: "<p>bob original</p>",
                 spoiler_text: "",
                 sensitive: false,
+                visibility: "public",
                 in_reply_to_id: None,
                 in_reply_to_account_id: None,
                 created_at: Utc::now(),
@@ -585,6 +588,127 @@ async fn rejects_cross_origin_create_and_cross_actor_delete() {
             status,
             StatusCode::FORBIDDEN,
             "Undo with mismatched inner actor must be forbidden: {resp}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rejects_a_cross_actor_profile_update_or_actor_delete() {
+    run_db_test(|store, state| async move {
+        let pool = store.pool();
+        let (mallory_key, mallory_pem) = generate_keypair();
+        let (_alice_key, alice_pem) = generate_keypair();
+        let mallory_uri = "https://evil.test/users/mallory";
+        let alice_uri = "https://evil.test/users/alice";
+        let mallory = seed_remote_actor(
+            pool,
+            mallory_uri,
+            "mallory",
+            "evil.test",
+            Some(&mallory_pem),
+        )
+        .await;
+        let alice =
+            seed_remote_actor(pool, alice_uri, "alice", "evil.test", Some(&alice_pem)).await;
+        let alice_note_uri = "https://evil.test/notes/alice-2";
+        statuses::upsert_remote(
+            pool,
+            &NewRemoteStatus {
+                id: &Id::new().to_string(),
+                account_id: &alice.id,
+                uri: alice_note_uri,
+                content: "alice original",
+                content_html: "<p>alice original</p>",
+                spoiler_text: "",
+                sensitive: false,
+                visibility: "public",
+                in_reply_to_id: None,
+                in_reply_to_account_id: None,
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("seed alice note");
+
+        // Mallory edits Alice's profile on the same domain.
+        let stolen_update = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://evil.test/updates/1",
+            "type": "Update",
+            "actor": mallory_uri,
+            "object": {
+                "id": alice_uri,
+                "type": "Person",
+                "preferredUsername": "alice",
+                "name": "owned by mallory",
+                "inbox": "https://evil.test/users/alice/inbox",
+            }
+        });
+        let (status, resp) = post_signed_inbox(
+            &state,
+            &mallory_key,
+            &format!("{mallory_uri}#main-key"),
+            &stolen_update,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a cross-actor profile update must be forbidden: {resp}"
+        );
+        let stored = accounts::by_id(pool, &alice.id)
+            .await
+            .expect("lookup")
+            .expect("alice still exists");
+        assert_eq!(stored.display_name, "alice");
+
+        // Mallory names Alice's actor document in a Delete.
+        let actor_delete = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://evil.test/deletes/3",
+            "type": "Delete",
+            "actor": mallory_uri,
+            "object": { "id": alice_uri, "type": "Person" },
+        });
+        let _ = post_signed_inbox(
+            &state,
+            &mallory_key,
+            &format!("{mallory_uri}#main-key"),
+            &actor_delete,
+        )
+        .await;
+        assert!(
+            statuses::by_uri(pool, alice_note_uri)
+                .await
+                .expect("lookup")
+                .is_some(),
+            "naming another actor's document must not tombstone their posts"
+        );
+
+        // Mallory deletes her own actor document, which is allowed.
+        let own_delete = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://evil.test/deletes/4",
+            "type": "Delete",
+            "actor": mallory_uri,
+            "object": { "id": mallory_uri, "type": "Person" },
+        });
+        let (status, resp) = post_signed_inbox(
+            &state,
+            &mallory_key,
+            &format!("{mallory_uri}#main-key"),
+            &own_delete,
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+        assert_eq!(
+            accounts::by_id(pool, &mallory.id)
+                .await
+                .expect("lookup")
+                .expect("mallory is kept")
+                .display_name,
+            "mallory"
         );
     })
     .await;

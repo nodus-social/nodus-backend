@@ -209,6 +209,40 @@ pub async fn upsert_remote(
         .await
 }
 
+/// A remote actor's changed profile fields; `None` leaves a field as it was.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteProfile<'a> {
+    pub display_name: Option<&'a str>,
+    pub note: Option<&'a str>,
+    pub avatar_url: Option<&'a str>,
+    pub header_url: Option<&'a str>,
+}
+
+/// Refreshes the profile of a remote actor we already know.
+///
+/// Returns `None` when the URI names no remote account, so a peer cannot reach a local
+/// profile through an `Update`.
+pub async fn update_remote_profile(
+    pool: &PgPool,
+    uri: &str,
+    profile: &RemoteProfile<'_>,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET display_name = COALESCE($2, display_name), \
+             note = COALESCE($3, note), avatar_url = COALESCE($4, avatar_url), \
+             header_url = COALESCE($5, header_url), updated_at = now() \
+          WHERE uri = $1 AND NOT local RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(uri)
+        .bind(profile.display_name)
+        .bind(profile.note)
+        .bind(profile.avatar_url)
+        .bind(profile.header_url)
+        .fetch_optional(pool)
+        .await
+}
+
 /// A local account by username (`@alice`, without the domain).
 pub async fn local_by_username<'e>(
     executor: impl sqlx::PgExecutor<'e>,

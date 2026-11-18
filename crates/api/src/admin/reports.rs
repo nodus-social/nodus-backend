@@ -276,6 +276,7 @@ async fn create(
             category,
             comment: form.comment.trim(),
             rule_ids: &split_ids(&form.rule_ids),
+            activity_uri: None,
         },
     )
     .await?;

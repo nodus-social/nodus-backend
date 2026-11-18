@@ -130,8 +130,14 @@ mod tests {
             Some("10.0.1.1"),
         );
         assert!(should_record_at(&format!("{key}-a"), now));
-        assert!(!should_record_at(&format!("{key}-a"), now + Duration::from_secs(1)));
-        assert!(should_record_at(&format!("{key}-a"), now + WINDOW + Duration::from_secs(1)));
+        assert!(!should_record_at(
+            &format!("{key}-a"),
+            now + Duration::from_secs(1)
+        ));
+        assert!(should_record_at(
+            &format!("{key}-a"),
+            now + WINDOW + Duration::from_secs(1)
+        ));
     }
 
     #[test]

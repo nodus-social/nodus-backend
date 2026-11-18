@@ -121,7 +121,11 @@ pub async fn serve(State(serving): State<Arc<Serving>>, Path(id): Path<String>) 
     };
     if !row.original_pruned {
         if let Ok(bytes) = tokio::fs::read(serving.root.join(&row.digest)).await {
-            return with_cache(bytes, &row.content_type, "public, max-age=31536000, immutable");
+            return with_cache(
+                bytes,
+                &row.content_type,
+                "public, max-age=31536000, immutable",
+            );
         }
     }
     for layer in [Layer::Compressed, Layer::Preview] {
@@ -198,9 +202,7 @@ fn not_found() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        default_avatar, DEFAULT_AVATAR_SIZE, PLACEHOLDER_BACKGROUND, PLACEHOLDER_FIGURE,
-    };
+    use super::{default_avatar, DEFAULT_AVATAR_SIZE, PLACEHOLDER_BACKGROUND, PLACEHOLDER_FIGURE};
 
     /// The default picture is only useful if a client can decode it, so the test decodes it.
     #[tokio::test]
@@ -219,7 +221,10 @@ mod tests {
         let head = picture.get_pixel(DEFAULT_AVATAR_SIZE / 2, 156);
         let corner = picture.get_pixel(2, 2);
         assert_eq!([head[0], head[1], head[2]], PLACEHOLDER_FIGURE[..3]);
-        assert_eq!([corner[0], corner[1], corner[2]], PLACEHOLDER_BACKGROUND[..3]);
+        assert_eq!(
+            [corner[0], corner[1], corner[2]],
+            PLACEHOLDER_BACKGROUND[..3]
+        );
     }
 
     #[tokio::test]

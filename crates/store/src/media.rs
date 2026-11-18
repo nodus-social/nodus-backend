@@ -26,12 +26,14 @@ pub struct MediaRow {
     pub processing_progress: i16,
     pub processing_error: Option<String>,
     pub original_pruned: bool,
+    /// Where a remote attachment lives when we never copied the bytes.
+    pub remote_url: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 const MEDIA_COLUMNS: &str = "id, account_id, status_id, digest, content_type, size, width, \
      height, blurhash, description, sensitive, lossless, processing_state, processing_progress, \
-     processing_error, original_pruned, created_at";
+     processing_error, original_pruned, NULLIF(meta->>'url', '') AS remote_url, created_at";
 
 /// Inserts an unattached upload.
 pub async fn insert(pool: &PgPool, media: &MediaRow) -> Result<(), sqlx::Error> {
@@ -128,6 +130,58 @@ pub async fn attach(
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// An attachment a remote status points at.
+#[derive(Debug, Clone)]
+pub struct RemoteAttachment<'a> {
+    pub url: &'a str,
+    pub content_type: &'a str,
+    pub description: &'a str,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+}
+
+/// Replaces the remote attachments of a status.
+///
+/// The bytes stay on the peer, so the row records only where they are; the digest is
+/// synthetic because nothing was hashed here, and the state is `ready` because there is
+/// no local processing to wait for.
+pub async fn replace_remote(
+    pool: &PgPool,
+    status_id: &str,
+    account_id: &str,
+    sensitive: bool,
+    attachments: &[RemoteAttachment<'_>],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM media_attachment WHERE status_id = $1 AND remote")
+        .bind(status_id)
+        .execute(&mut *tx)
+        .await?;
+    for (index, attachment) in attachments.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO media_attachment (id, account_id, status_id, digest, content_type, \
+                 size, width, height, description, sensitive, remote, processing_state, \
+                 processing_progress, meta, created_at) \
+             VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, true, 'ready', 100, \
+                 jsonb_build_object('url', $10::text), now())",
+        )
+        .bind(nodus_server_core::Id::new().to_string())
+        .bind(account_id)
+        .bind(status_id)
+        .bind(format!("remote:{status_id}:{index}"))
+        .bind(attachment.content_type)
+        .bind(attachment.width)
+        .bind(attachment.height)
+        .bind(attachment.description)
+        .bind(sensitive)
+        .bind(attachment.url)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Updates the author-controlled fields.
@@ -413,6 +467,7 @@ mod tests {
                 processing_progress: 50,
                 processing_error: None,
                 original_pruned: false,
+                remote_url: None,
                 created_at: now,
             },
         )
@@ -547,6 +602,7 @@ mod tests {
                     processing_progress: 100,
                     processing_error: None,
                     original_pruned: false,
+                    remote_url: None,
                     created_at: old,
                 },
             )

@@ -181,6 +181,7 @@ pub async fn upload(
         processing_progress: 0,
         processing_error: None,
         original_pruned: false,
+        remote_url: None,
         created_at: Utc::now(),
     };
 
@@ -457,6 +458,7 @@ mod tests {
                 processing_progress: 0,
                 processing_error: None,
                 original_pruned: false,
+                remote_url: None,
                 created_at: Utc::now(),
             },
         )
@@ -513,6 +515,4 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
-
-
 }

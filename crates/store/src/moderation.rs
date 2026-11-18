@@ -46,13 +46,15 @@ pub struct NewReport<'a> {
     pub category: &'a str,
     pub comment: &'a str,
     pub rule_ids: &'a [String],
+    /// Set when a peer's activity opened the report, so its retry finds the row.
+    pub activity_uri: Option<&'a str>,
 }
 
 pub async fn create_report(pool: &PgPool, new: &NewReport<'_>) -> Result<ReportRow, sqlx::Error> {
     let sql = format!(
         "INSERT INTO report (id, account_id, target_account_id, status_ids, category, comment, \
-             rule_ids) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {REPORT_COLUMNS}"
+             rule_ids, activity_uri) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {REPORT_COLUMNS}"
     );
     sqlx::query_as(&sql)
         .bind(Id::new().to_string())
@@ -62,7 +64,19 @@ pub async fn create_report(pool: &PgPool, new: &NewReport<'_>) -> Result<ReportR
         .bind(new.category)
         .bind(new.comment)
         .bind(new.rule_ids)
+        .bind(new.activity_uri)
         .fetch_one(pool)
+        .await
+}
+
+/// The report an activity already opened, so a replayed activity does not open another.
+pub async fn report_for_activity(
+    pool: &PgPool,
+    activity_uri: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM report WHERE activity_uri = $1")
+        .bind(activity_uri)
+        .fetch_optional(pool)
         .await
 }
 

@@ -85,6 +85,55 @@ pub async fn mentions_of(pool: &PgPool, status_id: &str) -> Result<Vec<String>, 
     .await
 }
 
+/// Replaces the accounts a remote status mentions.
+pub async fn replace_mentions(
+    pool: &PgPool,
+    status_id: &str,
+    account_ids: &[String],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM status_mention WHERE status_id = $1")
+        .bind(status_id)
+        .execute(&mut *tx)
+        .await?;
+    for account_id in account_ids {
+        sqlx::query(
+            "INSERT INTO status_mention (status_id, account_id) VALUES ($1, $2) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(status_id)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Replaces the hashtags a remote status carries.
+pub async fn replace_tags(
+    pool: &PgPool,
+    status_id: &str,
+    tags: &[String],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM status_tag WHERE status_id = $1")
+        .bind(status_id)
+        .execute(&mut *tx)
+        .await?;
+    for tag in tags {
+        sqlx::query(
+            "INSERT INTO status_tag (status_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(status_id)
+        .bind(tag)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// One status by its canonical `ActivityPub` URI.
 pub async fn by_uri(pool: &PgPool, uri: &str) -> Result<Option<StatusRow>, sqlx::Error> {
     let sql =
@@ -148,6 +197,33 @@ pub async fn upsert_remote(
     Ok(row)
 }
 
+/// Refreshes a remote note from an edit by its author.
+pub async fn update_remote_content(
+    pool: &PgPool,
+    uri: &str,
+    account_id: &str,
+    content: &str,
+    content_html: &str,
+    spoiler_text: &str,
+    sensitive: bool,
+) -> Result<Option<StatusRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE status SET content = $3, content_html = $4, spoiler_text = $5, \
+             sensitive = $6, edited_at = now() \
+          WHERE uri = $1 AND account_id = $2 AND NOT local AND deleted_at IS NULL \
+          RETURNING {STATUS_COLUMNS_SIMPLE}"
+    );
+    sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(uri)
+        .bind(account_id)
+        .bind(content)
+        .bind(content_html)
+        .bind(spoiler_text)
+        .bind(sensitive)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Soft-deletes a remote status by URI, scoped to its owning account.
 pub async fn delete_remote(
     pool: &PgPool,
@@ -157,7 +233,7 @@ pub async fn delete_remote(
     let mut tx = pool.begin().await?;
     let deleted: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
         "UPDATE status SET deleted_at = now() \
-          WHERE uri = $1 AND account_id = $2 AND deleted_at IS NULL \
+          WHERE uri = $1 AND account_id = $2 AND NOT local AND deleted_at IS NULL \
           RETURNING id, in_reply_to_id, reblog_of_id",
     )
     .bind(uri)
@@ -176,6 +252,33 @@ pub async fn delete_remote(
     .await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Soft-deletes every live status one remote actor posted.
+///
+/// The account stays: a tombstoned post is enough to stop serving it, and keeping the row
+/// makes a repeated `Delete` idempotent while replies still resolve their author.
+pub async fn delete_remote_actor(pool: &PgPool, account_id: &str) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "UPDATE status SET deleted_at = now() \
+          WHERE account_id = $1 AND NOT local AND deleted_at IS NULL \
+          RETURNING id, in_reply_to_id, reblog_of_id",
+    )
+    .bind(account_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (status_id, in_reply_to_id, reblog_of_id) in &rows {
+        cleanup_deleted_status(
+            &mut tx,
+            status_id,
+            in_reply_to_id.as_deref(),
+            reblog_of_id.as_deref(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(u64::try_from(rows.len()).unwrap_or_default())
 }
 
 fn page_bounds(params: PageParams) -> (Option<String>, Option<String>, &'static str) {

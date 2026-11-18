@@ -9,6 +9,7 @@ pub mod accounts;
 pub mod alerts;
 pub mod announcements;
 pub mod apps;
+pub mod blocks;
 pub mod collections;
 pub mod conversations;
 pub mod delivery;

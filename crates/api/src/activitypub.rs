@@ -28,6 +28,7 @@ use nodus_server_sdk::activitypub::{
     Webfinger,
 };
 use nodus_server_store::accounts::{self, AccountRow};
+use nodus_server_store::media;
 use nodus_server_store::statuses::{self, StatusRow};
 
 use crate::error::{ApiError, ApiResult};
@@ -305,8 +306,9 @@ async fn verify_signature(
 
     let value: Value = serde_json::from_slice(body)
         .map_err(|_| ApiError::unprocessable("The activity is not JSON"))?;
-    let activity =
-        Activity::from_json(&value).map_err(|error| ApiError::unprocessable(error.to_string()))?;
+    let activity = Activity::from_json(&value).or_else(|error| {
+        flag_activity(&value).ok_or_else(|| ApiError::unprocessable(error.to_string()))
+    })?;
 
     let key_actor = prepared
         .params
@@ -399,19 +401,44 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
                 ingest_note(state, &remote, value).await?;
             }
         }
-        ActivityKind::Delete => {
-            if let Some(id) = delete_target_id(activity) {
-                if validate_remote_url(id).is_err() || !same_origin(id, &activity.actor) {
-                    return Err(ApiError::forbidden(
-                        "cannot delete object from another origin",
-                    ));
-                }
-                statuses::delete_remote(state.store().pool(), id, &remote.id).await?;
-            }
+        ActivityKind::Delete => delete_remote_object(state, &remote, activity).await?,
+        ActivityKind::Update => update_remote_object(state, &remote, activity).await?,
+        ActivityKind::Block => {
+            nodus_server_store::blocks::record_remote_block(state.store().pool(), &activity.actor)
+                .await?;
         }
+        ActivityKind::Flag => report_remote_flag(state, &remote, activity).await?,
         _ => {}
     }
     Ok(())
+}
+
+/// A `Flag` whose object is a list.
+///
+/// Mastodon reports name the reported account and its posts together, and the SDK's object
+/// parser only accepts one id or one embedded document. The signature covers the body, so
+/// the same verification applies once the document is shaped into an activity here.
+fn flag_activity(value: &Value) -> Option<Activity> {
+    if value.get("type").and_then(Value::as_str) != Some("Flag")
+        || !value.get("object").is_some_and(Value::is_array)
+    {
+        return None;
+    }
+    let mut extra = Map::new();
+    for key in ["content", "summary"] {
+        if let Some(field) = value.get(key) {
+            extra.insert(key.to_owned(), field.clone());
+        }
+    }
+    Some(Activity {
+        id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+        kind: ActivityKind::Flag,
+        actor: value.get("actor")?.as_str()?.to_owned(),
+        object: ActivityObject::Value(value.get("object")?.clone()),
+        to: Vec::new(),
+        cc: Vec::new(),
+        extra,
+    })
 }
 
 fn activity_target_id(activity: &Activity) -> Option<&str> {
@@ -427,6 +454,212 @@ fn delete_target_id(activity: &Activity) -> Option<&str> {
         ActivityObject::Value(value) => value.get("id").and_then(Value::as_str),
         ActivityObject::Activity(_) => None,
     }
+}
+
+fn document_type(value: &Value) -> Option<&str> {
+    match value.get("type")? {
+        Value::String(kind) => Some(kind.as_str()),
+        Value::Array(kinds) => kinds.iter().find_map(Value::as_str),
+        _ => None,
+    }
+}
+
+async fn delete_remote_object(
+    state: &AppState,
+    remote: &AccountRow,
+    activity: &Activity,
+) -> ApiResult<()> {
+    let Some(id) = delete_target_id(activity) else {
+        return Ok(());
+    };
+    if validate_remote_url(id).is_err() || !same_origin(id, &activity.actor) {
+        return Err(ApiError::forbidden(
+            "cannot delete object from another origin",
+        ));
+    }
+    if id == activity.actor {
+        if let Some(account) = accounts::by_uri(state.store().pool(), id).await? {
+            statuses::delete_remote_actor(state.store().pool(), &account.id).await?;
+        }
+        return Ok(());
+    }
+    statuses::delete_remote(state.store().pool(), id, &remote.id).await?;
+    Ok(())
+}
+
+async fn update_remote_object(
+    state: &AppState,
+    remote: &AccountRow,
+    activity: &Activity,
+) -> ApiResult<()> {
+    let ActivityObject::Value(value) = &activity.object else {
+        return Ok(());
+    };
+    let Some(id) = value.get("id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if validate_remote_url(id).is_err() || !same_origin(id, &activity.actor) {
+        return Err(ApiError::forbidden(
+            "cannot update object from another origin",
+        ));
+    }
+    match document_type(value) {
+        Some("Note") => {
+            let note = Note::from_json(value)
+                .map_err(|error| ApiError::unprocessable(error.to_string()))?;
+            update_remote_note(state, remote, activity, &note).await
+        }
+        Some("Person" | "Service" | "Application" | "Organization" | "Group") => {
+            let actor = Actor::from_json(value)
+                .map_err(|error| ApiError::unprocessable(error.to_string()))?;
+            if actor.id != activity.actor {
+                return Err(ApiError::forbidden("cannot update another actor's profile"));
+            }
+            update_remote_actor_document(state, value, &actor).await
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn update_remote_note(
+    state: &AppState,
+    remote: &AccountRow,
+    activity: &Activity,
+    note: &Note,
+) -> ApiResult<()> {
+    let actor_uri = remote.uri.as_deref().unwrap_or(&activity.actor);
+    ensure_note_from_actor(state, remote, note, actor_uri).await?;
+    let content_html = crate::html::sanitize_html(&note.content);
+    let content = html_to_text(&content_html);
+    let spoiler_text = crate::html::escape_text(&note.summary);
+    let Some(row) = statuses::update_remote_content(
+        state.store().pool(),
+        &note.id,
+        &remote.id,
+        &content,
+        &content_html,
+        &spoiler_text,
+        note.sensitive,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    store_note_extras(state, remote, note, &row).await
+}
+
+async fn update_remote_actor_document(
+    state: &AppState,
+    value: &Value,
+    actor: &Actor,
+) -> ApiResult<()> {
+    let display_name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(crate::html::escape_text);
+    let note = value
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(crate::html::sanitize_html);
+    let updated = accounts::update_remote_profile(
+        state.store().pool(),
+        &actor.id,
+        &accounts::RemoteProfile {
+            display_name: display_name.as_deref(),
+            note: note.as_deref(),
+            avatar_url: actor
+                .avatar
+                .as_deref()
+                .filter(|url| validate_remote_url(url).is_ok()),
+            header_url: actor
+                .header
+                .as_deref()
+                .filter(|url| validate_remote_url(url).is_ok()),
+        },
+    )
+    .await?;
+    if updated.is_none() {
+        tracing::debug!(actor = %actor.id, "ignored an update for an unknown actor");
+    }
+    Ok(())
+}
+
+/// The objects a `Flag` names.
+fn flag_targets(activity: &Activity) -> Vec<String> {
+    match &activity.object {
+        ActivityObject::Id(id) => vec![id.clone()],
+        ActivityObject::Value(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(id) => Some(id.clone()),
+                other => other.get("id").and_then(Value::as_str).map(str::to_owned),
+            })
+            .collect(),
+        ActivityObject::Value(value) => value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| vec![id.to_owned()])
+            .unwrap_or_default(),
+        ActivityObject::Activity(_) => Vec::new(),
+    }
+}
+
+async fn report_remote_flag(
+    state: &AppState,
+    remote: &AccountRow,
+    activity: &Activity,
+) -> ApiResult<()> {
+    let pool = state.store().pool();
+    if let Some(id) = activity.id.as_deref() {
+        if nodus_server_store::moderation::report_for_activity(pool, id)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+    }
+    let mut status_ids = Vec::new();
+    let mut target_account_id = None;
+    for target in flag_targets(activity) {
+        if let Some(account) = accounts::by_uri(pool, &target).await? {
+            target_account_id.get_or_insert(account.id);
+            continue;
+        }
+        if let Some(status) = statuses::by_uri(pool, &target).await? {
+            // Only a local post is ours to act on; a cached remote one still names its author.
+            if status.local {
+                status_ids.push(status.id);
+            }
+            target_account_id.get_or_insert(status.account_id);
+        }
+    }
+    let Some(target_account_id) = target_account_id else {
+        tracing::warn!(actor = %activity.actor, "ignored a flag naming no known account");
+        return Ok(());
+    };
+    status_ids.sort();
+    status_ids.dedup();
+    let comment = activity
+        .extra
+        .get("content")
+        .and_then(Value::as_str)
+        .map(crate::html::sanitize_html)
+        .map(|html| html_to_plain(&html))
+        .unwrap_or_default();
+    nodus_server_store::moderation::create_report(
+        pool,
+        &nodus_server_store::moderation::NewReport {
+            account_id: &remote.id,
+            target_account_id: &target_account_id,
+            status_ids: &status_ids,
+            category: "federation",
+            comment: &comment,
+            rule_ids: &[],
+            activity_uri: activity.id.as_deref(),
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn ensure_domain_allowed(state: &AppState, domain: &str) -> ApiResult<()> {
@@ -660,7 +893,8 @@ async fn follow_local(
 }
 
 async fn like_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiResult<()> {
-    let Some(row) = nodus_server_store::statuses::by_uri(state.store().pool(), target).await? else {
+    let Some(row) = nodus_server_store::statuses::by_uri(state.store().pool(), target).await?
+    else {
         return Ok(());
     };
     // Only a post this instance minted can be counted here: a remote post's favourite is
@@ -681,7 +915,8 @@ async fn like_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiR
 }
 
 async fn boost_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiResult<()> {
-    let Some(row) = nodus_server_store::statuses::by_uri(state.store().pool(), target).await? else {
+    let Some(row) = nodus_server_store::statuses::by_uri(state.store().pool(), target).await?
+    else {
         return Ok(());
     };
     if !row.local {
@@ -717,6 +952,46 @@ pub(crate) async fn ingest_note(
         .uri
         .as_deref()
         .ok_or_else(|| ApiError::unprocessable("remote actor has no URI"))?;
+    ensure_note_from_actor(state, remote, &note, actor_uri).await?;
+    let parent = match &note.in_reply_to {
+        Some(uri) => statuses::by_uri(state.store().pool(), uri).await?,
+        None => None,
+    };
+    let created_at = chrono::DateTime::parse_from_rfc3339(&note.published).map_or_else(
+        |_| chrono::Utc::now(),
+        |date| date.with_timezone(&chrono::Utc),
+    );
+    let content_html = crate::html::sanitize_html(&note.content);
+    let content = html_to_text(&content_html);
+    let spoiler_text = crate::html::escape_text(&note.summary);
+    let row = statuses::upsert_remote(
+        state.store().pool(),
+        &statuses::NewRemoteStatus {
+            id: &nodus_server_core::Id::new().to_string(),
+            account_id: &remote.id,
+            uri: &note.id,
+            content: &content,
+            content_html: &content_html,
+            spoiler_text: &spoiler_text,
+            sensitive: note.sensitive,
+            visibility: addressed(&note.to, &note.cc),
+            in_reply_to_id: parent.as_ref().map(|row| row.id.as_str()),
+            in_reply_to_account_id: parent.as_ref().map(|row| row.account_id.as_str()),
+            created_at,
+        },
+    )
+    .await?;
+    store_note_extras(state, remote, &note, &row).await
+}
+
+/// Checks that a note really is the sending actor's, and that no other account already
+/// owns the URI.
+async fn ensure_note_from_actor(
+    state: &AppState,
+    remote: &AccountRow,
+    note: &Note,
+    actor_uri: &str,
+) -> ApiResult<()> {
     if validate_remote_url(&note.id).is_err() || !same_origin(&note.id, actor_uri) {
         return Err(ApiError::forbidden(
             "note id does not belong to actor origin",
@@ -736,35 +1011,79 @@ pub(crate) async fn ingest_note(
             ));
         }
     }
-    let parent = match &note.in_reply_to {
-        Some(uri) => statuses::by_uri(state.store().pool(), uri).await?,
-        None => None,
-    };
-    let created_at = chrono::DateTime::parse_from_rfc3339(&note.published).map_or_else(
-        |_| chrono::Utc::now(),
-        |date| date.with_timezone(&chrono::Utc),
-    );
-    let content_html = crate::html::sanitize_html(&note.content);
-    let content = html_to_text(&content_html);
-    let spoiler_text = crate::html::escape_text(&note.summary);
-    statuses::upsert_remote(
-        state.store().pool(),
-        &statuses::NewRemoteStatus {
-            id: &nodus_server_core::Id::new().to_string(),
-            account_id: &remote.id,
-            uri: &note.id,
-            content: &content,
-            content_html: &content_html,
-            spoiler_text: &spoiler_text,
-            sensitive: note.sensitive,
-            visibility: addressed(&note.to, &note.cc),
-            in_reply_to_id: parent.as_ref().map(|row| row.id.as_str()),
-            in_reply_to_account_id: parent.as_ref().map(|row| row.account_id.as_str()),
-            created_at,
-        },
+    Ok(())
+}
+
+/// Keeps the parts of an ingested note that live outside the status row: who it mentions,
+/// its hashtags and its media.
+async fn store_note_extras(
+    state: &AppState,
+    remote: &AccountRow,
+    note: &Note,
+    row: &StatusRow,
+) -> ApiResult<()> {
+    let pool = state.store().pool();
+    let mut mentions = Vec::new();
+    for uri in &note.mentions {
+        if let Some(account) = accounts::by_uri(pool, uri).await? {
+            mentions.push(account.id);
+        } else {
+            tracing::debug!(mention = %uri, "mentioned actor is unknown");
+        }
+    }
+    mentions.sort();
+    mentions.dedup();
+    statuses::replace_mentions(pool, &row.id, &mentions).await?;
+    statuses::replace_tags(pool, &row.id, &hashtags_of(note)).await?;
+    media::replace_remote(
+        pool,
+        &row.id,
+        &remote.id,
+        note.sensitive,
+        &remote_attachments(note),
     )
     .await?;
     Ok(())
+}
+
+fn hashtags_of(note: &Note) -> Vec<String> {
+    let Some(Value::Array(tags)) = note.extra.get("tag") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = tags
+        .iter()
+        .filter(|tag| tag.get("type").and_then(Value::as_str) == Some("Hashtag"))
+        .filter_map(|tag| tag.get("name").and_then(Value::as_str))
+        .map(|name| name.trim_start_matches('#').to_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn remote_attachments(note: &Note) -> Vec<media::RemoteAttachment<'_>> {
+    note.attachments
+        .iter()
+        .filter(|attachment| validate_remote_url(&attachment.url).is_ok())
+        .filter_map(|attachment| {
+            let content_type = match attachment.kind.as_str() {
+                "Image" => "image/jpeg",
+                "Video" => "video/mp4",
+                "Audio" => "audio/mpeg",
+                _ => return None,
+            };
+            Some(media::RemoteAttachment {
+                url: &attachment.url,
+                content_type,
+                description: attachment.description.as_deref().unwrap_or_default(),
+                width: attachment.width.and_then(|value| i32::try_from(value).ok()),
+                height: attachment
+                    .height
+                    .and_then(|value| i32::try_from(value).ok()),
+            })
+        })
+        .collect()
 }
 
 fn html_to_text(html: &str) -> String {
@@ -779,6 +1098,16 @@ fn html_to_text(html: &str) -> String {
         }
     }
     text.trim().to_owned()
+}
+
+/// The text of an HTML fragment with the entities the sanitizer introduced undone.
+fn html_to_plain(html: &str) -> String {
+    html_to_text(html)
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 pub(crate) async fn status_activity(
@@ -819,7 +1148,10 @@ fn audience(visibility: &str, actor: &str, mentioned: &[String]) -> (Vec<String>
 async fn mentioned_actors(state: &AppState, row: &StatusRow) -> Vec<String> {
     let pool = state.store().pool();
     let mut actors = Vec::new();
-    for id in statuses::mentions_of(pool, &row.id).await.unwrap_or_default() {
+    for id in statuses::mentions_of(pool, &row.id)
+        .await
+        .unwrap_or_default()
+    {
         match nodus_server_store::accounts::by_id(pool, &id).await {
             Ok(Some(account)) => actors.push(actor_url(state, &account)),
             Ok(None) => {}
@@ -845,19 +1177,25 @@ async fn note_document(state: &AppState, row: &StatusRow, account: &AccountRow) 
     let media = nodus_server_store::media::by_status(state.store().pool(), &row.id).await?;
     let attachments = media
         .iter()
-        .map(|media| Attachment {
-            kind: if media.content_type.starts_with("video/") {
-                "Video".to_owned()
-            } else if media.content_type.starts_with("image/") {
-                "Image".to_owned()
-            } else {
-                "Document".to_owned()
-            },
-            url: state.instance().url(&format!("/media/{}", media.id)),
-            preview_url: Some(state.instance().url(&format!("/media/{}", media.id))),
-            description: (!media.description.is_empty()).then(|| media.description.clone()),
-            width: media.width.and_then(|value| u32::try_from(value).ok()),
-            height: media.height.and_then(|value| u32::try_from(value).ok()),
+        .map(|media| {
+            let url = media
+                .remote_url
+                .clone()
+                .unwrap_or_else(|| state.instance().url(&format!("/media/{}", media.id)));
+            Attachment {
+                kind: if media.content_type.starts_with("video/") {
+                    "Video".to_owned()
+                } else if media.content_type.starts_with("image/") {
+                    "Image".to_owned()
+                } else {
+                    "Document".to_owned()
+                },
+                url: url.clone(),
+                preview_url: Some(url),
+                description: (!media.description.is_empty()).then(|| media.description.clone()),
+                width: media.width.and_then(|value| u32::try_from(value).ok()),
+                height: media.height.and_then(|value| u32::try_from(value).ok()),
+            }
         })
         .collect();
     Ok(Note {
@@ -1064,7 +1402,7 @@ mod tests {
         let mentioned = vec!["https://mastodon.test/users/eve".to_owned()];
         let (to, cc) = super::audience("direct", actor, &mentioned);
         assert_eq!(to, mentioned);
-        assert!(cc.is_empty());
+        assert_eq!(cc, Vec::<String>::new());
     }
 
     #[test]
@@ -1256,5 +1594,405 @@ mod tests {
             local_username("https://social.test/users/alice", "social.test"),
             Some("alice".to_owned())
         );
+    }
+
+    async fn seed_remote(store: &Store, uri: &str) -> AccountRow {
+        let domain = uri
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or("remote.test");
+        let username = uri.rsplit('/').next().unwrap_or("remote");
+        let inbox = format!("{uri}/inbox");
+        accounts::upsert_remote(
+            store.pool(),
+            &accounts::RemoteAccount {
+                uri,
+                username,
+                domain,
+                display_name: username,
+                note: "",
+                avatar_url: None,
+                header_url: None,
+                inbox_url: Some(inbox.as_str()),
+                shared_inbox_url: None,
+                public_key_pem: None,
+                locked: false,
+                bot: false,
+            },
+        )
+        .await
+        .expect("seed remote account")
+    }
+
+    #[test]
+    fn a_flag_with_an_array_object_is_parsed_with_its_targets() {
+        let value = serde_json::json!({
+            "id": "https://remote.test/reports/1",
+            "type": "Flag",
+            "actor": "https://remote.test/users/mallory",
+            "content": "spam",
+            "object": [
+                "https://remote.test/users/spammer",
+                {"id": "https://remote.test/notes/9"}
+            ]
+        });
+        let activity = super::flag_activity(&value).expect("flag parsed");
+        assert_eq!(activity.kind, ActivityKind::Flag);
+        assert_eq!(activity.actor, "https://remote.test/users/mallory");
+        assert_eq!(
+            super::flag_targets(&activity),
+            vec![
+                "https://remote.test/users/spammer".to_owned(),
+                "https://remote.test/notes/9".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_flag_fallback_only_handles_array_objects() {
+        assert!(super::flag_activity(&serde_json::json!({
+            "type": "Flag",
+            "actor": "https://remote.test/users/mallory",
+            "object": "https://remote.test/users/spammer"
+        }))
+        .is_none());
+        assert!(super::flag_activity(&serde_json::json!({
+            "type": "Create",
+            "actor": "https://remote.test/users/mallory",
+            "object": []
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn hashtags_are_lowercased_deduplicated_and_ignore_mentions() {
+        let note = Note::from_json(&serde_json::json!({
+            "id": "https://remote.test/notes/1",
+            "type": "Note",
+            "content": "<p>hi</p>",
+            "tag": [
+                {"type": "Hashtag", "name": "#Rust"},
+                {"type": "Hashtag", "name": "#rust"},
+                {"type": "Mention", "href": "https://remote.test/users/eve"},
+                {"type": "Hashtag", "name": "#"}
+            ]
+        }))
+        .expect("note parses");
+        assert_eq!(super::hashtags_of(&note), vec!["rust".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn an_ingested_note_keeps_mentions_tags_and_media() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let mentioned = seed_remote(&store, "https://remote.test/users/eve").await;
+            let note_uri = format!("https://remote.test/notes/{}", Id::new());
+            let note = serde_json::json!({
+                "id": note_uri,
+                "type": "Note",
+                "published": "2026-01-01T00:00:00Z",
+                "content": "<p>look</p>",
+                "tag": [
+                    {"type": "Mention", "href": mentioned.uri.clone().unwrap()},
+                    {"type": "Hashtag", "name": "#Rust"}
+                ],
+                "attachment": [{
+                    "type": "Image",
+                    "url": "https://remote.test/media/1.png",
+                    "name": "alt text",
+                    "width": 640,
+                    "height": 480
+                }]
+            });
+
+            ingest_note(&state, &author, &note)
+                .await
+                .expect("ingest note");
+
+            let row = statuses::by_uri(store.pool(), &note_uri)
+                .await
+                .expect("lookup")
+                .expect("stored status");
+            assert_eq!(
+                statuses::mentions_of(store.pool(), &row.id)
+                    .await
+                    .expect("read mentions"),
+                vec![mentioned.id.clone()]
+            );
+            assert_eq!(
+                statuses::tags_of(store.pool(), &row.id)
+                    .await
+                    .expect("read tags"),
+                vec!["rust".to_owned()]
+            );
+            let stored = media::by_status(store.pool(), &row.id)
+                .await
+                .expect("read media");
+            assert_eq!(stored.len(), 1);
+            assert_eq!(
+                stored[0].remote_url.as_deref(),
+                Some("https://remote.test/media/1.png")
+            );
+            assert_eq!(stored[0].description, "alt text");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_update_refreshes_a_remote_note_and_stamps_the_edit() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let note_uri = format!("https://remote.test/notes/{}", Id::new());
+            let original = serde_json::json!({
+                "id": note_uri,
+                "type": "Note",
+                "to": ["https://www.w3.org/ns/activitystreams#Public"],
+                "content": "<p>before</p>"
+            });
+            ingest_note(&state, &author, &original)
+                .await
+                .expect("ingest note");
+
+            let edited = serde_json::json!({
+                "id": note_uri,
+                "type": "Note",
+                "summary": "cw",
+                "sensitive": true,
+                "content": "<p>after</p>"
+            });
+            let activity = Activity::new(ActivityKind::Update, author.uri.clone().unwrap(), edited);
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest update");
+
+            let row = statuses::by_uri(store.pool(), &note_uri)
+                .await
+                .expect("lookup")
+                .expect("stored status");
+            assert_eq!(row.content, "after");
+            assert!(row.content_html.contains("<p>after</p>"));
+            assert!(row.sensitive);
+            assert_eq!(row.spoiler_text, "cw");
+            assert!(row.edited_at.is_some());
+            assert_eq!(row.visibility, "public");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_update_refreshes_a_remote_profile() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let uri = author.uri.clone().unwrap();
+            let document = serde_json::json!({
+                "id": uri,
+                "type": "Person",
+                "preferredUsername": "mallory",
+                "name": "New Name",
+                "summary": "<p>new bio</p>",
+                "icon": {"type": "Image", "url": "https://remote.test/avatar.png"},
+                "image": {"type": "Image", "url": "https://remote.test/header.png"},
+                "inbox": "https://remote.test/users/mallory/inbox"
+            });
+            let activity = Activity::new(ActivityKind::Update, uri, document);
+
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest update");
+
+            let row = accounts::by_uri(store.pool(), author.uri.as_deref().unwrap())
+                .await
+                .expect("lookup")
+                .expect("stored account");
+            assert_eq!(row.display_name, "New Name");
+            assert!(row.note.contains("new bio"));
+            assert_eq!(
+                row.avatar_url.as_deref(),
+                Some("https://remote.test/avatar.png")
+            );
+            assert_eq!(
+                row.header_url.as_deref(),
+                Some("https://remote.test/header.png")
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_remote_actor_soft_deletes_its_statuses_but_keeps_the_account() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let uri = author.uri.clone().unwrap();
+            let first = format!("https://remote.test/notes/{}", Id::new());
+            let second = format!("https://remote.test/notes/{}", Id::new());
+            for note_uri in [&first, &second] {
+                ingest_note(
+                    &state,
+                    &author,
+                    &serde_json::json!({
+                        "id": note_uri,
+                        "type": "Note",
+                        "content": "<p>gone soon</p>"
+                    }),
+                )
+                .await
+                .expect("ingest note");
+            }
+
+            let activity = Activity::new(ActivityKind::Delete, uri.clone(), uri.clone());
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest delete");
+
+            assert!(statuses::by_uri(store.pool(), &first)
+                .await
+                .expect("lookup")
+                .is_none());
+            assert!(statuses::by_uri(store.pool(), &second)
+                .await
+                .expect("lookup")
+                .is_none());
+            assert!(accounts::by_uri(store.pool(), &uri)
+                .await
+                .expect("lookup")
+                .is_some());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_remote_note_spares_its_siblings() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let gone = format!("https://remote.test/notes/{}", Id::new());
+            let kept = format!("https://remote.test/notes/{}", Id::new());
+            for note_uri in [&gone, &kept] {
+                ingest_note(
+                    &state,
+                    &author,
+                    &serde_json::json!({
+                        "id": note_uri,
+                        "type": "Note",
+                        "content": "<p>x</p>"
+                    }),
+                )
+                .await
+                .expect("ingest note");
+            }
+
+            let activity = Activity::new(
+                ActivityKind::Delete,
+                author.uri.clone().unwrap(),
+                gone.clone(),
+            );
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest delete");
+
+            assert!(statuses::by_uri(store.pool(), &gone)
+                .await
+                .expect("lookup")
+                .is_none());
+            assert!(statuses::by_uri(store.pool(), &kept)
+                .await
+                .expect("lookup")
+                .is_some());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_inbound_block_stops_delivery_to_the_blocking_host() {
+        with_isolated_state(|store, state| async move {
+            let blocker = seed_remote(&store, "https://blocked.test/users/mallory").await;
+            let local = accounts::insert(
+                store.pool(),
+                &accounts::NewAccount {
+                    username: "alice",
+                    display_name: "Alice",
+                    note: "",
+                    bot: false,
+                    locked: false,
+                },
+            )
+            .await
+            .expect("insert local account");
+            let activity = Activity::new(
+                ActivityKind::Block,
+                blocker.uri.clone().unwrap(),
+                "https://social.test/users/alice",
+            );
+
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest block");
+
+            let document = serde_json::json!({
+                "id": format!("https://social.test/users/alice/statuses/{}", Id::new()),
+                "type": "Create",
+                "actor": "https://social.test/users/alice",
+                "object": {"id": "https://social.test/users/alice/statuses/1"}
+            });
+            let inboxes = vec![
+                "https://blocked.test/users/mallory/inbox".to_owned(),
+                "https://open.test/inbox".to_owned(),
+            ];
+            assert_eq!(
+                nodus_server_store::delivery::enqueue(store.pool(), &local.id, &document, &inboxes)
+                    .await
+                    .expect("enqueue"),
+                1
+            );
+            let pending = nodus_server_store::delivery::pending(store.pool(), 10)
+                .await
+                .expect("pending");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].inbox_url, "https://open.test/inbox");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_flag_opens_a_federation_report() {
+        with_isolated_state(|store, state| async move {
+            let reporter = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let target = seed_remote(&store, "https://remote.test/users/spammer").await;
+            let value = serde_json::json!({
+                "id": "https://remote.test/reports/1",
+                "type": "Flag",
+                "actor": reporter.uri.clone().unwrap(),
+                "content": "spam &amp; abuse",
+                "object": [target.uri.clone().unwrap()]
+            });
+            let activity = super::flag_activity(&value).expect("flag parsed");
+
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest flag");
+            ingest_activity(&state, &activity)
+                .await
+                .expect("ingest replayed flag");
+
+            let reports = nodus_server_store::moderation::reports(
+                store.pool(),
+                &nodus_server_store::moderation::ReportFilter {
+                    category: Some("federation"),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read reports");
+            assert_eq!(
+                reports.len(),
+                1,
+                "a replayed flag must not open a second report"
+            );
+            assert_eq!(reports[0].account_id, reporter.id);
+            assert_eq!(reports[0].target_account_id, target.id);
+            assert_eq!(reports[0].comment, "spam & abuse");
+        })
+        .await;
     }
 }

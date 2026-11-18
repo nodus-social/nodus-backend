@@ -161,10 +161,11 @@ async fn a_post_is_queued_once_per_follower_inbox() {
 }
 
 #[tokio::test]
-async fn a_private_post_is_not_announced() {
+async fn a_private_post_reaches_followers_and_is_not_addressed_to_the_public() {
     run_db_test(|store, app| async move {
         let pool = store.pool().clone();
         let author = signing_account(&pool, "author").await;
+        let username = username_of(&pool, &author).await;
         let token = create_token(&pool, &author, &["read", "write"]).await;
         let follower = remote_follower(&pool, "follower", "https://remote.test/inbox").await;
         support::follow(&pool, &follower, &author).await;
@@ -174,15 +175,29 @@ async fn a_private_post_is_not_announced() {
             &token,
             "POST",
             "/api/v1/statuses",
-            Some(json!({ "status": "not for peers", "visibility": "private" })),
+            Some(json!({ "status": "not for everyone", "visibility": "private" })),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM federation_delivery")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        assert_eq!(queued, 0, "a private post has no peer audience");
+        let queued: Vec<(String, Value)> =
+            sqlx::query_as("SELECT inbox_url, activity FROM federation_delivery")
+                .fetch_all(&pool)
+                .await
+                .expect("queued deliveries");
+        assert_eq!(queued.len(), 1, "a private post goes to followers only");
+        let (inbox, activity) = &queued[0];
+        assert_eq!(inbox, "https://remote.test/inbox");
+        assert_eq!(
+            activity["object"]["to"],
+            json!([format!("https://social.test/users/{username}/followers")])
+        );
+        assert_eq!(activity["object"]["cc"], json!([]));
+        assert!(
+            !activity
+                .to_string()
+                .contains("https://www.w3.org/ns/activitystreams#Public"),
+            "a private post must not advertise the public collection: {activity}"
+        );
     })
     .await;
 }
