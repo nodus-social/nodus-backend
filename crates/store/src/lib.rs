@@ -30,6 +30,7 @@ pub mod jobs;
 pub mod lists;
 pub mod markers;
 pub mod media;
+pub mod media_nodes;
 pub mod miauth;
 pub mod moderation;
 pub mod moderation_rules;

@@ -19,5 +19,8 @@ tokio = { workspace = true }
 tracing.workspace = true
 ulid = { workspace = true }
 
+[dev-dependencies]
+tower = { workspace = true }
+
 [lints]
 workspace = true

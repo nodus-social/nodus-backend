@@ -8,16 +8,22 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::Router;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
 use nodus_server_store::media::{self, VariantRow};
+use nodus_server_store::media_nodes;
 
+use crate::cluster::{self, placement, Member};
+use crate::hash::hex;
 use crate::{CachePolicy, Layer};
 
 /// The bytes a media catalogue id resolves to, and where they are kept.
@@ -26,25 +32,69 @@ pub struct Serving {
     pool: PgPool,
     root: PathBuf,
     variants: PathBuf,
+    /// This process's name in the membership table.
+    node: String,
+    /// Shared secret the peers present on the internal routes. `None` disables them.
+    cluster_token: Option<String>,
 }
 
 impl Serving {
     /// Serve from this database and these directories.
     #[must_use]
-    pub fn new(pool: PgPool, root: PathBuf, variants: PathBuf) -> Self {
+    pub fn new(
+        pool: PgPool,
+        root: PathBuf,
+        variants: PathBuf,
+        node: String,
+        cluster_token: Option<String>,
+    ) -> Self {
         Self {
             pool,
             root,
             variants,
+            node,
+            cluster_token,
         }
     }
 
+    /// Whether the `/internal/*` routes are registered at all.
+    #[must_use]
+    pub const fn cluster_enabled(&self) -> bool {
+        self.cluster_token.is_some()
+    }
+
     /// `/media/default-avatar.png`, `/media/{id}`, `/media/{id}/{layer}`.
+    ///
+    /// The `/internal/*` routes exist only when a cluster token is configured. With no
+    /// token they are not registered at all, so they answer the same 404 an unknown path
+    /// does rather than merely refusing the request.
     pub fn router(self: &Arc<Self>) -> Router {
-        Router::new()
+        let public = Router::new()
             .route("/media/default-avatar.png", get(default_avatar))
             .route("/media/{id}", get(serve))
             .route("/media/{id}/{layer}", get(serve_variant))
+            .with_state(self.clone());
+        if self.cluster_token.is_none() {
+            return public;
+        }
+        public.merge(self.internal_router())
+    }
+
+    fn internal_router(self: &Arc<Self>) -> Router {
+        Router::new()
+            .route(
+                "/internal/media/{digest}",
+                put(internal_put)
+                    .get(internal_get)
+                    .head(internal_head)
+                    .delete(internal_delete),
+            )
+            .route("/internal/placement/{digest}", get(internal_placement))
+            .layer(DefaultBodyLimit::max(MAX_INTERNAL_UPLOAD))
+            .layer(middleware::from_fn_with_state(
+                self.clone(),
+                require_cluster_token,
+            ))
             .with_state(self.clone())
     }
 }
@@ -228,9 +278,271 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Record not found").into_response()
 }
 
+/// The largest body an internal replica write will buffer. Originals are capped well
+/// below this at upload; the limit here is defence against a peer that sends more.
+const MAX_INTERNAL_UPLOAD: usize = 64 * 1024 * 1024;
+
+/// What one digest resolves to, for an operator or a peer checking its own view.
+///
+/// `replicas` is the whole placement, best first, so it always starts with `owner`; with
+/// `R = 2` it names the owner and the one node that should also hold the bytes. `local`
+/// says whether this process is that owner.
+#[derive(Debug, Serialize)]
+struct PlacementView {
+    owner: String,
+    replicas: Vec<String>,
+    local: bool,
+}
+
+/// Rejects anything but a lowercase SHA-256 hex digest.
+///
+/// The digest becomes a file name, so this is also what keeps `..` and a slash out of the
+/// path: a peer cannot choose where a write lands.
+fn is_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Constant-time comparison for the cluster token.
+///
+/// Length is compared first because a length difference is not a secret: the token's
+/// length is fixed by configuration, not guessed byte by byte from the response time.
+fn token_matches(expected: &str, presented: &str) -> bool {
+    let (expected, presented) = (expected.as_bytes(), presented.as_bytes());
+    if expected.len() != presented.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in expected.iter().zip(presented) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+/// Every `/internal/*` request carries the shared secret.
+async fn require_cluster_token(
+    State(serving): State<Arc<Serving>>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let expected = serving.cluster_token.as_deref().unwrap_or_default();
+    let presented = headers
+        .get("x-nodus-cluster")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !token_matches(expected, presented) {
+        return (StatusCode::UNAUTHORIZED, "Invalid cluster token").into_response();
+    }
+    next.run(request).await
+}
+
+/// `PUT /internal/media/{digest}` — a peer stores bytes this node owns.
+///
+/// The body is verified against the digest before anything is written, so a corrupt or
+/// malicious send cannot occupy the address of content it does not match. The write lands
+/// in the same directory as the target and is renamed into place, so a reader sees either
+/// the previous state or the whole new file, never a partial one.
+async fn internal_put(
+    State(serving): State<Arc<Serving>>,
+    Path(digest): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !is_digest(&digest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "digest must be 64 lowercase hex characters",
+        )
+            .into_response();
+    }
+    if hex(&Sha256::digest(&body)) != digest {
+        return (StatusCode::BAD_REQUEST, "digest does not match the body").into_response();
+    }
+    let target = serving.root.join(&digest);
+    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
+        return StatusCode::OK.into_response();
+    }
+    if let Err(error) = tokio::fs::create_dir_all(&serving.root).await {
+        tracing::error!(%error, path = %serving.root.display(), "could not create the media directory");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let staged = serving
+        .root
+        .join(format!(".{digest}.{}.part", ulid::Ulid::new()));
+    if let Err(error) = tokio::fs::write(&staged, &body).await {
+        let _ = tokio::fs::remove_file(&staged).await;
+        tracing::error!(%error, %digest, "could not stage an internal media write");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match tokio::fs::rename(&staged, &target).await {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&staged).await;
+            tracing::error!(%error, %digest, "could not commit an internal media write");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `GET /internal/media/{digest}` — raw bytes, with no catalogue check.
+async fn internal_get(State(serving): State<Arc<Serving>>, Path(digest): Path<String>) -> Response {
+    if !is_digest(&digest) {
+        return not_found();
+    }
+    match tokio::fs::read(serving.root.join(&digest)).await {
+        Ok(bytes) => (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            )],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Err(_) => not_found(),
+    }
+}
+
+/// `HEAD /internal/media/{digest}` — presence without reading the file.
+async fn internal_head(
+    State(serving): State<Arc<Serving>>,
+    Path(digest): Path<String>,
+) -> Response {
+    if !is_digest(&digest) {
+        return not_found();
+    }
+    match tokio::fs::metadata(serving.root.join(&digest)).await {
+        Ok(metadata) if metadata.is_file() => StatusCode::OK.into_response(),
+        _ => not_found(),
+    }
+}
+
+/// `DELETE /internal/media/{digest}` — idempotent, because a peer may retry a delete and
+/// the absence of the file is the outcome it wants either way.
+async fn internal_delete(
+    State(serving): State<Arc<Serving>>,
+    Path(digest): Path<String>,
+) -> Response {
+    if is_digest(&digest) {
+        match tokio::fs::remove_file(serving.root.join(&digest)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, %digest, "could not delete an internal media file");
+            }
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /internal/placement/{digest}` — where this cluster thinks a digest belongs.
+async fn internal_placement(
+    State(serving): State<Arc<Serving>>,
+    Path(digest): Path<String>,
+) -> Response {
+    let nodes = match media_nodes::members(&serving.pool, cluster::MEMBER_MAX_AGE).await {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::error!(%error, "the media membership could not be read");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let members: Vec<Member> = nodes
+        .into_iter()
+        .map(|node| Member {
+            name: node.name,
+            endpoint: node.endpoint,
+        })
+        .collect();
+    let placed = placement(&digest, &members, cluster::REPLICAS);
+    let owner = placed
+        .first()
+        .map_or_else(String::new, |member| member.name.clone());
+    let local = owner == serving.node;
+    axum::Json(PlacementView {
+        owner,
+        replicas: placed.iter().map(|member| member.name.clone()).collect(),
+        local,
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{default_avatar, DEFAULT_AVATAR_SIZE, PLACEHOLDER_BACKGROUND, PLACEHOLDER_FIGURE};
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request as HttpRequest, StatusCode};
+    use tower::ServiceExt;
+
+    use super::{
+        default_avatar, Serving, DEFAULT_AVATAR_SIZE, PLACEHOLDER_BACKGROUND, PLACEHOLDER_FIGURE,
+    };
+
+    /// A serving state with no database: these tests assert routing and token handling, and
+    /// the one route that reads membership is only asserted where it must refuse a request.
+    fn serving(cluster_token: Option<&str>) -> Arc<Serving> {
+        let store =
+            nodus_server_store::Store::connect_lazy("postgres://nodus:nodus@127.0.0.1:1/nodus", 1);
+        let root = std::env::temp_dir().join(format!("nodus-media-{}", ulid::Ulid::new()));
+        Arc::new(Serving::new(
+            store.pool().clone(),
+            root.clone(),
+            root.join("variants"),
+            "test-node".to_owned(),
+            cluster_token.map(str::to_owned),
+        ))
+    }
+
+    async fn status_of(token: Option<&str>, request: HttpRequest<Body>) -> StatusCode {
+        serving(token)
+            .router()
+            .oneshot(request)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_wrong_cluster_token_is_unauthorised() {
+        let request = HttpRequest::builder()
+            .uri("/internal/placement/00")
+            .header("x-nodus-cluster", "not-the-token")
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(
+            status_of(Some("the-token"), request).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_cluster_token_is_unauthorised() {
+        let request = HttpRequest::builder()
+            .uri("/internal/media/00")
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(
+            status_of(Some("the-token"), request).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn the_internal_routes_are_absent_without_a_token() {
+        for uri in ["/internal/placement/00", "/internal/media/00"] {
+            let request = HttpRequest::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request");
+            assert_eq!(
+                status_of(None, request).await,
+                StatusCode::NOT_FOUND,
+                "{uri} must look like an unknown path"
+            );
+        }
+    }
 
     /// The default picture is only useful if a client can decode it, so the test decodes it.
     #[tokio::test]
