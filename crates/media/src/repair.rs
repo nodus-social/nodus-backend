@@ -209,3 +209,168 @@ async fn repair_one(
     }
     summary
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testpeer::Peer;
+
+    fn digest_of(bytes: &[u8]) -> String {
+        hex(&Sha256::digest(bytes))
+    }
+
+    fn temp_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("nodus-media-repair-{}", ulid::Ulid::new()))
+    }
+
+    /// This node is a member so placement has two candidates; its endpoint is never
+    /// called, because the walk reads its own files from disk.
+    fn self_member() -> Member {
+        Member {
+            name: "self".to_owned(),
+            endpoint: "http://127.0.0.1:1".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_copy_only_a_peer_holds_is_repaired_locally() {
+        let root = temp_root();
+        let body = b"held elsewhere".to_vec();
+        let digest = digest_of(&body);
+        let peer = Peer::spawn("beta").await;
+        peer.seed(&digest, body.clone());
+        let members = vec![self_member(), peer.member()];
+        let summary = repair_digests(
+            &root,
+            "self",
+            Some("token"),
+            std::slice::from_ref(&digest),
+            &members,
+        )
+        .await;
+        assert_eq!(
+            summary,
+            Summary {
+                repaired: 1,
+                pushed: 0,
+                unreadable: 0,
+                extra: 0,
+            }
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(&digest)).await.expect("copy"),
+            body
+        );
+        assert_eq!(peer.gets(), 1, "the peer was read once");
+        assert_eq!(peer.puts(), 0, "nothing was pushed at a peer that had it");
+    }
+
+    #[tokio::test]
+    async fn a_replica_without_the_digest_is_pushed() {
+        let root = temp_root();
+        let body = b"only here".to_vec();
+        let digest = digest_of(&body);
+        tokio::fs::create_dir_all(&root).await.expect("root");
+        tokio::fs::write(root.join(&digest), &body)
+            .await
+            .expect("seed");
+        let peer = Peer::spawn("beta").await;
+        let members = vec![self_member(), peer.member()];
+        let summary = repair_digests(
+            &root,
+            "self",
+            Some("token"),
+            std::slice::from_ref(&digest),
+            &members,
+        )
+        .await;
+        assert_eq!(
+            summary,
+            Summary {
+                repaired: 0,
+                pushed: 1,
+                unreadable: 0,
+                extra: 0,
+            }
+        );
+        assert_eq!(peer.file(&digest), Some(body));
+    }
+
+    #[tokio::test]
+    async fn a_digest_no_member_holds_is_counted_unreadable() {
+        let root = temp_root();
+        let digest = digest_of(b"gone everywhere");
+        let peer = Peer::spawn("beta").await;
+        let members = vec![self_member(), peer.member()];
+        let summary = repair_digests(&root, "self", Some("token"), &[digest], &members).await;
+        assert_eq!(
+            summary,
+            Summary {
+                repaired: 0,
+                pushed: 0,
+                unreadable: 1,
+                extra: 0,
+            }
+        );
+        assert_eq!(peer.puts(), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_token_the_walk_touches_nothing() {
+        let root = temp_root();
+        let body = b"single node".to_vec();
+        let digest = digest_of(&body);
+        let peer = Peer::spawn("beta").await;
+        let members = vec![self_member(), peer.member()];
+        let summary = repair_digests(&root, "self", None, &[digest], &members).await;
+        assert_eq!(summary, Summary::default());
+        assert_eq!(
+            peer.requests(),
+            0,
+            "a single-node instance must not ask anybody"
+        );
+    }
+
+    /// A copy held outside the placement is counted, and left where it is.
+    #[tokio::test]
+    async fn an_extra_copy_is_counted_and_kept() {
+        let root = temp_root();
+        let body = b"extra".to_vec();
+        let digest = digest_of(&body);
+        tokio::fs::create_dir_all(&root).await.expect("root");
+        tokio::fs::write(root.join(&digest), &body)
+            .await
+            .expect("seed");
+        let peer = Peer::spawn("beta").await;
+        // Placement over these two members holds every digest on both, so an "extra"
+        // needs a third node: it is a member but placement cuts at REPLICAS.
+        let spare = Peer::spawn("gamma").await;
+        spare.seed(&digest, body.clone());
+        let members = vec![self_member(), peer.member(), spare.member()];
+        let summary = repair_digests(
+            &root,
+            "self",
+            Some("token"),
+            std::slice::from_ref(&digest),
+            &members,
+        )
+        .await;
+        assert!(summary.extra <= 1, "extra was {}", summary.extra);
+        assert_eq!(
+            spare.file(&digest),
+            Some(body),
+            "the extra copy was deleted"
+        );
+    }
+
+    #[test]
+    fn the_summary_line_is_the_one_an_operator_greps_for() {
+        let summary = Summary {
+            repaired: 2,
+            pushed: 3,
+            unreadable: 4,
+            extra: 5,
+        };
+        assert_eq!(summary.line(), "repaired=2 pushed=3 unreadable=4 extra=5");
+    }
+}
