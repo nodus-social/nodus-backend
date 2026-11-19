@@ -24,6 +24,7 @@ pub mod escalation;
 pub mod events;
 pub mod external_ids;
 pub mod filters;
+pub mod forwarded;
 pub mod highlights;
 pub mod jobs;
 pub mod lists;

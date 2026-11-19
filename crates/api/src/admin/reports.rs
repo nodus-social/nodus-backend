@@ -181,6 +181,11 @@ async fn detail(
 pub struct ResolveBody {
     #[serde(default)]
     note: String,
+    /// Mastodon's report UI calls this "forward": send the report on to the peer that
+    /// hosts the account. Off by default, because the same moderation decision means
+    /// different things on different instances and must not leave this one silently.
+    #[serde(default)]
+    forward_to_peer: bool,
 }
 
 async fn resolve(
@@ -190,7 +195,14 @@ async fn resolve(
     body: Option<Json<ResolveBody>>,
 ) -> ApiResult<Json<ReportDto>> {
     auth.require_admin("admin:write")?;
-    let note = body.map(|Json(body)| body.note).unwrap_or_default();
+    let body = body.map(|Json(body)| body).unwrap_or_default();
+    let note = body.note;
+    // Forwarding happens before the local decision is written: a refused forward must
+    // leave the report open so the moderator can pick a different path, and a forward
+    // that fails to queue must not look delivered because the report says "resolved".
+    if body.forward_to_peer {
+        super::forwarded::forward_report(&state, &auth, &id, note.trim()).await?;
+    }
     let row =
         moderation::resolve_report(state.store().pool(), &id, &auth.0.account.id, note.trim())
             .await?
@@ -354,6 +366,20 @@ async fn create(
         json!({ "report": row.id }),
     )
     .await?;
+    // A moderator filing the report is the moment the instance already decided there is
+    // something to say, so send it without a second click. Anyone else's report goes to
+    // the local queue and is forwarded later, by a moderator, through `resolve`.
+    // Best effort on purpose: the report exists either way, and a refusal is not a reason
+    // to reject a member's report.
+    if auth.0.account.staff_role != "none" && !target.local {
+        if let Err(error) = super::forwarded::forward_report(&state, &auth, &row.id, "").await {
+            tracing::warn!(
+                report = %row.id,
+                error = %error.message(),
+                "could not forward a staff report to its peer"
+            );
+        }
+    }
     Ok(Json(report_dto(&state, row).await?))
 }
 
