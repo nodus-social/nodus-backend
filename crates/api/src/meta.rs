@@ -26,7 +26,7 @@ use nodus_shared::{Meta, CONTRACT_VERSION, MIN_CONTRACT_VERSION};
 /// this instance's `nodus-feed` process on the same origin. The rest are answered by this
 /// API. `tests/capabilities.rs` holds the feature-to-path table and fails when a name here
 /// stops answering or a route appears that no name covers.
-pub const FEATURES: [&str; 19] = [
+pub const FEATURES: [&str; 21] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -51,6 +51,12 @@ pub const FEATURES: [&str; 19] = [
     "moderation_stats", // GET /api/v1/admin/stats
     "remote_accounts",  // GET /api/v1/admin/federation/remote-accounts
     "warnings",         // GET /api/v1/admin/warning_presets
+    // The two surfaces the last two commits shipped without a name. `federation_delivery`
+    // rather than `federation_deliveries` or `deliveries` because it is already the feature
+    // string those handlers write to the audit log (`admin/federation.rs`): one spelling for
+    // one thing, so the console's audit filter and its capability gate agree.
+    "escalation",          // GET|PUT /api/v1/admin/escalation
+    "federation_delivery", // GET /api/v1/admin/federation/deliveries
 ];
 
 /// The capability names as owned strings, for documents that serialize their own envelope.

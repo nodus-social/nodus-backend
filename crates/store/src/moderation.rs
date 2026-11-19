@@ -399,6 +399,28 @@ pub async fn audit_page(
     .await
 }
 
+/// The audit rows recorded *about* one account, newest first.
+///
+/// `audit_page` can filter by `target_type` but not by which target, so the moderation
+/// history of a single person could only be read by paging the whole instance log. An
+/// export needs the rows about one account and nothing else.
+pub async fn audit_for_account(
+    pool: &PgPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<AuditRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, actor_id, action, target_type, target_id, detail, created_at \
+         FROM audit_log \
+         WHERE target_type = 'account' AND target_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2",
+    )
+    .bind(account_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct DomainBlockRow {
     pub id: String,

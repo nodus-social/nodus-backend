@@ -77,6 +77,7 @@ pub fn router(state: AppState) -> axum::Router {
             put(reactions::set).delete(reactions::remove),
         )
         .route("/api/v1/accounts/{id}", get(accounts::show))
+        .route("/api/v1/accounts/{id}/export", get(accounts::export))
         .route("/api/v1/accounts/lookup", get(accounts::lookup))
         .route("/api/v1/accounts/{id}/followers", get(accounts::followers))
         .route("/api/v1/accounts/{id}/following", get(accounts::following))

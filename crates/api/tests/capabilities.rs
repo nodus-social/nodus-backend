@@ -163,6 +163,14 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/admin/escalation",
         owner: Owner::Api,
     },
+    // Not `federation_deliveries`: the retry handlers in `admin/federation.rs` already tag
+    // their audit rows `federation_delivery`, and a capability the audit filter spells
+    // differently from the log is a panel that lists nothing.
+    Capability {
+        name: "federation_delivery",
+        path: "/api/v1/admin/federation/deliveries",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -177,7 +185,10 @@ const MODULE_FEATURES: &[(&str, &[&str])] = &[
     ("appeals", &["appeals"]),
     ("escalation", &["escalation"]),
     ("blocklist", &["block_lists"]),
-    ("federation", &["remote_blocks", "remote_accounts"]),
+    (
+        "federation",
+        &["remote_blocks", "remote_accounts", "federation_delivery"],
+    ),
     ("media", &["media_quarantine"]),
     ("moderation_rules", &["moderation_rules"]),
     ("reports", &["moderation"]),

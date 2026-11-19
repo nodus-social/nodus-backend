@@ -408,6 +408,43 @@ pub async fn account_page(
     Ok(finish(rows, size))
 }
 
+/// How many statuses one page of an account export may carry.
+///
+/// Larger than a timeline page because an export is read by a script, not a screen, and
+/// bounded because the whole point is that a 50 000-post account streams through pages
+/// instead of being assembled into one string.
+pub const EXPORT_PAGE_MAX: u32 = 200;
+
+/// A page of an account's own statuses for its data export, newest first.
+///
+/// Deliberately not `account_page`: that one is an outbox, so it hides direct posts, hides
+/// the posts of a silenced actor and hides what moderation quarantined. An export is the
+/// opposite reader — the account asking for what it wrote — so it filters on authorship
+/// alone. Tombstones stay excluded because a deleted post is not a post the person has any
+/// more, and the page is cursor-bounded because the export of a 50 000-post account must
+/// not be assembled in memory in one query.
+pub async fn export_page(
+    pool: &PgPool,
+    account_id: &str,
+    max_id: Option<&str>,
+    limit: i64,
+) -> Result<StatusPage, sqlx::Error> {
+    let size = PageSize::clamp(u32::try_from(limit).ok(), EXPORT_PAGE_MAX);
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM status s \
+         WHERE s.account_id = $1 AND s.deleted_at IS NULL \
+           AND ($2::text IS NULL OR s.id < $2) \
+         ORDER BY s.id DESC LIMIT $3"
+    );
+    let rows = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(account_id)
+        .bind(max_id)
+        .bind(size.as_i64() + 1)
+        .fetch_all(pool)
+        .await?;
+    Ok(finish(rows, size))
+}
+
 /// `/api/v1/timelines/home`: the materialised lane union the big-account lane.
 ///
 /// Direct messages are excluded here and served by the notifications path: they reach
