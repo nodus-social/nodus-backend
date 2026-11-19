@@ -37,7 +37,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         store.clone(),
         config.instance.clone(),
         federation.clone(),
-    );
+    )
+    .with_authorized_fetch(config.authorized_fetch);
     tokio::spawn(nodus_server_api::schedules::run(state.clone()));
     // The subscription sweep lives here rather than in the pruning worker: it is an
     // outbound fetch, and the outbound guard, the client and the import path all live in
@@ -62,11 +63,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// Everything this service answers, in the order the router sees it.
 fn router(store: &Store, config: &Config, federation: Option<FederationKey>) -> Router {
-    let api = root_router(AppState::with_federation(
-        store.clone(),
-        config.instance.clone(),
-        federation,
-    ));
+    let api = root_router(
+        AppState::with_federation(store.clone(), config.instance.clone(), federation)
+            .with_authorized_fetch(config.authorized_fetch),
+    );
     let auth = nodus_auth::router(nodus_auth::AppState::new(
         PgAuthStore::new(store.pool().clone()),
         nodus_auth::Config {

@@ -19,13 +19,32 @@ pub use nodus_server_core::instance::InstanceConfig;
 /// How long an admin stats answer may be reused. The console polls this view.
 const STATS_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// How long a signing actor's `publicKeyPem` is trusted after it is resolved.
+///
+/// Short enough that a peer rotating its key stops being refused within a few minutes,
+/// long enough that a peer reading several of our URLs signed by the same key costs one
+/// fetch rather than one per request. A failed fetch is never stored here: the next
+/// attempt must try again, not verify against an empty key.
+pub(crate) const ACTOR_KEY_TTL: Duration = Duration::from_secs(300);
+
+/// Upper bound on cached actor keys, so a hostile peer cannot grow the map without
+/// limit by inventing key ids. Well above the number of peers one instance talks to.
+const ACTOR_KEY_CACHE_MAX: usize = 1024;
+
 #[derive(Debug)]
 struct Inner {
     store: Store,
     instance: InstanceConfig,
     federation: Option<Arc<FederationKey>>,
+    /// `NODUS_AUTHORIZED_FETCH`, read once at startup. Off means ActivityPub reads
+    /// answer anyone, exactly as they did before the switch existed.
+    authorized_fetch: bool,
     /// Process-local, keyed by the `range` the console asked for.
     stats_cache: Mutex<HashMap<&'static str, (Instant, StatsDto)>>,
+    /// Signing actor URL → (resolved at, PEM). Only successful lookups are inserted.
+    actor_keys: Mutex<HashMap<String, (Instant, String)>>,
+    /// One gate per actor URL, so concurrent cold requests do one fetch, not one each.
+    key_fetches: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Cloned into every handler; `Store` is a pool handle and `InstanceConfig` is small.
@@ -126,7 +145,29 @@ impl AppState {
                 store,
                 instance,
                 federation: federation.map(Arc::new),
+                authorized_fetch: false,
                 stats_cache: Mutex::new(HashMap::new()),
+                actor_keys: Mutex::new(HashMap::new()),
+                key_fetches: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// The same state with secure (authorized-fetch) mode on or off.
+    ///
+    /// The switch is read from the environment once, in the binary, and then only read:
+    /// nothing re-reads the variable per request, so the mode cannot change mid-flight.
+    #[must_use]
+    pub fn with_authorized_fetch(self, enabled: bool) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                store: self.inner.store.clone(),
+                instance: self.inner.instance.clone(),
+                federation: self.inner.federation.clone(),
+                authorized_fetch: enabled,
+                stats_cache: Mutex::new(HashMap::new()),
+                actor_keys: Mutex::new(HashMap::new()),
+                key_fetches: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -144,6 +185,58 @@ impl AppState {
     #[must_use]
     pub fn federation(&self) -> Option<&FederationKey> {
         self.inner.federation.as_deref()
+    }
+
+    /// Whether ActivityPub reads require an HTTP signature (`NODUS_AUTHORIZED_FETCH`).
+    #[must_use]
+    pub fn authorized_fetch(&self) -> bool {
+        self.inner.authorized_fetch
+    }
+
+    /// An unexpired cached key for `actor`, or `None` when it must be resolved again.
+    pub(crate) fn cached_actor_key(&self, actor: &str) -> Option<String> {
+        let mut cache = self.inner.actor_keys.lock().ok()?;
+        match cache.get(actor) {
+            Some((at, pem)) if at.elapsed() < ACTOR_KEY_TTL => Some(pem.clone()),
+            Some(_) => {
+                cache.remove(actor);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Records a key that was just resolved successfully. Failures are never cached.
+    pub(crate) fn cache_actor_key(&self, actor: &str, pem: String) {
+        let Ok(mut cache) = self.inner.actor_keys.lock() else {
+            return;
+        };
+        if cache.len() >= ACTOR_KEY_CACHE_MAX && !cache.contains_key(actor) {
+            cache.retain(|_, (at, _)| at.elapsed() < ACTOR_KEY_TTL);
+            if cache.len() >= ACTOR_KEY_CACHE_MAX {
+                // Still full of live entries: dropping them costs a refetch, which is
+                // cheaper than an unbounded map a peer can grow at will.
+                cache.clear();
+            }
+        }
+        cache.insert(actor.to_owned(), (Instant::now(), pem));
+    }
+
+    /// The per-actor gate that serialises key resolution on a cold cache.
+    pub(crate) fn key_fetch_gate(&self, actor: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let Ok(mut gates) = self.inner.key_fetches.lock() else {
+            return Arc::new(tokio::sync::Mutex::new(()));
+        };
+        if let Some(gate) = gates.get(actor) {
+            return Arc::clone(gate);
+        }
+        if gates.len() >= ACTOR_KEY_CACHE_MAX {
+            // Drop gates nobody is waiting on, so the map tracks in-flight fetches.
+            gates.retain(|_, gate| Arc::strong_count(gate) > 2);
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(actor.to_owned(), Arc::clone(&gate));
+        gate
     }
 
     /// A stats answer younger than [`STATS_CACHE_TTL`], or `None` when it must be rebuilt.

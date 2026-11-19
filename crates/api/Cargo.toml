@@ -48,6 +48,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { workspace = true }
+# Secure-mode tests sign with the same `RsaSigner` the outbound client uses, so the
+# test cannot pass by agreeing with a reimplementation.
+nodus-federation = { path = "../../../server-sdk/crates/federation", features = ["crypto"] }
 # The contract tests decode responses into the shipped client's own types, so a field
 # this server stops sending fails here instead of in somebody's browser.
 nodus-client-core = { path = "../../../sdk/crates/client-core", version = "0.1.0", default-features = false }

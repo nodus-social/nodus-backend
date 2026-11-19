@@ -14,6 +14,7 @@ pub mod appeals;
 pub mod apps;
 pub mod assets;
 pub mod auth;
+pub mod authorized_fetch;
 pub mod body;
 pub mod client_metadata;
 pub mod collections;
@@ -161,7 +162,16 @@ pub fn router(state: AppState) -> axum::Router {
 /// The complete server surface: client API plus the ActivityPub documents a peer
 /// resolves from the domain root.
 pub fn root_router(state: AppState) -> axum::Router {
-    router(state.clone()).merge(activitypub::router(state))
+    router(state.clone())
+        .merge(activitypub::router(state.clone()))
+        // Secure mode wraps the whole root surface rather than each ActivityPub
+        // handler: a read can arrive as `/users/alice`, as `/actor`, or as an
+        // `Accept: application/activity+json` request to a status or account URL, and
+        // one place to decide is one place to keep the bypass rule in step.
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            authorized_fetch::require_signature,
+        ))
 }
 
 #[cfg(test)]

@@ -86,6 +86,14 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// The store's lookup key for a bearer token: lowercase hex of its SHA-256.
+///
+/// Shared with secure mode, which must recognise our own sessions without rejecting
+/// the request the way [`Auth`] does.
+pub(crate) fn token_digest(token: &str) -> String {
+    hex_lower(&Sha256::digest(token.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2643,6 +2643,7 @@ dependencies = [
  "nodus-activitypub-client",
  "nodus-auth",
  "nodus-client-core",
+ "nodus-federation",
  "nodus-server-core",
  "nodus-server-federation",
  "nodus-server-media",
