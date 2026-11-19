@@ -298,6 +298,17 @@ pub(crate) async fn publish(
         new_poll.as_ref(),
     )
     .await?;
+    // The instance's rules act on what its own accounts publish too. This runs after the
+    // row exists, so a rule that suspends the author still leaves the audit trail that
+    // explains the suspension.
+    crate::rulewatch::screen(
+        state.store().pool(),
+        "local",
+        &row.id,
+        account_id,
+        &row.content,
+    )
+    .await;
     notify_mentions(
         state.store().pool(),
         account_id,

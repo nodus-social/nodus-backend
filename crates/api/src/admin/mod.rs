@@ -14,6 +14,7 @@ mod appeals;
 pub mod blocklist;
 mod federation;
 mod media;
+mod moderation_rules;
 mod reports;
 mod rules;
 mod scanners;
@@ -878,6 +879,7 @@ pub fn router() -> Router<AppState> {
         .merge(scanners::router())
         .merge(media::router())
         .merge(rules::router())
+        .merge(moderation_rules::router())
         .merge(topology::router())
         .route("/api/v1/admin/meta", get(meta))
         .route("/api/v1/admin/overview", get(overview))

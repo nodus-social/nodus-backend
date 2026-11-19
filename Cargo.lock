@@ -2763,6 +2763,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "nodus-server-core",
+ "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "sha2",

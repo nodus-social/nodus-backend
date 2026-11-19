@@ -42,6 +42,7 @@ pub mod polls;
 pub mod preferences;
 pub mod reactions;
 pub mod remote;
+pub mod rulewatch;
 pub mod schedules;
 pub mod state;
 pub mod statuses;

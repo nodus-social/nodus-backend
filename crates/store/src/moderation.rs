@@ -72,6 +72,30 @@ pub async fn create_report(pool: &PgPool, new: &NewReport<'_>) -> Result<ReportR
         .await
 }
 
+/// The same insert on a caller-owned connection, so a rule's report, its audit row and
+/// the action it applied commit or roll back together.
+pub async fn create_report_in(
+    conn: &mut PgConnection,
+    new: &NewReport<'_>,
+) -> Result<ReportRow, sqlx::Error> {
+    let sql = format!(
+        "INSERT INTO report (id, account_id, target_account_id, status_ids, category, comment, \
+             rule_ids, activity_uri) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING {REPORT_COLUMNS}"
+    );
+    sqlx::query_as(&sql)
+        .bind(Id::new().to_string())
+        .bind(new.account_id)
+        .bind(new.target_account_id)
+        .bind(new.status_ids)
+        .bind(new.category)
+        .bind(new.comment)
+        .bind(new.rule_ids)
+        .bind(new.activity_uri)
+        .fetch_one(conn)
+        .await
+}
+
 /// The report an activity already opened, so a replayed activity does not open another.
 pub async fn report_for_activity(
     pool: &PgPool,

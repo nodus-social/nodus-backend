@@ -1211,6 +1211,9 @@ async fn store_note_extras(
     if let Err(error) = crate::guard::screen_status(pool, &row.id, &remote.id).await {
         tracing::warn!(status = %row.id, %error, "inbound media check could not run");
     }
+    // Now the instance's rules read the post. Inbound scope: the author is somebody
+    // else's account, so a `local` rule is not about them.
+    crate::rulewatch::screen(pool, "inbound", &row.id, &remote.id, &row.content).await;
     Ok(())
 }
 

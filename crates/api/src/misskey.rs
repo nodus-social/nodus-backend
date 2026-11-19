@@ -739,6 +739,15 @@ async fn create_note(
         &tags,
     )
     .await?;
+    // A note is a local status: the same rules that read a Mastodon post read this one.
+    crate::rulewatch::screen(
+        state.store().pool(),
+        "local",
+        &row.id,
+        &auth.account.id,
+        &row.content,
+    )
+    .await;
     crate::statuses::notify_mentions(
         state.store().pool(),
         &auth.account.id,

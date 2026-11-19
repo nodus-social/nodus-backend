@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 chrono = { workspace = true }
 nodus-server-core = { workspace = true }
+regex = "1"
+regex-syntax = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
