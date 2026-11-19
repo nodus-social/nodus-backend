@@ -188,6 +188,13 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/admin/federation/forwarded",
         owner: Owner::Api,
     },
+    // The deletion surface is a GET probe's 405 on the recovery route: the request itself
+    // is a DELETE, which this probe does not speak, but the path must be registered.
+    Capability {
+        name: "account_deletion",
+        path: "/api/v1/accounts/{id}/undelete",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.

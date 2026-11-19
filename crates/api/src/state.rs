@@ -19,6 +19,13 @@ pub use nodus_server_core::instance::InstanceConfig;
 /// How long an admin stats answer may be reused. The console polls this view.
 const STATS_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// How long a deleted account waits before its profile and credentials are erased.
+///
+/// Thirty days is long enough to notice a mistaken deletion and short enough that the
+/// instance is not holding someone's data indefinitely after they asked to leave. The
+/// operator can change it with `NODUS_ACCOUNT_DELETE_GRACE_DAYS`.
+pub const DEFAULT_ACCOUNT_DELETE_GRACE_DAYS: i64 = 30;
+
 /// How long a signing actor's `publicKeyPem` is trusted after it is resolved.
 ///
 /// Short enough that a peer rotating its key stops being refused within a few minutes,
@@ -45,6 +52,8 @@ struct Inner {
     actor_keys: Mutex<HashMap<String, (Instant, String)>>,
     /// One gate per actor URL, so concurrent cold requests do one fetch, not one each.
     key_fetches: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Days between a deletion request and the erasure of the tombstone's fields.
+    account_delete_grace_days: i64,
 }
 
 /// Cloned into every handler; `Store` is a pool handle and `InstanceConfig` is small.
@@ -149,6 +158,7 @@ impl AppState {
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
+                account_delete_grace_days: DEFAULT_ACCOUNT_DELETE_GRACE_DAYS,
             }),
         }
     }
@@ -168,8 +178,32 @@ impl AppState {
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
+                account_delete_grace_days: self.inner.account_delete_grace_days,
             }),
         }
+    }
+
+    /// The same state with a different deletion grace period, in days.
+    #[must_use]
+    pub fn with_account_delete_grace_days(self, days: i64) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                store: self.inner.store.clone(),
+                instance: self.inner.instance.clone(),
+                federation: self.inner.federation.clone(),
+                authorized_fetch: self.inner.authorized_fetch,
+                stats_cache: Mutex::new(HashMap::new()),
+                actor_keys: Mutex::new(HashMap::new()),
+                key_fetches: Mutex::new(HashMap::new()),
+                account_delete_grace_days: days.max(0),
+            }),
+        }
+    }
+
+    /// Days between a deletion request and the purge of the tombstone's fields.
+    #[must_use]
+    pub fn account_delete_grace_days(&self) -> i64 {
+        self.inner.account_delete_grace_days
     }
 
     #[must_use]

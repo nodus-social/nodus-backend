@@ -176,6 +176,11 @@ async fn catalogue(serving: &Serving, id: &str) -> Option<media::MediaRow> {
 /// Whether the account that posted this media is suspended, in which case the bytes are
 /// not served at all — a suspended account's pictures are part of what it posted.
 async fn suspended(serving: &Serving, account_id: &str) -> bool {
+    match nodus_server_store::accounts::is_deleted(&serving.pool, account_id).await {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(error) => tracing::error!(%error, "the account table could not be read"),
+    }
     match nodus_server_store::remote_moderation::action_for_account(&serving.pool, account_id).await
     {
         Ok(action) => action.as_deref() == Some(nodus_server_store::remote_moderation::SUSPEND),

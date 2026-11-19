@@ -155,6 +155,31 @@ impl FromRequestParts<AppState> for AppealAuth {
     }
 }
 
+/// Authentication for undoing a deletion: alive tokens only, deletion not disqualifying.
+///
+/// `Auth` refuses a deleted account, which is exactly right everywhere else and useless
+/// here: the whole point of the grace window is that a person who proved their identity
+/// again can reclaim the account. Tokens revoked by the deletion stay dead, so the old
+/// bearer cannot reverse what a thief used it to do; only a token minted afterwards works.
+#[derive(Debug, Clone)]
+pub struct RecoveryAuth(pub Auth);
+
+impl FromRequestParts<AppState> for RecoveryAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = bearer(parts)?;
+        let digest = hex_lower(&Sha256::digest(token.as_bytes()));
+        verify_token_any_state(state.store().pool(), &digest)
+            .await?
+            .map(|authenticated| Self(Auth(authenticated)))
+            .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))
+    }
+}
+
 /// The bearer value from the `Authorization` header, or the one `401` these routes share.
 fn bearer(parts: &Parts) -> Result<&str, ApiError> {
     let raw = parts

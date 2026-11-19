@@ -308,7 +308,7 @@ impl AuthStore for PgAuthStore {
         let row = sqlx::query_as::<_, (String, String, String, String, String)>(
             "SELECT c.account_id, a.username::text, a.display_name, c.email::text, c.password_hash \
              FROM account_credential c JOIN account a ON a.id = c.account_id \
-             WHERE c.email = $1 AND a.suspended_at IS NULL",
+             WHERE c.email = $1 AND a.suspended_at IS NULL AND a.deleted_at IS NULL",
         )
         .bind(email)
         .fetch_optional(&self.pool)
@@ -374,7 +374,8 @@ impl AuthStore for PgAuthStore {
         let row = sqlx::query_as::<_, (String, String, String, bool)>(
             "SELECT a.id, a.username::text, a.display_name, a.admin \
              FROM auth_session s JOIN account a ON a.id = s.account_id \
-             WHERE s.token_hash = $1 AND s.expires_at > now() AND a.suspended_at IS NULL AND a.approved",
+             WHERE s.token_hash = $1 AND s.expires_at > now() AND a.suspended_at IS NULL \
+               AND a.deleted_at IS NULL AND a.approved",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
@@ -429,7 +430,8 @@ impl AuthStore for PgAuthStore {
             "UPDATE oauth_code c SET consumed_at = now() \
              FROM account a \
              WHERE c.code_hash = $1 AND c.consumed_at IS NULL AND c.expires_at > now() \
-               AND a.id = c.account_id AND a.suspended_at IS NULL AND a.approved \
+               AND a.id = c.account_id AND a.suspended_at IS NULL AND a.deleted_at IS NULL \
+               AND a.approved \
              RETURNING c.id, c.app_id, c.account_id, a.admin, c.redirect_uri, c.scopes, c.code_challenge",
         )
         .bind(code_hash)

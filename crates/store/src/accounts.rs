@@ -60,6 +60,8 @@ pub struct AccountRow {
     pub silenced_at: Option<DateTime<Utc>>,
     pub moved_to: Option<String>,
     pub also_known_as: Vec<String>,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub purge_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -67,13 +69,14 @@ pub(crate) const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS user
      a.display_name, a.note, a.avatar_ref, a.header_ref, a.avatar_url, a.header_url, a.fields, a.client_metadata, a.locked, a.bot, a.local, a.uri, \
      a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.staff_role, a.approved, \
      a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
-     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.moved_to, a.also_known_as, a.created_at";
+     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.moved_to, a.also_known_as, \
+     a.deleted_at, a.purge_at, a.created_at";
 
 pub(crate) const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
      display_name, note, avatar_ref, header_ref, avatar_url, header_url, fields, client_metadata, locked, bot, local, uri, \
      inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, staff_role, approved, \
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \
-     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, moved_to, also_known_as, created_at";
+     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, moved_to, also_known_as, deleted_at, purge_at, created_at";
 
 /// A token verified against an account.
 #[derive(Debug, Clone, FromRow)]
@@ -109,7 +112,7 @@ pub async fn verify_token(
         "SELECT {ACCOUNT_COLUMNS_ALIASED}, t.scopes FROM oauth_token t \
          JOIN account a ON a.id = t.account_id \
          WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND a.suspended_at IS NULL \
-           AND a.approved"
+           AND a.deleted_at IS NULL AND a.approved"
     );
     resolve_token(pool, &sql, token_hash).await
 }
@@ -175,6 +178,143 @@ pub async fn purge(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
         == 1;
     tx.commit().await?;
     Ok(removed)
+}
+
+/// Marks a local account deleted and cuts its access immediately.
+///
+/// The row survives: it is the tombstone that keeps a stale activity from creating a new
+/// account under the same URI, and the profile fields are erased later by
+/// [`purge_due`]. Tokens and sessions die now, because a deleted account must not act while
+/// it waits for the purge.
+pub async fn request_deletion(
+    pool: &PgPool,
+    id: &str,
+    purge_at: DateTime<Utc>,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let sql = format!(
+        "UPDATE account SET deleted_at = COALESCE(deleted_at, now()), \
+             purge_at = CASE WHEN deleted_at IS NULL THEN $2 ELSE purge_at END, \
+             updated_at = now() \
+          WHERE id = $1 AND local RETURNING {ACCOUNT_COLUMNS}"
+    );
+    let row = sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(purge_at)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if row.is_some() {
+        sqlx::query(
+            "UPDATE oauth_token SET revoked_at = COALESCE(revoked_at, now()) WHERE account_id = $1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM auth_session WHERE account_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM oauth_code WHERE account_id = $1 AND consumed_at IS NULL")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Reverses a deletion inside the grace window.
+///
+/// Only the tombstone is cleared. Tokens stay revoked and sessions stay gone: undoing a
+/// deletion with the token that performed it would make the deletion reversible by theft.
+pub async fn undelete(pool: &PgPool, id: &str) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET deleted_at = NULL, purge_at = NULL, updated_at = now() \
+          WHERE id = $1 AND local AND deleted_at IS NOT NULL RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Erases the profile, media references, credentials and tokens of due tombstones.
+///
+/// Returns the number of accounts erased, so the prune worker can log a non-zero pass and
+/// stay quiet otherwise. Running it twice is safe: the second pass has nothing left to
+/// select.
+pub async fn purge_due(pool: &PgPool, limit: i64) -> Result<u64, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT a.id FROM account a \
+          WHERE a.deleted_at IS NOT NULL AND a.purge_at IS NOT NULL AND a.purge_at <= now() \
+            AND (a.display_name <> '' OR a.note <> '' OR a.avatar_ref IS NOT NULL \
+                 OR a.header_ref IS NOT NULL OR a.avatar_url IS NOT NULL \
+                 OR a.header_url IS NOT NULL OR a.fields <> '[]'::jsonb \
+                 OR a.client_metadata <> '{}'::jsonb OR a.inbox_url IS NOT NULL \
+                 OR a.shared_inbox_url IS NOT NULL OR a.public_key_pem IS NOT NULL \
+                 OR a.private_key_pem IS NOT NULL OR a.moved_to IS NOT NULL \
+                 OR a.also_known_as <> '{}' OR a.discoverable OR a.indexable \
+                 OR EXISTS (SELECT 1 FROM account_credential c WHERE c.account_id = a.id) \
+                 OR EXISTS (SELECT 1 FROM auth_session s WHERE s.account_id = a.id) \
+                 OR EXISTS (SELECT 1 FROM oauth_token t WHERE t.account_id = a.id) \
+                 OR EXISTS (SELECT 1 FROM oauth_code c WHERE c.account_id = a.id) \
+                 OR EXISTS (SELECT 1 FROM media_attachment m WHERE m.account_id = a.id)) \
+          ORDER BY a.purge_at LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut erased = 0_u64;
+    for id in ids {
+        let mut tx = pool.begin().await?;
+        let row = sqlx::query(
+            "UPDATE account SET display_name = '', note = '', avatar_ref = NULL, \
+                 header_ref = NULL, avatar_url = NULL, header_url = NULL, \
+                 fields = '[]'::jsonb, client_metadata = '{}'::jsonb, \
+                 discoverable = false, indexable = false, moved_to = NULL, \
+                 also_known_as = '{}', inbox_url = NULL, shared_inbox_url = NULL, \
+                 public_key_pem = NULL, private_key_pem = NULL, updated_at = now() \
+              WHERE id = $1 AND deleted_at IS NOT NULL",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM account_credential WHERE account_id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM auth_session WHERE account_id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM oauth_code WHERE account_id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM oauth_token WHERE account_id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM media_attachment WHERE account_id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        if row.rows_affected() == 1 {
+            erased += 1;
+        }
+    }
+    Ok(erased)
+}
+
+/// Whether an account has requested deletion. Used by read paths that only have an id.
+pub async fn is_deleted(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM account WHERE id = $1 AND deleted_at IS NOT NULL)",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
 }
 
 /// One account by its canonical `ActivityPub` actor URL.
@@ -312,8 +452,10 @@ pub async fn local_by_username<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     username: &str,
 ) -> Result<Option<AccountRow>, sqlx::Error> {
-    let sql =
-        format!("SELECT {ACCOUNT_COLUMNS} FROM account WHERE domain IS NULL AND username = $1");
+    let sql = format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM account \
+          WHERE domain IS NULL AND username = $1 AND deleted_at IS NULL"
+    );
     sqlx::query_as::<_, AccountRow>(&sql)
         .bind(username)
         .fetch_optional(executor)
@@ -552,7 +694,8 @@ pub async fn lookup(pool: &PgPool, acct: &str) -> Result<Option<AccountRow>, sql
     let domain = parts.next();
     let sql = format!(
         "SELECT {ACCOUNT_COLUMNS} FROM account \
-          WHERE username = $1 AND (($2::text IS NULL AND domain IS NULL) OR domain = $2)"
+          WHERE username = $1 AND (($2::text IS NULL AND domain IS NULL) OR domain = $2) \
+            AND deleted_at IS NULL"
     );
     sqlx::query_as::<_, AccountRow>(&sql)
         .bind(username)
@@ -652,7 +795,7 @@ pub async fn directory(
     };
     let sql = format!(
         "SELECT {ACCOUNT_COLUMNS} FROM account \
-          WHERE suspended_at IS NULL AND discoverable \
+          WHERE suspended_at IS NULL AND deleted_at IS NULL AND discoverable \
             AND ($1 = false OR domain IS NULL) \
           ORDER BY {order} OFFSET $2 LIMIT $3"
     );
@@ -734,7 +877,7 @@ pub async fn local_signer(
     sqlx::query_as::<_, (String, Option<String>, String)>(
         "SELECT username, uri, private_key_pem FROM account \
           WHERE domain IS NULL AND private_key_pem IS NOT NULL \
-            AND suspended_at IS NULL \
+            AND suspended_at IS NULL AND deleted_at IS NULL \
           ORDER BY admin DESC, created_at ASC LIMIT 1",
     )
     .fetch_optional(pool)

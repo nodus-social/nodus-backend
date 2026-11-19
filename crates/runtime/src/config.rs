@@ -11,6 +11,10 @@ use nodus_server_transport::Address;
 pub const DEFAULT_BIND: &str = "0.0.0.0:3000";
 pub const DEFAULT_DATABASE_URL: &str = "postgres://nodus:nodus@localhost/nodus";
 
+/// How long a deleted account stays recoverable before its profile is erased. Thirty days
+/// balances a mistaken deletion against keeping a leaver's data longer than they asked.
+pub const DEFAULT_ACCOUNT_DELETE_GRACE_DAYS: i64 = 30;
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each switch is an independent deployment decision, not a state"
@@ -27,6 +31,9 @@ pub struct Config {
     /// Whether `ActivityPub` reads require an HTTP signature (`NODUS_AUTHORIZED_FETCH`).
     /// Off unless the operator opts in, and read once so peers see one stable mode.
     pub authorized_fetch: bool,
+    /// Days between an account deletion request and the purge of its profile and keys
+    /// (`NODUS_ACCOUNT_DELETE_GRACE_DAYS`, default 30).
+    pub account_delete_grace_days: i64,
     pub migrate_only: bool,
     pub bootstrap: Option<Bootstrap>,
     /// Where this process answers questions about itself, if anywhere.
@@ -68,6 +75,11 @@ pub fn read() -> Result<Config, Box<dyn Error>> {
         env::var("NODUS_REGISTRATIONS_OPEN").map_or(Ok(false), |value| value.parse())?;
     let authorized_fetch =
         env::var("NODUS_AUTHORIZED_FETCH").map_or(Ok(false), |value| value.parse())?;
+    let account_delete_grace_days = env::var("NODUS_ACCOUNT_DELETE_GRACE_DAYS")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(DEFAULT_ACCOUNT_DELETE_GRACE_DAYS);
     let bootstrap = match (
         env::var("NODUS_BOOTSTRAP_EMAIL"),
         env::var("NODUS_BOOTSTRAP_USERNAME"),
@@ -115,6 +127,7 @@ pub fn read() -> Result<Config, Box<dyn Error>> {
         secure_cookies,
         registrations_open,
         authorized_fetch,
+        account_delete_grace_days,
         migrate_only: env::args().any(|argument| argument == "--migrate-only"),
         bootstrap,
         telemetry,

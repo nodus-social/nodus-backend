@@ -1,9 +1,10 @@
 //! Account lookup, follow graph and relationship endpoints.
 
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::HeaderValue;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -11,7 +12,7 @@ use nodus_server_core::{PageParams, PageSize};
 use nodus_server_store::accounts::AccountRow;
 use nodus_server_store::social::{FollowOutcome, Relationship};
 
-use crate::auth::Auth;
+use crate::auth::{Auth, RecoveryAuth};
 use crate::body::JsonOrForm;
 use crate::dto::AccountDto;
 use crate::error::{ApiError, ApiResult};
@@ -171,7 +172,88 @@ pub async fn show(
     let account = nodus_server_store::accounts::by_id(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    if account.deleted_at.is_some() {
+        return Err(ApiError::not_found("Record not found"));
+    }
     Ok(Json(AccountDto::from_row(&account, state.instance())))
+}
+
+/// `DELETE /api/v1/accounts/{id}` — ask to leave.
+///
+/// This is a request, not a wipe. The tombstone appears and every credential stops working
+/// now; the profile itself is erased by the prune worker once `purge_at` has passed, so a
+/// mistaken deletion can still be undone inside the window. A staff token may delete
+/// another local account, and that deletion is written to the audit log.
+pub async fn delete(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let own = id == auth.0.account.id;
+    if own {
+        auth.require_scope("write:accounts")?;
+    } else {
+        auth.require_admin("admin:write")?;
+    }
+    let account = nodus_server_store::accounts::by_id(state.store().pool(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    if !account.local {
+        return Err(ApiError::not_found("Record not found"));
+    }
+    if account.deleted_at.is_some() {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "deleted_at": account.deleted_at,
+                "purge_at": account.purge_at,
+            })),
+        ));
+    }
+    let purge_at = Utc::now() + Duration::days(state.account_delete_grace_days());
+    let row = nodus_server_store::accounts::request_deletion(state.store().pool(), &id, purge_at)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    crate::outbox::deliver_account_delete(&state, &row.id).await;
+    if !own {
+        nodus_server_store::moderation::audit(
+            state.store().pool(),
+            &auth.0.account.id,
+            "delete_account",
+            "account",
+            Some(&id),
+            &json!({ "deleted_at": row.deleted_at, "purge_at": row.purge_at }),
+        )
+        .await?;
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "deleted_at": row.deleted_at,
+            "purge_at": row.purge_at,
+        })),
+    ))
+}
+
+/// `POST /api/v1/accounts/{id}/undelete` — come back inside the grace window.
+///
+/// Only the tombstone is cleared. The deletion revoked the tokens and removed the
+/// sessions, and they stay that way: proving the account again has to mint new ones.
+pub async fn undelete(
+    State(state): State<AppState>,
+    RecoveryAuth(auth): RecoveryAuth,
+    Path(id): Path<String>,
+) -> ApiResult<Json<AccountDto>> {
+    if id != auth.0.account.id {
+        return Err(ApiError::forbidden(
+            "You can only undelete your own account",
+        ));
+    }
+    auth.require_scope("write:accounts")?;
+    let row = nodus_server_store::accounts::undelete(state.store().pool(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("There is no deletion to undo"))?;
+    Ok(Json(AccountDto::from_row(&row, state.instance())))
 }
 
 pub async fn lookup(

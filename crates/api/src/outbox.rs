@@ -222,6 +222,37 @@ pub async fn deliver_actor_update(state: &AppState, account_id: &str) {
     }
 }
 
+/// Tells everyone who has heard from this actor that it is gone.
+///
+/// The recipients are the current follower inboxes *and* every inbox the delivery ledger
+/// has already reached for this account: an unfollowed peer still caches the actor, and a
+/// peer that received a post through a mention was never a follower at all. The activity
+/// goes through the normal queue, so blocks, pauses and retries apply exactly as they do
+/// to a post.
+pub async fn deliver_account_delete(state: &AppState, account_id: &str) {
+    let pool = state.store().pool();
+    let Ok(Some(account)) = nodus_server_store::accounts::by_id(pool, account_id).await else {
+        return;
+    };
+    let actor = crate::activitypub::actor_url(state, &account);
+    let activity = Activity::new(ActivityKind::Delete, &actor, actor.as_str());
+    let value = match serde_json::to_value(&activity) {
+        Ok(value) => identified(value, &actor, "activities"),
+        Err(error) => {
+            tracing::warn!(%error, "could not serialise an actor Delete");
+            return;
+        }
+    };
+    let mut inboxes = follower_inboxes(state, account_id).await;
+    match nodus_server_store::delivery::delivered_inboxes(pool, account_id).await {
+        Ok(reached) => inboxes.extend(reached),
+        Err(error) => tracing::warn!(%error, "could not read the delivery ledger"),
+    }
+    inboxes.sort_unstable();
+    inboxes.dedup();
+    enqueue(state, account_id, value, inboxes).await;
+}
+
 /// Tells the followers that a post changed.
 ///
 /// Poll tallies move after publication, so the same outbox that carried the `Create`

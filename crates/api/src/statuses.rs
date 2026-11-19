@@ -780,6 +780,11 @@ pub(crate) async fn can_view_for_viewer(
     viewer_id: Option<&str>,
     row: &StatusRow,
 ) -> ApiResult<bool> {
+    // A deleted account's posts stop being served at once, before the grace period has
+    // erased anything. The row may still be there as a tombstone; its writing is not.
+    if nodus_server_store::accounts::is_deleted(state.store().pool(), &row.account_id).await? {
+        return Ok(false);
+    }
     // A suspended remote account disappears everywhere, its threads included, whether or
     // not a link pointed at it. Silence only keeps it off the public listings, so a status
     // URL it was linked by still resolves for whoever already has the link.

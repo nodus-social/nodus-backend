@@ -355,6 +355,7 @@ pub async fn public_page(
          WHERE s.deleted_at IS NULL AND s.visibility = 'public' \
            AND s.quarantined_at IS NULL \
            AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+           AND a.deleted_at IS NULL \
            AND NOT EXISTS (SELECT 1 FROM instance_block b WHERE b.domain = a.domain \
                            AND b.severity IN ('suspend', 'silence')) \
            AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
@@ -391,8 +392,10 @@ pub async fn account_page(
     let (max_id, lower_id, order) = page_bounds(params);
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM status s \
+           JOIN account a ON a.id = s.account_id \
          WHERE s.account_id = $1 AND s.deleted_at IS NULL \
            AND s.quarantined_at IS NULL \
+           AND a.deleted_at IS NULL \
            AND s.visibility IN ('public', 'unlisted') \
            AND NOT EXISTS (SELECT 1 FROM domain_pause p JOIN account a ON a.id = s.account_id \
                             WHERE p.domain = a.domain \
@@ -472,6 +475,7 @@ pub async fn home_page(
             AND s.quarantined_at IS NULL \
             AND s.visibility <> 'direct' \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+            AND a.deleted_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
             AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
@@ -492,6 +496,7 @@ pub async fn home_page(
             AND s.deleted_at IS NULL AND s.quarantined_at IS NULL \
             AND s.visibility <> 'direct' \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+            AND a.deleted_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
             AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \

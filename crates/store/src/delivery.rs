@@ -494,6 +494,25 @@ pub async fn followers_inboxes(
     Ok(rows.into_iter().map(|(inbox,)| inbox).collect())
 }
 
+/// Every inbox this account has already delivered an activity to.
+///
+/// A follower list only names the accounts that still follow us. A peer that received a
+/// post and later unfollowed still caches the actor, so a `Delete` must reach the inboxes
+/// the delivery ledger remembers, not only the current followers.
+pub async fn delivered_inboxes(
+    pool: &PgPool,
+    account_id: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT inbox_url FROM federation_delivery \
+          WHERE account_id = $1 AND delivered_at IS NOT NULL",
+    )
+    .bind(account_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(inbox,)| inbox).collect())
+}
+
 /// The inbox one remote account reads: its shared inbox when it publishes one.
 pub async fn inbox_of(pool: &PgPool, account_id: &str) -> Result<Option<String>, sqlx::Error> {
     let inbox: Option<Option<String>> = sqlx::query_scalar(

@@ -77,5 +77,12 @@ async fn sweep(store: Store, wake: Arc<tokio::sync::Notify>) {
             () = wake.notified() => {}
         }
         runtime::prune_media(&store).await;
+        // Account tombstones share this clock: the grace window is checked hourly, and the
+        // erasure is idempotent, so a wake-up between ticks costs one empty query.
+        match nodus_server_store::accounts::purge_due(store.pool(), 100).await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(accounts = count, "erased account tombstones"),
+            Err(error) => tracing::warn!(%error, "could not purge account tombstones"),
+        }
     }
 }
