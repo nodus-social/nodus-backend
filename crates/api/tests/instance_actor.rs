@@ -66,6 +66,20 @@ async fn the_instance_actor_publishes_the_key_the_signer_names() {
         assert_eq!(document["id"], "https://social.test/actor");
         assert_eq!(document["type"], "Application");
         assert_eq!(document["preferredUsername"], "instance.actor");
+        // The handle peers derive from the document has to be the one WebFinger serves;
+        // a 404 here is what every enforcing peer reports against our signed reads.
+        let handle = format!(
+            "acct:{}@social.test",
+            document["preferredUsername"]
+                .as_str()
+                .expect("preferredUsername")
+        );
+        let (status, _content_type, body) = get(
+            &app,
+            &format!("/.well-known/webfinger?resource={handle}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{handle}: {body}");
         assert_eq!(document["url"], "https://social.test/actor");
         assert_eq!(document["inbox"], "https://social.test/inbox");
         assert_eq!(
@@ -112,6 +126,60 @@ async fn the_instance_actor_publishes_the_key_the_signer_names() {
         assert!(request.headers().contains_key("signature"));
         assert!(request.headers().contains_key("date"));
         assert!(!request.headers().contains_key("digest"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_instance_actor_handle_resolves_to_the_actor_document() {
+    run_db_test(|store, _app| async move {
+        let app = root_router(AppState::new(store.clone(), instance_config()));
+
+        for resource in [
+            "acct:instance.actor@social.test",
+            "acct:social.test@social.test",
+            "https://social.test/actor",
+        ] {
+            let uri = format!(
+                "/.well-known/webfinger?resource={}",
+                url::form_urlencoded::byte_serialize(resource.as_bytes()).collect::<String>()
+            );
+            let (status, content_type, body) = get(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{resource}: {body}");
+            assert_eq!(content_type, "application/jrd+json", "{resource}");
+
+            let jrd: Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(jrd["subject"], "acct:instance.actor@social.test", "{resource}");
+            assert_eq!(
+                jrd["aliases"],
+                serde_json::json!(["https://social.test/actor"]),
+                "{resource}"
+            );
+            let links = jrd["links"].as_array().expect("links");
+            let self_link = links
+                .iter()
+                .find(|link| link["rel"] == "self")
+                .expect("self link");
+            assert_eq!(self_link["type"], "application/activity+json", "{resource}");
+            assert_eq!(self_link["href"], "https://social.test/actor", "{resource}");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unknown_handle_still_404s() {
+    run_db_test(|store, _app| async move {
+        let app = root_router(AppState::new(store.clone(), instance_config()));
+
+        for resource in ["acct:nobody@social.test", "acct:instance.actor@elsewhere.test"] {
+            let uri = format!(
+                "/.well-known/webfinger?resource={}",
+                url::form_urlencoded::byte_serialize(resource.as_bytes()).collect::<String>()
+            );
+            let (status, _content_type, body) = get(&app, &uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{resource}: {body}");
+        }
     })
     .await;
 }

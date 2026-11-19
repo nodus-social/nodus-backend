@@ -24,7 +24,7 @@ use nodus_server_core::PageParams;
 use nodus_server_federation::{prepare, verify_prepared};
 use nodus_server_sdk::activitypub::{
     Activity, ActivityKind, ActivityObject, Actor, Attachment, Collection, CollectionPage, Note,
-    Webfinger,
+    Webfinger, WebfingerLink,
 };
 use nodus_server_store::accounts::{self, AccountRow};
 use nodus_server_store::media;
@@ -131,6 +131,14 @@ async fn webfinger(
 ) -> ApiResult<Response> {
     let username = local_username(&query.resource, &state.instance().domain)
         .ok_or_else(|| ApiError::not_found("No such account"))?;
+    // The key we sign outbound fetches with belongs to the instance actor, and peers
+    // derive its handle from the actor document (`instance.actor@host`, the legacy
+    // Mastodon name, or `host@host`, which Mastodon publishes now). None of those is a
+    // row in `accounts`, so without this branch every enforcing peer sees a 404 the
+    // moment it tries to resolve the signer.
+    if is_instance_actor(&username, &state.instance().domain) {
+        return Ok(document_response(&instance_webfinger(&state)));
+    }
     let account = accounts::local_by_username(state.store().pool(), &username)
         .await?
         .ok_or_else(|| ApiError::not_found("No such account"))?;
@@ -162,7 +170,7 @@ async fn instance_actor(State(state): State<AppState>) -> Response {
         "@context": "https://www.w3.org/ns/activitystreams",
         "id": &id,
         "type": "Application",
-        "preferredUsername": "instance.actor",
+        "preferredUsername": INSTANCE_ACTOR_USERNAME,
         "name": state.instance().title,
         "url": &id,
         "inbox": &inbox,
@@ -1717,6 +1725,36 @@ pub(crate) fn status_url(state: &AppState, row: &StatusRow) -> String {
         .unwrap_or_else(|| state.instance().url(&format!("/statuses/{}", row.id)))
 }
 
+/// The handle every pre-4.2 Mastodon, and every peer that reads the actor document,
+/// derives for the instance actor. The actor is served at `https://host/actor`.
+pub(crate) const INSTANCE_ACTOR_USERNAME: &str = "instance.actor";
+
+/// Whether a resolved local username names the instance actor rather than a stored
+/// account. The bare domain is included because Mastodon 4.2+ uses `host@host` for its
+/// own instance actor, and a peer may ask for that shape before reading ours.
+fn is_instance_actor(username: &str, domain: &str) -> bool {
+    username.eq_ignore_ascii_case(INSTANCE_ACTOR_USERNAME) || username.eq_ignore_ascii_case(domain)
+}
+
+/// The JRD for the instance actor, in the shape Mastodon's own instance actor answers
+/// with: an `acct:` subject, the actor URL as the sole alias, a profile-page link and
+/// an `activity+json` self link. Peers follow the self link, and some validate that the
+/// subject's handle and the document's `preferredUsername` agree.
+fn instance_webfinger(state: &AppState) -> Webfinger {
+    let actor = state.instance().url("/actor");
+    Webfinger {
+        subject: format!(
+            "acct:{INSTANCE_ACTOR_USERNAME}@{}",
+            state.instance().domain
+        ),
+        aliases: vec![actor.clone()],
+        links: vec![
+            WebfingerLink::profile(&state.instance().url("/")),
+            WebfingerLink::activitypub(&actor),
+        ],
+    }
+}
+
 fn local_username(resource: &str, domain: &str) -> Option<String> {
     if let Some(handle) = resource.strip_prefix("acct:") {
         let (username, host) = handle.rsplit_once('@')?;
@@ -1729,6 +1767,9 @@ fn local_username(resource: &str, domain: &str) -> Option<String> {
         .strip_prefix("https://")
         .or_else(|| resource.strip_prefix("http://"))?;
     let (_, path) = rest.split_once('/')?;
+    if path.trim_end_matches('/') == "actor" {
+        return Some(INSTANCE_ACTOR_USERNAME.to_owned());
+    }
     path.strip_prefix("users/").map(str::to_owned)
 }
 
@@ -1979,6 +2020,17 @@ mod tests {
             local_username("https://social.test/users/alice", "social.test"),
             Some("alice".to_owned())
         );
+        assert_eq!(
+            local_username("https://social.test/actor", "social.test"),
+            Some(INSTANCE_ACTOR_USERNAME.to_owned())
+        );
+    }
+
+    #[test]
+    fn the_instance_actor_answers_to_the_legacy_and_domain_handles() {
+        assert!(is_instance_actor("instance.actor", "social.test"));
+        assert!(is_instance_actor("SOCIAL.TEST", "social.test"));
+        assert!(!is_instance_actor("alice", "social.test"));
     }
 
     async fn seed_remote(store: &Store, uri: &str) -> AccountRow {
