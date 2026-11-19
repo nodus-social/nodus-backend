@@ -5,6 +5,7 @@
 //! second catalogue row.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::StatusCode;
@@ -88,6 +89,133 @@ async fn remove_local_original(digest: &str) {
             tracing::warn!(%error, path = %path.display(), "could not remove a media original");
         }
     }
+}
+
+/// How long the API waits for a media node to accept an original.
+///
+/// The upload has not answered yet while this runs, so it is the user's wait: long enough
+/// for a healthy node on the same network, short enough that a dead one becomes a local
+/// write and a warning instead of a hung request.
+const CLUSTER_PUT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The media cluster the API hands originals to, read from the environment.
+///
+/// Both halves are required: a URL without a token cannot address the internal routes, and
+/// a token without a URL names no node. With either one missing this instance is
+/// unclustered and the upload path is exactly what it was before the cluster existed.
+#[derive(Debug, Clone)]
+struct ClusterUpload {
+    /// The node every original is written through. Caddy hashes the path onto one member,
+    /// so this can be the same public name the website uses.
+    base: String,
+    token: String,
+}
+
+impl ClusterUpload {
+    fn from_env() -> Option<Self> {
+        let base = std::env::var("NODUS_MEDIA_CLUSTER_URL")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let token = std::env::var("NODUS_MEDIA_CLUSTER_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        Some(Self {
+            base: base.trim_end_matches('/').to_owned(),
+            token,
+        })
+    }
+
+    /// `PUT {base}/internal/media/{digest}`, bounded by [`CLUSTER_PUT_TIMEOUT`].
+    ///
+    /// The body is the original itself. A 2xx means a media node now owns the digest: it
+    /// replicates it, repairs it, and serves it from then on.
+    async fn put(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
+        let url = format!("{}/internal/media/{digest}", self.base);
+        let response = cluster_client()
+            .put(&url)
+            .header(nodus_server_media::cluster::TOKEN_HEADER, &self.token)
+            .timeout(CLUSTER_PUT_TIMEOUT)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(format!("the node answered {status}"))
+        }
+    }
+}
+
+/// One client for every cluster upload: a client owns the connection pool, and building
+/// one per upload would throw that away on every request.
+fn cluster_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Where an upload's original went, and where a renderer can read the bytes back.
+enum Original {
+    /// Written under `NODUS_MEDIA_DIR` and served from this host.
+    Local(PathBuf),
+    /// Accepted by a media node. This copy exists only for variant rendering, which needs a
+    /// file, and is deleted once the variants are made.
+    Scratch(PathBuf),
+}
+
+impl Original {
+    fn path(&self) -> &PathBuf {
+        match self {
+            Self::Local(path) | Self::Scratch(path) => path,
+        }
+    }
+
+    const fn is_scratch(&self) -> bool {
+        matches!(self, Self::Scratch(_))
+    }
+}
+
+/// Writes the original, through the cluster when one is configured.
+///
+/// A node that answers 2xx owns the digest, and the bytes are not written under
+/// `NODUS_MEDIA_DIR` here at all. Every other answer — a 4xx, a 5xx, a connection that
+/// never lands inside [`CLUSTER_PUT_TIMEOUT`] — falls back to the local write with a
+/// warning: the user has already sent the bytes, and a media node that is down must not
+/// turn that into a failed upload.
+///
+/// Variants stay local either way. This process renders them into
+/// `NODUS_MEDIA_VARIANTS_DIR` from the bytes in hand, which is why a cluster upload keeps a
+/// scratch copy while processing runs; a media node never generates variants, and on a read
+/// miss it fetches the original from a peer, so the original is the only byte path the
+/// cluster carries.
+async fn store_original(
+    dir: &std::path::Path,
+    digest: &str,
+    bytes: &[u8],
+    cluster: Option<&ClusterUpload>,
+) -> ApiResult<Original> {
+    if let Some(cluster) = cluster {
+        match cluster.put(digest, bytes).await {
+            Ok(()) => {
+                tracing::debug!(%digest, base = %cluster.base, "the media cluster accepted an original");
+                let scratch = std::env::temp_dir().join(format!("nodus-upload-{}", Id::new()));
+                tokio::fs::write(&scratch, bytes).await?;
+                return Ok(Original::Scratch(scratch));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %digest,
+                    base = %cluster.base,
+                    "the media cluster did not accept an original; writing it locally"
+                );
+            }
+        }
+    }
+    let path = dir.join(digest);
+    tokio::fs::write(&path, bytes).await?;
+    Ok(Original::Local(path))
 }
 
 /// The digest becomes a file name, so only a lowercase SHA-256 hex string may reach it.
@@ -206,8 +334,12 @@ pub async fn upload(
     let dir = storage_dir();
     tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::create_dir_all(variants_dir()).await?;
-    let source = dir.join(&digest);
-    tokio::fs::write(&source, &bytes).await?;
+    let cluster = ClusterUpload::from_env();
+    let original = store_original(&dir, &digest, &bytes, cluster.as_ref()).await?;
+    let source = original.path().clone();
+    // A cluster upload leaves no original here, so the copy the renderer reads is thrown
+    // away as soon as the variants exist.
+    let scratch = original.is_scratch().then(|| source.clone());
 
     let id = Id::new().to_string();
     let mut row = MediaRow {
@@ -279,6 +411,11 @@ pub async fn upload(
             lossless,
         )
         .await;
+        if let Some(path) = scratch {
+            if let Err(error) = tokio::fs::remove_file(&path).await {
+                tracing::warn!(%error, path = %path.display(), "could not remove an upload's scratch copy");
+            }
+        }
     });
 
     Ok(Json(MediaAttachmentDto::from_row(&row, state.instance())))
@@ -444,6 +581,8 @@ pub async fn update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use nodus_server_store::accounts::{self, NewAccount};
 
     #[sqlx::test(migrations = "../store/migrations")]
@@ -568,6 +707,167 @@ mod tests {
             .unwrap()
             .expect("best compressed");
         assert_eq!(best.max_edge, 720);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A media node's internal `PUT`, reduced to what the upload tests assert on.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Put {
+        path: String,
+        token: String,
+        body: Vec<u8>,
+    }
+
+    /// A one-route fake: reads a `PUT`, records it, and answers `status`.
+    async fn fake_node(status: u16) -> (String, Arc<std::sync::Mutex<Vec<Put>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a fake media node");
+        let base = format!("http://{}", listener.local_addr().expect("fake address"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let read = stream.read(&mut chunk).await.unwrap_or(0);
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..read]);
+                        let Some(head_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buffer[..head_end]).to_owned();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buffer.len() < head_end + 4 + length {
+                            continue;
+                        }
+                        let request = head.lines().next().unwrap_or_default();
+                        let path = request.split(' ').nth(1).unwrap_or_default().to_owned();
+                        let token = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("x-nodus-cluster")
+                                    .then(|| value.trim().to_owned())
+                            })
+                            .unwrap_or_default();
+                        recorded.lock().expect("fake node state").push(Put {
+                            path,
+                            token,
+                            body: buffer[head_end + 4..head_end + 4 + length].to_vec(),
+                        });
+                        let response = format!(
+                            "HTTP/1.1 {status} fake\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    fn scratch_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("nodus-api-media-test-{}", Id::new()))
+    }
+
+    /// The cluster owns the bytes: the node got the exact original, and this host has no
+    /// copy under the digest's name, so there is nothing here for a peer to disagree with.
+    #[tokio::test]
+    async fn a_cluster_that_accepts_the_original_leaves_no_local_copy() {
+        let (base, seen) = fake_node(201).await;
+        let dir = scratch_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let bytes = b"an original the cluster takes".to_vec();
+        let digest = hex(&Sha256::digest(&bytes));
+        let cluster = ClusterUpload {
+            base,
+            token: "secret".to_owned(),
+        };
+
+        let original = store_original(&dir, &digest, &bytes, Some(&cluster))
+            .await
+            .expect("the cluster accepted the write");
+
+        assert!(matches!(&original, Original::Scratch(_)));
+        assert_eq!(tokio::fs::read(original.path()).await.unwrap(), bytes);
+        assert!(
+            !dir.join(&digest).exists(),
+            "a cluster upload must not be written locally"
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, format!("/internal/media/{digest}"));
+        assert_eq!(seen[0].token, "secret");
+        assert_eq!(seen[0].body, bytes);
+
+        let _ = tokio::fs::remove_file(original.path()).await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A node that answers 500 must not lose the upload: the local write happens, and the
+    /// file is byte-for-byte the digest a read will look for.
+    #[tokio::test]
+    async fn a_cluster_that_answers_500_still_stores_the_original_locally() {
+        let (base, seen) = fake_node(500).await;
+        let dir = scratch_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let bytes = b"an original the cluster refuses".to_vec();
+        let digest = hex(&Sha256::digest(&bytes));
+        let cluster = ClusterUpload {
+            base,
+            token: "secret".to_owned(),
+        };
+
+        let original = store_original(&dir, &digest, &bytes, Some(&cluster))
+            .await
+            .expect("a refused upload falls back instead of failing");
+
+        assert!(matches!(&original, Original::Local(_)));
+        assert_eq!(original.path(), &dir.join(&digest));
+        let stored = tokio::fs::read(dir.join(&digest)).await.unwrap();
+        assert_eq!(
+            hex(&Sha256::digest(&stored)),
+            digest,
+            "the fallback file must be the digest a read serves"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "the node was still asked");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// No cluster configured is the old path, untouched: no HTTP, just the write.
+    #[tokio::test]
+    async fn without_a_cluster_the_original_is_written_locally() {
+        let dir = scratch_dir();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let bytes = b"an unclustered original".to_vec();
+        let digest = hex(&Sha256::digest(&bytes));
+
+        let original = store_original(&dir, &digest, &bytes, None).await.unwrap();
+
+        assert!(matches!(&original, Original::Local(_)));
+        assert_eq!(tokio::fs::read(dir.join(&digest)).await.unwrap(), bytes);
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
