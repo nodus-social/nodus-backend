@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 axum = { workspace = true }
 nodus-server-store = { path = "../store" }
+reqwest = { workspace = true }
 serde.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
@@ -20,6 +21,7 @@ tracing.workspace = true
 ulid = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["net"] }
 tower = { workspace = true }
 
 [lints]

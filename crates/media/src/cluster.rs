@@ -11,11 +11,19 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::hash::hex;
+
 /// How many nodes hold a digest: the owner and one replica.
 pub const REPLICAS: usize = 2;
 
 /// How old a heartbeat may be before a node stops being a placement target.
 pub const MEMBER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The shared secret every internal request presents.
+pub const TOKEN_HEADER: &str = "x-nodus-cluster";
+
+/// How long one peer gets to answer before it counts as absent.
+pub const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A node that is currently a member of the cluster.
 ///
@@ -25,6 +33,42 @@ pub const MEMBER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6
 pub struct Member {
     pub name: String,
     pub endpoint: String,
+}
+
+/// One shared client for every peer call: a client owns the connection pool, and building
+/// one per miss would throw that away on every request.
+fn client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// `{endpoint}/internal/media/{digest}`, with the endpoint's trailing slash tolerated.
+fn media_url(endpoint: &str, digest: &str) -> String {
+    format!("{}/internal/media/{digest}", endpoint.trim_end_matches('/'))
+}
+
+/// `GET /internal/media/{digest}` from one peer, bounded by [`PEER_DEADLINE`].
+///
+/// A peer that answers with a 404, with bytes that do not hash to the digest, or not at
+/// all is `None`: a miss on a replica is not an error the client should see, it is the
+/// next step of the search.
+#[must_use]
+pub async fn fetch(endpoint: &str, token: &str, digest: &str) -> Option<Vec<u8>> {
+    let request = client()
+        .get(media_url(endpoint, digest))
+        .header(TOKEN_HEADER, token)
+        .send();
+    let attempt = async {
+        let response = request.await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.bytes().await.ok()
+    };
+    match tokio::time::timeout(PEER_DEADLINE, attempt).await {
+        Ok(Some(bytes)) if hex(&Sha256::digest(&bytes)) == digest => Some(bytes.to_vec()),
+        _ => None,
+    }
 }
 
 /// The nodes that own a digest, best first: `[0]` is the owner, the rest are replicas.

@@ -5,11 +5,13 @@
 //! while a large file is read, and the media process can be restarted, resized or moved to
 //! another host without touching the process that answers JSON.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -18,6 +20,7 @@ use axum::Router;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tokio::sync::{Mutex, Notify};
 
 use nodus_server_store::media::{self, VariantRow};
 use nodus_server_store::media_nodes;
@@ -27,7 +30,6 @@ use crate::hash::hex;
 use crate::{CachePolicy, Layer};
 
 /// The bytes a media catalogue id resolves to, and where they are kept.
-#[derive(Clone)]
 pub struct Serving {
     pool: PgPool,
     root: PathBuf,
@@ -36,6 +38,10 @@ pub struct Serving {
     node: String,
     /// Shared secret the peers present on the internal routes. `None` disables them.
     cluster_token: Option<String>,
+    /// One in-flight peer copy per digest. A burst of misses for the same bytes asks the
+    /// peers once; every other request waits for that copy and re-reads the file, rather
+    /// than each fetching and writing the same file.
+    inflight: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl Serving {
@@ -54,6 +60,7 @@ impl Serving {
             variants,
             node,
             cluster_token,
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -61,6 +68,96 @@ impl Serving {
     #[must_use]
     pub const fn cluster_enabled(&self) -> bool {
         self.cluster_token.is_some()
+    }
+
+    /// Reads `digest` from the first peer that has it, writes it here, and returns it.
+    ///
+    /// Read repair: this node owns the digest but has not received the bytes yet, so a
+    /// peer that already has them fills the gap while the client waits. The single-flight
+    /// map means a burst of misses for one digest asks the peers once; the rest wait for
+    /// that copy and re-read the file instead of each starting their own.
+    pub async fn copy_from_peers(&self, digest: &str, peers: &[Member]) -> Option<Vec<u8>> {
+        if !is_digest(digest) || peers.is_empty() {
+            return None;
+        }
+        // A copy may have landed between the caller's read and this call.
+        if let Ok(bytes) = tokio::fs::read(self.root.join(digest)).await {
+            return Some(bytes);
+        }
+        let Some(token) = self.cluster_token.as_deref() else {
+            return None;
+        };
+        let (notify, leader) = {
+            let mut inflight = self.inflight.lock().await;
+            match inflight.get(digest) {
+                Some(existing) => (Arc::clone(existing), false),
+                None => {
+                    let notify = Arc::new(Notify::new());
+                    inflight.insert(digest.to_owned(), Arc::clone(&notify));
+                    (notify, true)
+                }
+            }
+        };
+        if !leader {
+            // The notify can fire between the lookup above and this registration, so the
+            // wait is bounded: wake on the copy, or read whatever is on disk when the
+            // budget runs out and let the caller fall through.
+            let _ = tokio::time::timeout(PEER_BUDGET, notify.notified()).await;
+            return tokio::fs::read(self.root.join(digest)).await.ok();
+        }
+        let copied = self.fetch_from(peers, token, digest).await;
+        if let Some(bytes) = copied.as_deref() {
+            if let Err(error) = write_atomically(&self.root, digest, bytes).await {
+                tracing::warn!(%error, %digest, "could not keep bytes fetched from a peer");
+            }
+        }
+        {
+            let mut inflight = self.inflight.lock().await;
+            inflight.remove(digest);
+        }
+        // After the write and after the entry is gone, so a waiter that wakes either
+        // finds the file or becomes the next leader.
+        notify.notify_waiters();
+        copied
+    }
+
+    /// Asks the peers in order, each within [`cluster::PEER_DEADLINE`], all within
+    /// [`PEER_BUDGET`]. A peer that is down or does not have the digest is skipped.
+    async fn fetch_from(&self, peers: &[Member], token: &str, digest: &str) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + PEER_BUDGET;
+        for peer in peers {
+            if peer.endpoint.is_empty() {
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::debug!(%digest, "the peer budget ran out before the next member");
+                break;
+            }
+            match tokio::time::timeout(
+                remaining,
+                cluster::fetch(&peer.endpoint, token, digest),
+            )
+            .await
+            {
+                Ok(Some(bytes)) => return Some(bytes),
+                Ok(None) => {
+                    tracing::debug!(peer = %peer.name, %digest, "a peer did not have the digest")
+                }
+                Err(_) => {
+                    tracing::debug!(peer = %peer.name, %digest, "the peer budget ran out");
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    /// How many digests are mid-copy. A test uses this to prove the map does not leak an
+    /// entry after a failed copy, which would make every later miss for it wait.
+    #[doc(hidden)]
+    pub async fn inflight_len(&self) -> usize {
+        self.inflight.lock().await.len()
     }
 
     /// `/media/default-avatar.png`, `/media/{id}`, `/media/{id}/{layer}`.
@@ -165,7 +262,7 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 /// `GET /media/{id}` — original bytes, cached by digest.
-pub async fn serve(State(serving): State<Arc<Serving>>, Path(id): Path<String>) -> Response {
+pub async fn serve(State(serving): State<Arc<Serving>>, UrlPath(id): UrlPath<String>) -> Response {
     let Some(row) = catalogue(&serving, &id).await else {
         return not_found();
     };
@@ -173,12 +270,13 @@ pub async fn serve(State(serving): State<Arc<Serving>>, Path(id): Path<String>) 
         return not_found();
     }
     if !row.original_pruned {
-        if let Ok(bytes) = tokio::fs::read(serving.root.join(&row.digest)).await {
-            return with_cache(
-                bytes,
-                &row.content_type,
-                "public, max-age=31536000, immutable",
-            );
+        let bytes = match tokio::fs::read(serving.root.join(&row.digest)).await {
+            Ok(bytes) => Some(bytes),
+            // A replica answers for bytes this node owns but has not written yet.
+            Err(_) => copy_from_placement(&serving, &row.digest).await,
+        };
+        if let Some(bytes) = bytes {
+            return with_cache(bytes, &row.content_type, "public, max-age=31536000, immutable");
         }
     }
     for layer in [Layer::Compressed, Layer::Preview] {
@@ -192,7 +290,7 @@ pub async fn serve(State(serving): State<Arc<Serving>>, Path(id): Path<String>) 
 /// `GET /media/{id}/{layer}` — a generated preview/compressed/lossless variant.
 pub async fn serve_variant(
     State(serving): State<Arc<Serving>>,
-    Path((id, layer)): Path<(String, String)>,
+    UrlPath((id, layer)): UrlPath<(String, String)>,
 ) -> Response {
     let layer = match layer.as_str() {
         "preview" => Layer::Preview,
@@ -210,7 +308,7 @@ pub async fn serve_variant(
     if let Some(variant) = variant(&serving, &id, layer.as_str()).await {
         return variant_response(&serving, variant, layer).await;
     }
-    serve(State(serving), Path(id)).await
+    serve(State(serving), UrlPath(id)).await
 }
 
 async fn catalogue(serving: &Serving, id: &str) -> Option<media::MediaRow> {
@@ -282,6 +380,76 @@ fn not_found() -> Response {
 /// below this at upload; the limit here is defence against a peer that sends more.
 const MAX_INTERNAL_UPLOAD: usize = 64 * 1024 * 1024;
 
+/// How long a miss may spend asking peers in total. A cluster of dead nodes has to fall
+/// through to the variant ladder and answer 404 quickly, not become a slow 404.
+const PEER_BUDGET: Duration = Duration::from_secs(6);
+
+/// The peers that should hold a digest, this node excluded, in placement order.
+///
+/// Returns nothing unless there is at least one other live member and a cluster token:
+/// a single node must take exactly the path it took before placement existed.
+async fn copy_from_placement(serving: &Serving, digest: &str) -> Option<Vec<u8>> {
+    if serving.cluster_token.is_none() {
+        return None;
+    }
+    let nodes = match media_nodes::members(&serving.pool, cluster::MEMBER_MAX_AGE).await {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::error!(%error, %digest, "the media membership could not be read");
+            return None;
+        }
+    };
+    if nodes.len() < 2 {
+        return None;
+    }
+    let members: Vec<Member> = nodes
+        .into_iter()
+        .map(|node| Member {
+            name: node.name,
+            endpoint: node.endpoint,
+        })
+        .collect();
+    let peers: Vec<Member> = placement(digest, &members, cluster::REPLICAS)
+        .into_iter()
+        .filter(|member| member.name != serving.node)
+        .cloned()
+        .collect();
+    if peers.is_empty() {
+        return None;
+    }
+    serving.copy_from_peers(digest, &peers).await
+}
+
+/// Writes bytes beside the target and renames them into place.
+///
+/// The same path the internal PUT uses, so a reader of the directory (this process or a
+/// peer fetching from it) sees either the previous state or the whole file, never a
+/// half-written one under the digest's own name.
+async fn write_atomically(root: &Path, digest: &str, bytes: &[u8]) -> std::io::Result<()> {
+    tokio::fs::create_dir_all(root).await?;
+    let staged = root.join(format!(".{digest}.{}.part", ulid::Ulid::new()));
+    if let Err(error) = tokio::fs::write(&staged, bytes).await {
+        let _ = tokio::fs::remove_file(&staged).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&staged, root.join(digest)).await {
+        let _ = tokio::fs::remove_file(&staged).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Removes one digest from this node, tolerating the file already being gone.
+async fn remove_local(root: &Path, digest: &str) {
+    match tokio::fs::remove_file(root.join(digest)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(%error, %digest, "could not delete an internal media file");
+        }
+    }
+}
+
 /// What one digest resolves to, for an operator or a peer checking its own view.
 ///
 /// `replicas` is the whole placement, best first, so it always starts with `owner`; with
@@ -347,7 +515,7 @@ async fn require_cluster_token(
 /// the previous state or the whole new file, never a partial one.
 async fn internal_put(
     State(serving): State<Arc<Serving>>,
-    Path(digest): Path<String>,
+    UrlPath(digest): UrlPath<String>,
     body: Bytes,
 ) -> Response {
     if !is_digest(&digest) {
@@ -364,30 +532,17 @@ async fn internal_put(
     if tokio::fs::try_exists(&target).await.unwrap_or(false) {
         return StatusCode::OK.into_response();
     }
-    if let Err(error) = tokio::fs::create_dir_all(&serving.root).await {
-        tracing::error!(%error, path = %serving.root.display(), "could not create the media directory");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let staged = serving
-        .root
-        .join(format!(".{digest}.{}.part", ulid::Ulid::new()));
-    if let Err(error) = tokio::fs::write(&staged, &body).await {
-        let _ = tokio::fs::remove_file(&staged).await;
-        tracing::error!(%error, %digest, "could not stage an internal media write");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    match tokio::fs::rename(&staged, &target).await {
+    match write_atomically(&serving.root, &digest, &body).await {
         Ok(()) => StatusCode::CREATED.into_response(),
         Err(error) => {
-            let _ = tokio::fs::remove_file(&staged).await;
-            tracing::error!(%error, %digest, "could not commit an internal media write");
+            tracing::error!(%error, %digest, "could not write an internal media file");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
 
 /// `GET /internal/media/{digest}` — raw bytes, with no catalogue check.
-async fn internal_get(State(serving): State<Arc<Serving>>, Path(digest): Path<String>) -> Response {
+async fn internal_get(State(serving): State<Arc<Serving>>, UrlPath(digest): UrlPath<String>) -> Response {
     if !is_digest(&digest) {
         return not_found();
     }
@@ -407,7 +562,7 @@ async fn internal_get(State(serving): State<Arc<Serving>>, Path(digest): Path<St
 /// `HEAD /internal/media/{digest}` — presence without reading the file.
 async fn internal_head(
     State(serving): State<Arc<Serving>>,
-    Path(digest): Path<String>,
+    UrlPath(digest): UrlPath<String>,
 ) -> Response {
     if !is_digest(&digest) {
         return not_found();
@@ -422,16 +577,10 @@ async fn internal_head(
 /// the absence of the file is the outcome it wants either way.
 async fn internal_delete(
     State(serving): State<Arc<Serving>>,
-    Path(digest): Path<String>,
+    UrlPath(digest): UrlPath<String>,
 ) -> Response {
     if is_digest(&digest) {
-        match tokio::fs::remove_file(serving.root.join(&digest)).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(%error, %digest, "could not delete an internal media file");
-            }
-        }
+        remove_local(&serving.root, &digest).await;
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -439,7 +588,7 @@ async fn internal_delete(
 /// `GET /internal/placement/{digest}` — where this cluster thinks a digest belongs.
 async fn internal_placement(
     State(serving): State<Arc<Serving>>,
-    Path(digest): Path<String>,
+    UrlPath(digest): UrlPath<String>,
 ) -> Response {
     let nodes = match media_nodes::members(&serving.pool, cluster::MEMBER_MAX_AGE).await {
         Ok(nodes) => nodes,
@@ -477,22 +626,116 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        default_avatar, Serving, DEFAULT_AVATAR_SIZE, PLACEHOLDER_BACKGROUND, PLACEHOLDER_FIGURE,
+        default_avatar, Serving, DEFAULT_AVATAR_SIZE, PEER_BUDGET, PLACEHOLDER_BACKGROUND,
+        PLACEHOLDER_FIGURE,
     };
+    use crate::cluster::{self, Member};
 
-    /// A serving state with no database: these tests assert routing and token handling, and
-    /// the one route that reads membership is only asserted where it must refuse a request.
-    fn serving(cluster_token: Option<&str>) -> Arc<Serving> {
+    fn temp_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("nodus-media-{}", ulid::Ulid::new()))
+    }
+
+    fn serving_in(root: std::path::PathBuf, node: &str, cluster_token: Option<&str>) -> Arc<Serving> {
         let store =
             nodus_server_store::Store::connect_lazy("postgres://nodus:nodus@127.0.0.1:1/nodus", 1);
-        let root = std::env::temp_dir().join(format!("nodus-media-{}", ulid::Ulid::new()));
         Arc::new(Serving::new(
             store.pool().clone(),
             root.clone(),
             root.join("variants"),
-            "test-node".to_owned(),
+            node.to_owned(),
             cluster_token.map(str::to_owned),
         ))
+    }
+
+    fn digest_of(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        crate::hash::hex(&sha2::Sha256::digest(bytes))
+    }
+
+    /// A serving state with no database: these tests assert routing and token handling, and
+    /// the one route that reads membership is only asserted where it must refuse a request.
+    fn serving(cluster_token: Option<&str>) -> Arc<Serving> {
+        serving_in(temp_root(), "test-node", cluster_token)
+    }
+
+    /// Just enough HTTP to be a real network neighbour: one request per connection, with
+    /// the behaviour the test needs. No container and no second service.
+    #[derive(Clone)]
+    enum Behaviour {
+        Serve(Vec<u8>),
+        Gone,
+        Silent,
+    }
+
+    struct FakePeer {
+        endpoint: String,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakePeer {
+        async fn spawn(behaviour: Behaviour) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind a fake peer");
+            let address = listener.local_addr().expect("fake peer address");
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&hits);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let behaviour = behaviour.clone();
+                    tokio::spawn(async move {
+                        let mut buffer = [0u8; 2048];
+                        let _ = stream.read(&mut buffer).await;
+                        match behaviour {
+                            Behaviour::Silent => {
+                                // Accept, read, then never answer: only the caller's
+                                // deadline can end this request.
+                                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            }
+                            Behaviour::Serve(bytes) => {
+                                let head = format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                                    bytes.len()
+                                );
+                                let _ = stream.write_all(head.as_bytes()).await;
+                                let _ = stream.write_all(&bytes).await;
+                                let _ = stream.shutdown().await;
+                            }
+                            Behaviour::Gone => {
+                                let _ = stream
+                                    .write_all(
+                                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                                    )
+                                    .await;
+                                let _ = stream.shutdown().await;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                endpoint: format!("http://{address}"),
+                hits,
+            }
+        }
+
+        fn requests(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn member(&self, name: &str) -> Member {
+            Member {
+                name: name.to_owned(),
+                endpoint: self.endpoint.clone(),
+            }
+        }
     }
 
     async fn status_of(token: Option<&str>, request: HttpRequest<Body>) -> StatusCode {
@@ -577,4 +820,5 @@ mod tests {
             .and_then(|value| value.to_str().ok());
         assert_eq!(content_type, Some("image/png"));
     }
+
 }
