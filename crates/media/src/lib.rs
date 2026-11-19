@@ -14,6 +14,7 @@ use thiserror::Error;
 pub mod cluster;
 pub mod hash;
 pub mod process;
+pub mod repair;
 pub mod serve;
 
 #[cfg(test)]

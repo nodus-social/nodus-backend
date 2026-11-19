@@ -436,6 +436,28 @@ pub async fn delete_expired_unattached(pool: &PgPool) -> Result<PrunedUnattached
     })
 }
 
+/// One page of catalogue digests, ordered by id, strictly after the previous page's last
+/// id.
+///
+/// Keyset paging rather than `OFFSET`: the repair walk must not skip a row because a
+/// deletion earlier in the list shifted everything after it. The digest is returned with
+/// the id only because the id is what the next page is asked for.
+pub async fn digest_page(
+    pool: &PgPool,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, digest FROM media_attachment \
+          WHERE $1::text IS NULL OR id > $1 \
+          ORDER BY id LIMIT $2",
+    )
+    .bind(after)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Whether any variant row still uses this content digest.
 pub async fn variant_digest_referenced(pool: &PgPool, digest: &str) -> Result<bool, sqlx::Error> {
     let row: (i64,) = sqlx::query_as("SELECT count(*) FROM media_variant WHERE digest = $1")
