@@ -12,14 +12,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use nodus_server_store::accounts;
 use nodus_server_store::blocks as store_blocks;
 use nodus_server_store::delivery;
 use nodus_server_store::moderation::{
     self, DomainBlockFilter, DomainBlockRow, EmailDomainBlockRow, NewDomainBlock,
 };
+use nodus_server_store::pauses;
 use nodus_server_store::remote_moderation;
 
 use crate::auth::Auth;
+use crate::dto::AccountDto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -849,6 +852,229 @@ async fn lift_remote_account(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Serialize)]
+pub struct DomainPauseDto {
+    pub domain: String,
+    pub reason: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Whether the pause is in force right now. Like remote accounts, an expired row stays
+    /// listed: the console must be able to show that it was once paused and why.
+    pub expired: bool,
+    pub created_at: DateTime<Utc>,
+    pub created_by: Option<String>,
+    pub created_by_handle: Option<String>,
+}
+
+impl DomainPauseDto {
+    fn new(listed: &pauses::ListedDomainPause, now: DateTime<Utc>) -> Self {
+        Self {
+            domain: listed.row.domain.clone(),
+            reason: listed.row.reason.clone(),
+            expires_at: listed.row.expires_at,
+            expired: !listed.row.in_force(now),
+            created_at: listed.row.created_at,
+            created_by: listed.row.created_by.clone(),
+            created_by_handle: listed.created_by_handle.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DomainPauseForm {
+    domain: Option<String>,
+    #[serde(default)]
+    reason: String,
+    expires_at: Option<DateTime<Utc>>,
+}
+
+/// A pause takes a bare hostname, exactly like a block; the difference is that it expires.
+fn pause_domain(raw: &str) -> ApiResult<String> {
+    let domain = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() || !domain.contains('.') || domain.contains('/') || domain.contains(' ') {
+        return Err(ApiError::unprocessable(
+            "a domain looks like example.com, with no scheme and no path",
+        ));
+    }
+    Ok(domain)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DomainPauseQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// `GET /api/v1/admin/federation/domain-pauses` — every pause, expired ones included.
+async fn domain_pauses(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<DomainPauseQuery>,
+) -> ApiResult<Json<Vec<DomainPauseDto>>> {
+    auth.require_admin("admin:read")?;
+    let rows = pauses::list(
+        state.store().pool(),
+        page(query.limit),
+        offset(query.offset),
+    )
+    .await?;
+    let now = Utc::now();
+    Ok(Json(
+        rows.iter()
+            .map(|row| DomainPauseDto::new(row, now))
+            .collect(),
+    ))
+}
+
+async fn write_pause(
+    state: &AppState,
+    auth: &Auth,
+    domain: &str,
+    form: &DomainPauseForm,
+) -> ApiResult<(axum::http::StatusCode, Json<DomainPauseDto>)> {
+    let domain = pause_domain(domain)?;
+    let (row, inserted) = pauses::upsert(
+        state.store().pool(),
+        &pauses::NewDomainPause {
+            domain: &domain,
+            reason: form.reason.trim(),
+            expires_at: form.expires_at,
+            created_by: Some(auth.0.account.id.as_str()),
+        },
+    )
+    .await?;
+    super::audit_write_detail(
+        state,
+        auth,
+        if inserted {
+            "pause_domain"
+        } else {
+            "update_domain_pause"
+        },
+        "domain",
+        &domain,
+        json!({ "reason": form.reason.trim(), "expires_at": form.expires_at }),
+    )
+    .await?;
+    let listed = pauses::ListedDomainPause {
+        row,
+        created_by_handle: accounts::by_id(state.store().pool(), auth.0.account.id.as_str())
+            .await?
+            .map(|account| account.username),
+    };
+    let status = if inserted {
+        axum::http::StatusCode::CREATED
+    } else {
+        axum::http::StatusCode::OK
+    };
+    Ok((status, Json(DomainPauseDto::new(&listed, Utc::now()))))
+}
+
+/// `POST /api/v1/admin/federation/domain-pauses` — pause a domain.
+async fn create_domain_pause(
+    State(state): State<AppState>,
+    auth: Auth,
+    Body(form): Body<DomainPauseForm>,
+) -> ApiResult<(axum::http::StatusCode, Json<DomainPauseDto>)> {
+    auth.require_admin("admin:write")?;
+    let domain = form
+        .domain
+        .as_deref()
+        .ok_or_else(|| ApiError::unprocessable("domain is required"))?;
+    write_pause(&state, &auth, domain, &form).await
+}
+
+/// `PUT /api/v1/admin/federation/domain-pauses/{domain}` — change reason or expiry.
+async fn update_domain_pause(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(domain): Path<String>,
+    Body(form): Body<DomainPauseForm>,
+) -> ApiResult<(axum::http::StatusCode, Json<DomainPauseDto>)> {
+    auth.require_admin("admin:write")?;
+    write_pause(&state, &auth, &domain, &form).await
+}
+
+/// `DELETE /api/v1/admin/federation/domain-pauses/{domain}` — lift it now.
+async fn lift_domain_pause(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(domain): Path<String>,
+) -> ApiResult<axum::http::StatusCode> {
+    auth.require_admin("admin:write")?;
+    let domain = pause_domain(&domain)?;
+    if !pauses::lift(state.store().pool(), &domain).await? {
+        return Err(ApiError::not_found("that domain is not paused"));
+    }
+    super::audit_write_detail(
+        &state,
+        &auth,
+        "lift_domain_pause",
+        "domain",
+        &domain,
+        json!({}),
+    )
+    .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActorRefreshDto {
+    pub changed: Vec<String>,
+    pub actor: AccountDto,
+}
+
+/// `POST /api/v1/admin/federation/actors/{actor_uri}/refresh` — re-read the actor now.
+///
+/// The route matches the wildcard because an actor URI contains slashes; the handler
+/// strips the `/refresh` suffix and 404s anything else under this prefix.
+async fn refresh_actor(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(rest): Path<String>,
+) -> ApiResult<Json<ActorRefreshDto>> {
+    auth.require_admin("admin:write")?;
+    let actor_uri = rest
+        .trim_end_matches('/')
+        .strip_suffix("/refresh")
+        .ok_or_else(|| ApiError::not_found("no such route"))?
+        .trim();
+    crate::activitypub::validate_remote_url(actor_uri)?;
+    let stored = accounts::by_uri(state.store().pool(), actor_uri)
+        .await?
+        .filter(|row| !row.local)
+        .ok_or_else(|| ApiError::not_found("that actor is not known here"))?;
+    let actor = state
+        .fediverse_client()
+        .actor_url(actor_uri)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("could not fetch the actor: {error}"),
+            )
+        })?;
+    if actor.id != actor_uri {
+        return Err(ApiError::unprocessable(
+            "the peer returned a different actor",
+        ));
+    }
+    let (changed, updated) =
+        crate::activitypub::apply_actor_refresh(&state, &stored, &actor).await?;
+    super::audit_write_detail(
+        &state,
+        &auth,
+        "refresh_remote_actor",
+        "actor",
+        actor_uri,
+        json!({ "changed": changed }),
+    )
+    .await?;
+    Ok(Json(ActorRefreshDto {
+        changed,
+        actor: AccountDto::from_row(&updated, state.instance()),
+    }))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/admin/federation/deliveries", get(deliveries))
@@ -873,6 +1099,20 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/v1/admin/federation/remote-accounts/{*actor_uri}",
             axum::routing::put(apply_remote_account).delete(lift_remote_account),
+        )
+        .route(
+            "/api/v1/admin/federation/domain-pauses",
+            get(domain_pauses).post(create_domain_pause),
+        )
+        .route(
+            "/api/v1/admin/federation/domain-pauses/{domain}",
+            axum::routing::put(update_domain_pause).delete(lift_domain_pause),
+        )
+        // Same wildcard reason as remote accounts: the URI is the path. `/refresh` is the
+        // only suffix the handler accepts, so the documented URL is the one that works.
+        .route(
+            "/api/v1/admin/federation/actors/{*actor_uri}",
+            post(refresh_actor),
         )
         .route(
             "/api/v1/admin/domain_blocks",

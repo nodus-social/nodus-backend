@@ -171,6 +171,11 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/admin/federation/deliveries",
         owner: Owner::Api,
     },
+    Capability {
+        name: "domain_pauses",
+        path: "/api/v1/admin/federation/domain-pauses",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -187,7 +192,12 @@ const MODULE_FEATURES: &[(&str, &[&str])] = &[
     ("blocklist", &["block_lists"]),
     (
         "federation",
-        &["remote_blocks", "remote_accounts", "federation_delivery"],
+        &[
+            "remote_blocks",
+            "remote_accounts",
+            "federation_delivery",
+            "domain_pauses",
+        ],
     ),
     ("media", &["media_quarantine"]),
     ("moderation_rules", &["moderation_rules"]),

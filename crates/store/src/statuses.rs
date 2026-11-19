@@ -337,8 +337,11 @@ fn page_bounds(params: PageParams) -> (Option<String>, Option<String>, &'static 
 
 /// `/api/v1/timelines/public`: public visibility only.
 ///
-/// `local_only` is the default the app asks for (`public:local`); the federated view
-/// adds remote statuses once federation exists.
+/// `/api/v1/timelines/public`: public visibility only.
+///
+/// A paused domain is hidden here, not in `by_id`: a moderator opening a report must still
+/// see the post. Unlike `instance_block` (permanent, severity-bearing), a pause expires on
+/// its own and is not announced to the peer, so the predicate reads `expires_at` directly.
 pub async fn public_page(
     pool: &PgPool,
     params: PageParams,
@@ -354,6 +357,8 @@ pub async fn public_page(
            AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
            AND NOT EXISTS (SELECT 1 FROM instance_block b WHERE b.domain = a.domain \
                            AND b.severity IN ('suspend', 'silence')) \
+           AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
+                           AND (p.expires_at IS NULL OR p.expires_at > now())) \
            AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
                            AND m.action IN ('silence', 'suspend') \
                            AND (m.expires_at IS NULL OR m.expires_at > now())) \
@@ -389,6 +394,9 @@ pub async fn account_page(
          WHERE s.account_id = $1 AND s.deleted_at IS NULL \
            AND s.quarantined_at IS NULL \
            AND s.visibility IN ('public', 'unlisted') \
+           AND NOT EXISTS (SELECT 1 FROM domain_pause p JOIN account a ON a.id = s.account_id \
+                            WHERE p.domain = a.domain \
+                              AND (p.expires_at IS NULL OR p.expires_at > now())) \
            AND NOT EXISTS (SELECT 1 FROM account a JOIN remote_moderation m \
                             ON m.actor_uri = a.uri \
                            WHERE a.id = s.account_id \
@@ -466,6 +474,8 @@ pub async fn home_page(
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
+            AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
+                            AND (p.expires_at IS NULL OR p.expires_at > now())) \
             AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
                             AND m.action = 'suspend' \
                             AND (m.expires_at IS NULL OR m.expires_at > now())) \
@@ -484,6 +494,8 @@ pub async fn home_page(
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id AND r.kind = 'block') \
+            AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
+                            AND (p.expires_at IS NULL OR p.expires_at > now())) \
             AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
                             AND m.action = 'suspend' \
                             AND (m.expires_at IS NULL OR m.expires_at > now())) \
@@ -605,12 +617,13 @@ pub async fn quarantine(pool: &PgPool, status_id: &str) -> Result<bool, sqlx::Er
 
 /// Puts a status back into the timelines; the caller decides when nothing is left hidden.
 pub async fn release_quarantine(pool: &PgPool, status_id: &str) -> Result<bool, sqlx::Error> {
-    let updated =
-        sqlx::query("UPDATE status SET quarantined_at = NULL WHERE id = $1 AND quarantined_at IS NOT NULL")
-            .bind(status_id)
-            .execute(pool)
-            .await?
-            .rows_affected();
+    let updated = sqlx::query(
+        "UPDATE status SET quarantined_at = NULL WHERE id = $1 AND quarantined_at IS NOT NULL",
+    )
+    .bind(status_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
     Ok(updated > 0)
 }
 

@@ -88,7 +88,10 @@ async fn enqueue_with(
         return Ok(0);
     }
     let blocked = crate::blocks::blocked_hosts(pool).await?;
-    let mut inboxes = allowed_inboxes(inboxes, &blocked);
+    // A pause is not a block: `instance_block` is permanent and carries a severity, while
+    // a pause expires and is never announced to the peer. Both stop new deliveries here.
+    let paused = crate::pauses::active_domains(pool).await?;
+    let mut inboxes = allowed_inboxes(inboxes, &blocked, &paused);
     if !keep_suspended {
         let suspended = crate::remote_moderation::suspended_inboxes(pool).await?;
         inboxes.retain(|inbox| !suspended.contains(inbox));
@@ -133,8 +136,11 @@ pub const STATES: [&str; 4] = ["pending", "failed", "gave_up", "delivered"];
 /// not the worker's. A `failed` row is still owed and still scheduled.
 pub async fn due(pool: &PgPool, limit: i64) -> Result<Vec<DeliveryRow>, sqlx::Error> {
     let rows: Vec<(String, String, String, Value, i32)> = sqlx::query_as(
-        "SELECT id, account_id, inbox_url, activity, attempts FROM federation_delivery \
+        "SELECT id, account_id, inbox_url, activity, attempts FROM federation_delivery f \
           WHERE state IN ('pending', 'failed') AND next_attempt_at <= now() \
+            AND NOT EXISTS (SELECT 1 FROM domain_pause p \
+                             WHERE p.domain = f.host \
+                               AND (p.expires_at IS NULL OR p.expires_at > now())) \
           ORDER BY next_attempt_at, created_at LIMIT $1",
     )
     .bind(limit)
@@ -424,12 +430,19 @@ pub async fn withdraw(pool: &PgPool, activity_id: &str) -> Result<u64, sqlx::Err
     Ok(removed)
 }
 
-/// The inboxes that do not belong to a host that blocked this instance.
-fn allowed_inboxes(inboxes: &[String], blocked_hosts: &[String]) -> Vec<String> {
+/// The inboxes that do not belong to a host this instance blocked or paused.
+///
+/// The two lists stay separate at the call site because they mean different things: a
+/// blocked host is final and is never told, a paused host is temporary and is never told.
+fn allowed_inboxes(
+    inboxes: &[String],
+    blocked_hosts: &[String],
+    paused_hosts: &[String],
+) -> Vec<String> {
     inboxes
         .iter()
         .filter(|inbox| match crate::blocks::host_of(inbox) {
-            Some(host) => !blocked_hosts.contains(&host),
+            Some(host) => !blocked_hosts.contains(&host) && !paused_hosts.contains(&host),
             None => true,
         })
         .cloned()
@@ -482,7 +495,21 @@ mod tests {
             "https://blocked.test/users/a/inbox".to_owned(),
             "https://blocked.test/inbox".to_owned(),
         ];
-        let allowed = super::allowed_inboxes(&inboxes, &["blocked.test".to_owned()]);
+        let allowed = super::allowed_inboxes(
+            &inboxes,
+            &["blocked.test".to_owned()],
+            &["paused.test".to_owned()],
+        );
+        assert_eq!(allowed, vec!["https://open.test/inbox"]);
+    }
+
+    #[test]
+    fn inboxes_of_a_paused_host_are_dropped_before_queueing() {
+        let inboxes = vec![
+            "https://open.test/inbox".to_owned(),
+            "https://paused.test/users/a/inbox".to_owned(),
+        ];
+        let allowed = super::allowed_inboxes(&inboxes, &[], &["paused.test".to_owned()]);
         assert_eq!(allowed, vec!["https://open.test/inbox"]);
     }
 
@@ -490,7 +517,11 @@ mod tests {
     fn an_inbox_without_a_readable_host_is_left_for_the_worker() {
         let inboxes = vec!["not a url".to_owned()];
         assert_eq!(
-            super::allowed_inboxes(&inboxes, &["blocked.test".to_owned()]),
+            super::allowed_inboxes(
+                &inboxes,
+                &["blocked.test".to_owned()],
+                &["paused.test".to_owned()]
+            ),
             inboxes
         );
     }

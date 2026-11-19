@@ -637,6 +637,76 @@ async fn update_remote_note(
     store_note_poll(state, value, &row).await
 }
 
+/// Applies a freshly fetched actor document to the stored row and says which fields moved.
+///
+/// Split out from the HTTP handler so the comparison is testable without a peer: the
+/// federation client refuses loopback, so an integration test cannot stand one up. The
+/// handler is still the only caller in production.
+pub async fn apply_actor_refresh(
+    state: &AppState,
+    existing: &AccountRow,
+    actor: &Actor,
+) -> ApiResult<(Vec<String>, AccountRow)> {
+    let pool = state.store().pool();
+    let display_name = crate::html::escape_text(&actor.name);
+    let note = crate::html::sanitize_html(&actor.summary);
+    let avatar_url = actor
+        .avatar
+        .as_deref()
+        .filter(|url| validate_remote_url(url).is_ok());
+    let header_url = actor
+        .header
+        .as_deref()
+        .filter(|url| validate_remote_url(url).is_ok());
+    let mut changed = Vec::new();
+    if existing.display_name != display_name {
+        changed.push("display_name".to_owned());
+    }
+    if existing.note != note {
+        changed.push("note".to_owned());
+    }
+    if let Some(url) = avatar_url {
+        if existing.avatar_url.as_deref() != Some(url) {
+            changed.push("avatar_url".to_owned());
+        }
+    }
+    if let Some(url) = header_url {
+        if existing.header_url.as_deref() != Some(url) {
+            changed.push("header_url".to_owned());
+        }
+    }
+    let updated = accounts::update_remote_profile(
+        pool,
+        &actor.id,
+        &accounts::RemoteProfile {
+            display_name: Some(&display_name),
+            note: Some(&note),
+            avatar_url,
+            header_url,
+        },
+    )
+    .await?
+    .unwrap_or_else(|| existing.clone());
+
+    // `movedTo` is not a typed field on `Actor`; it survives in `extra`. A document that
+    // omits it says the actor is no longer moved, so it clears; an unusable value is
+    // ignored rather than allowed to erase a redirect the peer already confirmed.
+    let raw_moved_to = actor.extra.get("movedTo").and_then(Value::as_str);
+    let moved_to = raw_moved_to.filter(|url| validate_remote_url(url).is_ok());
+    let updated = if raw_moved_to.is_some() && moved_to.is_none() {
+        updated
+    } else if updated.moved_to.as_deref() != moved_to {
+        changed.push("moved_to".to_owned());
+        accounts::set_moved_to(pool, &updated.id, moved_to)
+            .await?
+            .unwrap_or(updated)
+    } else {
+        updated
+    };
+    accounts::set_also_known_as(pool, &actor.id, &also_known_as(actor)).await?;
+    Ok((changed, updated))
+}
+
 async fn update_remote_actor_document(
     state: &AppState,
     value: &Value,
@@ -1208,7 +1278,19 @@ async fn store_note_extras(
     // is never quarantined — it was accepted under this instance's rules and its author can
     // answer for it. A failed check must not fail the ingest: the post is already here, and
     // the alternative to a missed match is a delivery the peer will retry forever.
-    if let Err(error) = crate::guard::screen_status(pool, &row.id, &remote.id).await {
+    //
+    // A paused domain is the one exception: the attachments are recorded but never fetched,
+    // because the pause says this peer's media is not to be pulled right now. That is
+    // distinct from `instance_block`'s `reject_media`, which refuses the rows outright.
+    let paused = match remote.domain.as_deref() {
+        Some(domain) => nodus_server_store::pauses::in_force(pool, domain)
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
+    if paused {
+        tracing::debug!(status = %row.id, domain = ?remote.domain, "not fetching media from a paused domain");
+    } else if let Err(error) = crate::guard::screen_status(pool, &row.id, &remote.id).await {
         tracing::warn!(status = %row.id, %error, "inbound media check could not run");
     }
     // Now the instance's rules read the post. Inbound scope: the author is somebody
@@ -1746,10 +1828,7 @@ fn is_instance_actor(username: &str, domain: &str) -> bool {
 fn instance_webfinger(state: &AppState) -> Webfinger {
     let actor = state.instance().url("/actor");
     Webfinger {
-        subject: format!(
-            "acct:{INSTANCE_ACTOR_USERNAME}@{}",
-            state.instance().domain
-        ),
+        subject: format!("acct:{INSTANCE_ACTOR_USERNAME}@{}", state.instance().domain),
         aliases: vec![actor.clone()],
         links: vec![
             WebfingerLink::profile(&state.instance().url("/")),

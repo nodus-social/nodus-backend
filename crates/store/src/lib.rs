@@ -32,6 +32,7 @@ pub mod media;
 pub mod miauth;
 pub mod moderation;
 pub mod moderation_rules;
+pub mod pauses;
 pub mod polls;
 pub mod remote_moderation;
 pub mod rules;
