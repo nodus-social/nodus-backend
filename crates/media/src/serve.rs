@@ -869,4 +869,125 @@ mod tests {
         assert_eq!(content_type, Some("image/png"));
     }
 
+    /// A peer that never answers must not turn a miss into a slow miss.
+    #[tokio::test]
+    async fn a_miss_with_a_silent_peer_is_bounded_by_the_budget() {
+        let peer = FakePeer::spawn(Behaviour::Silent).await;
+        let serving = serving_in(temp_root(), "test-node", Some("token"));
+        let digest = digest_of(b"absent");
+        let began = std::time::Instant::now();
+        assert!(serving
+            .copy_from_peers(&digest, &[peer.member("beta")])
+            .await
+            .is_none());
+        let waited = began.elapsed();
+        assert!(
+            waited >= cluster::PEER_DEADLINE,
+            "the peer was not waited for at all: {waited:?}"
+        );
+        assert!(
+            waited < PEER_BUDGET + std::time::Duration::from_secs(1),
+            "a silent peer exceeded the budget: {waited:?}"
+        );
+        assert_eq!(peer.requests(), 1);
+        assert_eq!(serving.inflight_len().await, 0, "a failed copy leaked an entry");
+    }
+
+    /// A 404 from the replica is a miss, and leaves nothing half-written behind.
+    #[tokio::test]
+    async fn a_peer_without_the_digest_leaves_no_trace() {
+        let peer = FakePeer::spawn(Behaviour::Gone).await;
+        let root = temp_root();
+        let serving = serving_in(root.clone(), "test-node", Some("token"));
+        let digest = digest_of(b"nowhere");
+        assert!(serving
+            .copy_from_peers(&digest, &[peer.member("beta")])
+            .await
+            .is_none());
+        assert!(!tokio::fs::try_exists(root.join(&digest))
+            .await
+            .expect("exists"));
+        assert_eq!(serving.inflight_len().await, 0);
+    }
+
+    /// Read repair keeps the bytes, and the next miss reads them instead of the network.
+    #[tokio::test]
+    async fn a_peer_copy_is_kept_and_asked_only_once() {
+        let body = b"replicated bytes".to_vec();
+        let digest = digest_of(&body);
+        let peer = FakePeer::spawn(Behaviour::Serve(body.clone())).await;
+        let root = temp_root();
+        let serving = serving_in(root.clone(), "test-node", Some("token"));
+        let peers = [peer.member("beta")];
+        assert_eq!(
+            serving.copy_from_peers(&digest, &peers).await.as_deref(),
+            Some(body.as_slice())
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(&digest)).await.expect("kept"),
+            body
+        );
+        assert_eq!(
+            serving.copy_from_peers(&digest, &peers).await.as_deref(),
+            Some(body.as_slice())
+        );
+        assert_eq!(
+            peer.requests(),
+            1,
+            "the second miss must read the local copy"
+        );
+        assert_eq!(serving.inflight_len().await, 0);
+    }
+
+    /// A burst of misses for one digest asks the peer once, not once per request.
+    #[tokio::test]
+    async fn concurrent_misses_copy_once() {
+        let body = b"one copy".to_vec();
+        let digest = digest_of(&body);
+        let peer = FakePeer::spawn(Behaviour::Serve(body.clone())).await;
+        let root = temp_root();
+        let serving = serving_in(root.clone(), "test-node", Some("token"));
+        let peers = [peer.member("beta")];
+        let (left, right) = tokio::join!(
+            serving.copy_from_peers(&digest, &peers),
+            serving.copy_from_peers(&digest, &peers)
+        );
+        assert_eq!(left.as_deref(), Some(body.as_slice()));
+        assert_eq!(right.as_deref(), Some(body.as_slice()));
+        assert_eq!(peer.requests(), 1, "the copy was made more than once");
+        assert_eq!(serving.inflight_len().await, 0);
+    }
+
+    /// A delete reaches a live peer, and an unreachable one does not stop the answer.
+    #[tokio::test]
+    async fn a_delete_reaches_every_member_and_tolerates_a_dead_one() {
+        let live = FakePeer::spawn(Behaviour::Serve(Vec::new())).await;
+        let dead = FakePeer::spawn(Behaviour::Silent).await;
+        let root = temp_root();
+        let digest = digest_of(b"quarantined");
+        let serving = serving_in(root.clone(), "test-node", Some("token"));
+        tokio::fs::create_dir_all(&root).await.expect("media root");
+        tokio::fs::write(root.join(&digest), b"quarantined")
+            .await
+            .expect("seed a copy");
+        let members = vec![
+            Member {
+                name: "test-node".to_owned(),
+                endpoint: "http://127.0.0.1:1".to_owned(),
+            },
+            live.member("beta"),
+            dead.member("gamma"),
+        ];
+        let began = std::time::Instant::now();
+        serving.delete_everywhere(&digest, &members).await;
+        assert!(
+            began.elapsed() < cluster::PEER_DEADLINE * 3,
+            "a dead member held up the delete"
+        );
+        assert!(!tokio::fs::try_exists(root.join(&digest))
+            .await
+            .expect("exists"));
+        assert_eq!(live.requests(), 1, "the live replica kept its copy");
+        assert_eq!(dead.requests(), 1, "the dead member was never asked");
+    }
 }
