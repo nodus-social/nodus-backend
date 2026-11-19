@@ -380,13 +380,15 @@ async fn verify_signature(
         .ok_or_else(|| ApiError::unauthorized("signing key actor URL has no host"))?;
     ensure_domain_allowed(state, domain).await?;
 
-    if let Some(pem) = accounts::by_uri(state.store().pool(), key_actor)
-        .await?
-        .and_then(|account| account.public_key_pem)
+    // Our own actors answer from local data: a POST signed by this instance (an operator
+    // tool, a second service on the same key) must not be refused by the unsigned HTTP
+    // fetch that secure mode itself closes. A peer falls through to the signed client.
+    if let Some(pem) =
+        crate::authorized_fetch::local_actor_key(state, key_actor, &prepared.params.key_id).await?
     {
-        if verify_prepared(&prepared, &pem).is_ok() {
-            return Ok(activity);
-        }
+        return verify_prepared(&prepared, &pem)
+            .map(|()| activity)
+            .map_err(|error| ApiError::unauthorized(error.to_string()));
     }
     let actor = state
         .fediverse_client()

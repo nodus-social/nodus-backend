@@ -257,11 +257,85 @@ async fn ensure_signer_allowed(state: &AppState, actor: &str) -> Result<(), ApiE
         .map_err(|_| ApiError::unauthorized("the signing domain is blocked"))
 }
 
-/// The signer's public key: memory cache, then the store, then its actor document.
+/// Resolves a signing key that belongs to this instance without issuing a request.
+///
+/// Fetching our own actor over HTTP is a loop that secure mode itself closes: the fetch
+/// is unsigned, so this instance answers it with the same 401 it gives any unsigned
+/// reader — and the signature most likely to be made by an operator or a debugging tool
+/// is the one that then fails. So a `keyId` on our own domain is answered from memory
+/// (`FederationKey` for `/actor`, the account row for `/users/<name>`).
+///
+/// `Ok(None)` means the actor is a peer and the caller may resolve it over the network;
+/// `Ok(Some(pem))` means it is ours and no request was made. `Err` means it claims to be
+/// ours but is not a key we publish, which is never a reason to go to the network.
+pub(crate) async fn local_actor_key(
+    state: &AppState,
+    actor: &str,
+    key_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let Ok(url) = url::Url::parse(actor) else {
+        return Ok(None);
+    };
+    let ours = url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case(&state.instance().domain));
+    if !ours {
+        return Ok(None);
+    }
+    if url.path() == "/actor" {
+        let Some(key) = state.federation() else {
+            return Err(ApiError::unauthorized(
+                "this instance has no signing key configured",
+            ));
+        };
+        if key_id != key.key_id() {
+            return Err(ApiError::unauthorized(
+                "the signature keyId is not this actor's public key",
+            ));
+        }
+        let pem = key.public_pem().to_owned();
+        state.cache_actor_key(actor, pem.clone());
+        return Ok(Some(pem));
+    }
+    let username = url
+        .path()
+        .strip_prefix("/users/")
+        .filter(|name| !name.is_empty() && !name.contains('/'));
+    let Some(username) = username else {
+        return Err(ApiError::unauthorized(
+            "the signing keyId does not name one of this instance's actors",
+        ));
+    };
+    let Some(account) = accounts::local_by_username(state.store().pool(), username).await? else {
+        return Err(ApiError::unauthorized(
+            "the signing keyId names no local account",
+        ));
+    };
+    let Some(pem) = account.public_key_pem else {
+        return Err(ApiError::unauthorized(
+            "the local account has published no public key",
+        ));
+    };
+    if key_id != format!("{actor}#main-key") {
+        return Err(ApiError::unauthorized(
+            "the signature keyId is not this actor's public key",
+        ));
+    }
+    state.cache_actor_key(actor, pem.clone());
+    Ok(Some(pem))
+}
+
+/// The signer's public key: our own data when the actor is local, then memory cache,
+/// then the store, then its actor document.
 ///
 /// A cold cache costs one fetch, guarded per actor so concurrent requests wait for it
-/// rather than each starting one. A fetch that fails is an error and is never cached.
+/// rather than each starting one. The fetch goes through the signing client
+/// (`fediverse_client`), so a peer that also enforces secure mode accepts it. A fetch
+/// that fails is an error and is never cached.
 async fn key_for(state: &AppState, actor: &str, key_id: &str) -> Result<String, ApiError> {
+    if let Some(pem) = local_actor_key(state, actor, key_id).await? {
+        return Ok(pem);
+    }
     if let Some(pem) = state.cached_actor_key(actor) {
         return Ok(pem);
     }
