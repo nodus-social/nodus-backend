@@ -84,18 +84,15 @@ impl Serving {
         if let Ok(bytes) = tokio::fs::read(self.root.join(digest)).await {
             return Some(bytes);
         }
-        let Some(token) = self.cluster_token.as_deref() else {
-            return None;
-        };
+        let token = self.cluster_token.as_deref()?;
         let (notify, leader) = {
             let mut inflight = self.inflight.lock().await;
-            match inflight.get(digest) {
-                Some(existing) => (Arc::clone(existing), false),
-                None => {
-                    let notify = Arc::new(Notify::new());
-                    inflight.insert(digest.to_owned(), Arc::clone(&notify));
-                    (notify, true)
-                }
+            if let Some(existing) = inflight.get(digest) {
+                (Arc::clone(existing), false)
+            } else {
+                let notify = Arc::new(Notify::new());
+                inflight.insert(digest.to_owned(), Arc::clone(&notify));
+                (notify, true)
             }
         };
         if !leader {
@@ -134,15 +131,12 @@ impl Serving {
                 tracing::debug!(%digest, "the peer budget ran out before the next member");
                 break;
             }
-            match tokio::time::timeout(
-                remaining,
-                cluster::fetch(&peer.endpoint, token, digest),
-            )
-            .await
+            match tokio::time::timeout(remaining, cluster::fetch(&peer.endpoint, token, digest))
+                .await
             {
                 Ok(Some(bytes)) => return Some(bytes),
                 Ok(None) => {
-                    tracing::debug!(peer = %peer.name, %digest, "a peer did not have the digest")
+                    tracing::debug!(peer = %peer.name, %digest, "a peer did not have the digest");
                 }
                 Err(_) => {
                     tracing::debug!(peer = %peer.name, %digest, "the peer budget ran out");
@@ -296,7 +290,11 @@ pub async fn serve(State(serving): State<Arc<Serving>>, UrlPath(id): UrlPath<Str
             Err(_) => copy_from_placement(&serving, &row.digest).await,
         };
         if let Some(bytes) = bytes {
-            return with_cache(bytes, &row.content_type, "public, max-age=31536000, immutable");
+            return with_cache(
+                bytes,
+                &row.content_type,
+                "public, max-age=31536000, immutable",
+            );
         }
     }
     for layer in [Layer::Compressed, Layer::Preview] {
@@ -409,9 +407,7 @@ const PEER_BUDGET: Duration = Duration::from_secs(6);
 /// Returns nothing unless there is at least one other live member and a cluster token:
 /// a single node must take exactly the path it took before placement existed.
 async fn copy_from_placement(serving: &Serving, digest: &str) -> Option<Vec<u8>> {
-    if serving.cluster_token.is_none() {
-        return None;
-    }
+    serving.cluster_token.as_ref()?;
     let nodes = match media_nodes::members(&serving.pool, cluster::MEMBER_MAX_AGE).await {
         Ok(nodes) => nodes,
         Err(error) => {
@@ -562,7 +558,10 @@ async fn internal_put(
 }
 
 /// `GET /internal/media/{digest}` — raw bytes, with no catalogue check.
-async fn internal_get(State(serving): State<Arc<Serving>>, UrlPath(digest): UrlPath<String>) -> Response {
+async fn internal_get(
+    State(serving): State<Arc<Serving>>,
+    UrlPath(digest): UrlPath<String>,
+) -> Response {
     if !is_digest(&digest) {
         return not_found();
     }
@@ -683,12 +682,16 @@ mod tests {
         std::env::temp_dir().join(format!("nodus-media-{}", ulid::Ulid::new()))
     }
 
-    fn serving_in(root: std::path::PathBuf, node: &str, cluster_token: Option<&str>) -> Arc<Serving> {
+    fn serving_in(
+        root: &std::path::Path,
+        node: &str,
+        cluster_token: Option<&str>,
+    ) -> Arc<Serving> {
         let store =
             nodus_server_store::Store::connect_lazy("postgres://nodus:nodus@127.0.0.1:1/nodus", 1);
         Arc::new(Serving::new(
             store.pool().clone(),
-            root.clone(),
+            root.to_path_buf(),
             root.join("variants"),
             node.to_owned(),
             cluster_token.map(str::to_owned),
@@ -703,7 +706,7 @@ mod tests {
     /// A serving state with no database: these tests assert routing and token handling, and
     /// the one route that reads membership is only asserted where it must refuse a request.
     fn serving(cluster_token: Option<&str>) -> Arc<Serving> {
-        serving_in(temp_root(), "test-node", cluster_token)
+        serving_in(&temp_root(), "test-node", cluster_token)
     }
 
     /// Just enough HTTP to be a real network neighbour: one request per connection, with
@@ -873,7 +876,7 @@ mod tests {
     #[tokio::test]
     async fn a_miss_with_a_silent_peer_is_bounded_by_the_budget() {
         let peer = FakePeer::spawn(Behaviour::Silent).await;
-        let serving = serving_in(temp_root(), "test-node", Some("token"));
+        let serving = serving_in(&temp_root(), "test-node", Some("token"));
         let digest = digest_of(b"absent");
         let began = std::time::Instant::now();
         assert!(serving
@@ -890,7 +893,11 @@ mod tests {
             "a silent peer exceeded the budget: {waited:?}"
         );
         assert_eq!(peer.requests(), 1);
-        assert_eq!(serving.inflight_len().await, 0, "a failed copy leaked an entry");
+        assert_eq!(
+            serving.inflight_len().await,
+            0,
+            "a failed copy leaked an entry"
+        );
     }
 
     /// A 404 from the replica is a miss, and leaves nothing half-written behind.
@@ -898,7 +905,7 @@ mod tests {
     async fn a_peer_without_the_digest_leaves_no_trace() {
         let peer = FakePeer::spawn(Behaviour::Gone).await;
         let root = temp_root();
-        let serving = serving_in(root.clone(), "test-node", Some("token"));
+        let serving = serving_in(&root, "test-node", Some("token"));
         let digest = digest_of(b"nowhere");
         assert!(serving
             .copy_from_peers(&digest, &[peer.member("beta")])
@@ -917,7 +924,7 @@ mod tests {
         let digest = digest_of(&body);
         let peer = FakePeer::spawn(Behaviour::Serve(body.clone())).await;
         let root = temp_root();
-        let serving = serving_in(root.clone(), "test-node", Some("token"));
+        let serving = serving_in(&root, "test-node", Some("token"));
         let peers = [peer.member("beta")];
         assert_eq!(
             serving.copy_from_peers(&digest, &peers).await.as_deref(),
@@ -946,7 +953,7 @@ mod tests {
         let digest = digest_of(&body);
         let peer = FakePeer::spawn(Behaviour::Serve(body.clone())).await;
         let root = temp_root();
-        let serving = serving_in(root.clone(), "test-node", Some("token"));
+        let serving = serving_in(&root, "test-node", Some("token"));
         let peers = [peer.member("beta")];
         let (left, right) = tokio::join!(
             serving.copy_from_peers(&digest, &peers),
@@ -965,7 +972,7 @@ mod tests {
         let dead = FakePeer::spawn(Behaviour::Silent).await;
         let root = temp_root();
         let digest = digest_of(b"quarantined");
-        let serving = serving_in(root.clone(), "test-node", Some("token"));
+        let serving = serving_in(&root, "test-node", Some("token"));
         tokio::fs::create_dir_all(&root).await.expect("media root");
         tokio::fs::write(root.join(&digest), b"quarantined")
             .await
