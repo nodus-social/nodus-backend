@@ -123,6 +123,12 @@ async fn decide(
         media::release_quarantine(pool, &id).await?;
     } else {
         media::delete(pool, &id).await?;
+        // The row is gone; if it held the last reference to these bytes, remove them from
+        // the cluster too. A release is not a delete: it clears the match and leaves the
+        // bytes in place, so only this branch touches storage.
+        if !row.remote && !media::original_digest_referenced(pool, &row.digest).await? {
+            crate::media::delete_original(&row.digest).await;
+        }
     }
 
     let mut reports_resolved = 0;

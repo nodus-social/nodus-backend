@@ -153,6 +153,26 @@ impl Serving {
         None
     }
 
+    /// Deletes `digest` here and on every other member.
+    ///
+    /// Every member is asked, not only the placement: a replica that stopped being the
+    /// owner keeps its copy, and only a fan-out reaches it. Best effort, because the
+    /// caller's answer is the same whether or not a peer was reachable.
+    pub async fn delete_everywhere(&self, digest: &str, members: &[Member]) {
+        remove_local(&self.root, digest).await;
+        let Some(token) = self.cluster_token.as_deref() else {
+            return;
+        };
+        for peer in members.iter().filter(|peer| peer.name != self.node) {
+            if peer.endpoint.is_empty() {
+                continue;
+            }
+            if !cluster::delete_peer(&peer.endpoint, token, digest).await {
+                tracing::warn!(peer = %peer.name, %digest, "a peer did not confirm a media delete");
+            }
+        }
+    }
+
     /// How many digests are mid-copy. A test uses this to prove the map does not leak an
     /// entry after a failed copy, which would make every later miss for it wait.
     #[doc(hidden)]
@@ -573,14 +593,42 @@ async fn internal_head(
     }
 }
 
-/// `DELETE /internal/media/{digest}` — idempotent, because a peer may retry a delete and
-/// the absence of the file is the outcome it wants either way.
+/// `DELETE /internal/media/{digest}` — fan out to every member, and stay idempotent
+/// because a peer may retry a delete and the absence of the file is the outcome it wants
+/// either way.
+///
+/// Every member is asked rather than only the placement: an old replica can predate a
+/// membership change and keep bytes nobody would ever route to again. A peer that already
+/// received this delete passes it on with the fan-out marker, so the request does not
+/// bounce between nodes.
 async fn internal_delete(
     State(serving): State<Arc<Serving>>,
     UrlPath(digest): UrlPath<String>,
+    headers: HeaderMap,
 ) -> Response {
     if is_digest(&digest) {
-        remove_local(&serving.root, &digest).await;
+        let members = if headers.contains_key(cluster::NO_FANOUT_HEADER) {
+            Vec::new()
+        } else {
+            match media_nodes::members(&serving.pool, cluster::MEMBER_MAX_AGE).await {
+                Ok(nodes) => nodes
+                    .into_iter()
+                    .map(|node| Member {
+                        name: node.name,
+                        endpoint: node.endpoint,
+                    })
+                    .collect(),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        %digest,
+                        "could not read the membership to fan out a delete"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+        serving.delete_everywhere(&digest, &members).await;
     }
     StatusCode::NO_CONTENT.into_response()
 }

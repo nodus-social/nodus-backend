@@ -52,6 +52,52 @@ fn variants_dir() -> PathBuf {
         .map_or_else(|| storage_dir().join("variants"), PathBuf::from)
 }
 
+/// Removes a digest's bytes for good, across the cluster when there is one.
+///
+/// The media service answers the delete and fans it out to every member, which is the only
+/// way an old replica that stopped being the owner loses its copy. With no cluster token
+/// there is no peer to ask, so the local copy is unlinked exactly as before; the same
+/// unlink is the fallback when the media service does not confirm.
+pub async fn delete_original(digest: &str) {
+    let token = std::env::var("NODUS_MEDIA_CLUSTER_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    if let Some(token) = token {
+        let base = std::env::var("NODUS_MEDIA_INTERNAL_URL")
+            .ok()
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:3003".to_owned());
+        if nodus_server_media::cluster::request_delete(&base, &token, digest).await {
+            return;
+        }
+        tracing::warn!(%digest, %base, "the media service did not confirm a cluster delete");
+    }
+    remove_local_original(digest).await;
+}
+
+/// The single-node fallback: unlink this process's copy, tolerating absence.
+async fn remove_local_original(digest: &str) {
+    if !is_digest(digest) {
+        return;
+    }
+    let path = storage_dir().join(digest);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "could not remove a media original");
+        }
+    }
+}
+
+/// The digest becomes a file name, so only a lowercase SHA-256 hex string may reach it.
+fn is_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);

@@ -22,8 +22,18 @@ pub const MEMBER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6
 /// The shared secret every internal request presents.
 pub const TOKEN_HEADER: &str = "x-nodus-cluster";
 
+/// Marks a delete that has already been fanned out, so the peer removes its own copy and
+/// does not fan it out again — otherwise two nodes would bounce the same delete forever.
+pub const NO_FANOUT_HEADER: &str = "x-nodus-no-fanout";
+
 /// How long one peer gets to answer before it counts as absent.
 pub const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long the caller of a cluster-wide delete waits for the node it asked.
+///
+/// Longer than one peer deadline because that node then fans out to the rest, and its
+/// answer only arrives once its own peers were tried.
+const DELETE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// A node that is currently a member of the cluster.
 ///
@@ -69,6 +79,39 @@ pub async fn fetch(endpoint: &str, token: &str, digest: &str) -> Option<Vec<u8>>
         Ok(Some(bytes)) if hex(&Sha256::digest(&bytes)) == digest => Some(bytes.to_vec()),
         _ => None,
     }
+}
+
+/// `DELETE /internal/media/{digest}` on one peer, best effort.
+///
+/// The fan-out marker says "delete your copy, but do not pass this on": the node that
+/// received the original request already asked every member it knows about.
+#[must_use]
+pub async fn delete_peer(endpoint: &str, token: &str, digest: &str) -> bool {
+    let request = client()
+        .delete(media_url(endpoint, digest))
+        .header(TOKEN_HEADER, token)
+        .header(NO_FANOUT_HEADER, "1")
+        .send();
+    matches!(
+        tokio::time::timeout(PEER_DEADLINE, request).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
+}
+
+/// Asks a media node to delete a digest everywhere, which it fans out to its members.
+///
+/// Returns whether the node confirmed. A `false` is not an error for the caller: the
+/// bytes are unreferenced either way, and the local copy is still there to remove.
+#[must_use]
+pub async fn request_delete(base: &str, token: &str, digest: &str) -> bool {
+    let request = client()
+        .delete(media_url(base, digest))
+        .header(TOKEN_HEADER, token)
+        .send();
+    matches!(
+        tokio::time::timeout(DELETE_BUDGET, request).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
 }
 
 /// The nodes that own a digest, best first: `[0]` is the owner, the rest are replicas.
