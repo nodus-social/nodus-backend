@@ -167,6 +167,120 @@ impl Serving {
         }
     }
 
+    /// Spawns the replication of a digest that was just written here.
+    ///
+    /// Detached on purpose: the upload has already answered, and a peer that is down
+    /// must not turn a stored upload into a failed one. Without a cluster token there is
+    /// nobody to replicate to, so nothing is spawned at all.
+    pub fn spawn_replication(self: &Arc<Self>, digest: &str) {
+        if self.cluster_token.is_none() {
+            return;
+        }
+        let serving = Arc::clone(self);
+        let digest = digest.to_owned();
+        tokio::spawn(async move {
+            if let Some(peers) = serving.replication_peers(&digest).await {
+                let Some(token) = serving.cluster_token.as_deref() else {
+                    return;
+                };
+                serving.replicate_to(&digest, &peers, token).await;
+            }
+        });
+    }
+
+    /// Spawns replication to an explicit peer list, which is what the test above needs:
+    /// the production path reads the membership from the database.
+    #[doc(hidden)]
+    pub fn spawn_replication_to(self: &Arc<Self>, digest: &str, peers: Vec<Member>) {
+        let serving = Arc::clone(self);
+        let digest = digest.to_owned();
+        tokio::spawn(async move {
+            let Some(token) = serving.cluster_token.as_deref() else {
+                return;
+            };
+            serving.replicate_to(&digest, &peers, token).await;
+        });
+    }
+
+    /// The placement members that should hold `digest`, this node excluded.
+    ///
+    /// `None` means "nothing to do": one member, no token, a membership read that
+    /// failed, or a placement that names only this node. Single-node behaviour depends
+    /// on that being cheap and silent.
+    async fn replication_peers(self: &Arc<Self>, digest: &str) -> Option<Vec<Member>> {
+        self.cluster_token.as_ref()?;
+        let nodes = match media_nodes::members(&self.pool, cluster::MEMBER_MAX_AGE).await {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                tracing::warn!(%error, %digest, "could not read the membership to replicate");
+                return None;
+            }
+        };
+        if nodes.len() < 2 {
+            return None;
+        }
+        let members: Vec<Member> = nodes
+            .into_iter()
+            .map(|node| Member {
+                name: node.name,
+                endpoint: node.endpoint,
+            })
+            .collect();
+        let peers: Vec<Member> = placement(digest, &members, cluster::REPLICAS)
+            .into_iter()
+            .filter(|member| member.name != self.node && !member.endpoint.is_empty())
+            .cloned()
+            .collect();
+        if peers.is_empty() {
+            None
+        } else {
+            Some(peers)
+        }
+    }
+
+    /// Sends one digest to each peer, retrying a failed send on a fixed schedule.
+    ///
+    /// The bytes are re-read from disk before every attempt: the task must never write a
+    /// file this node no longer has, and the rename-into-place write means the read sees
+    /// either the previous file or the whole new one. The whole loop is bounded by
+    /// [`cluster::REPLICATION_BUDGET`], so a cluster of silent peers cannot leave a task
+    /// per upload behind.
+    async fn replicate_to(&self, digest: &str, peers: &[Member], token: &str) {
+        let deadline = tokio::time::Instant::now() + cluster::REPLICATION_BUDGET;
+        for peer in peers {
+            let mut sent = false;
+            let mut attempts = 0usize;
+            for backoff in cluster::REPLICATION_BACKOFF {
+                let Ok(bytes) = tokio::fs::read(self.root.join(digest)).await else {
+                    tracing::debug!(%digest, "the local copy vanished before it was replicated");
+                    return;
+                };
+                if hex(&Sha256::digest(&bytes)) != digest {
+                    tracing::warn!(%digest, "the local copy does not hash to its digest");
+                    return;
+                }
+                attempts += 1;
+                if cluster::put(&peer.endpoint, token, digest, &bytes).await {
+                    sent = true;
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(backoff.min(remaining)).await;
+            }
+            if !sent {
+                tracing::warn!(
+                    peer = %peer.name,
+                    %digest,
+                    attempts,
+                    "could not replicate media to a peer"
+                );
+            }
+        }
+    }
+
     /// How many digests are mid-copy. A test uses this to prove the map does not leak an
     /// entry after a failed copy, which would make every later miss for it wait.
     #[doc(hidden)]
@@ -441,7 +555,11 @@ async fn copy_from_placement(serving: &Serving, digest: &str) -> Option<Vec<u8>>
 /// The same path the internal PUT uses, so a reader of the directory (this process or a
 /// peer fetching from it) sees either the previous state or the whole file, never a
 /// half-written one under the digest's own name.
-async fn write_atomically(root: &Path, digest: &str, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_atomically(
+    root: &Path,
+    digest: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     tokio::fs::create_dir_all(root).await?;
     let staged = root.join(format!(".{digest}.{}.part", ulid::Ulid::new()));
     if let Err(error) = tokio::fs::write(&staged, bytes).await {
@@ -549,7 +667,13 @@ async fn internal_put(
         return StatusCode::OK.into_response();
     }
     match write_atomically(&serving.root, &digest, &body).await {
-        Ok(()) => StatusCode::CREATED.into_response(),
+        Ok(()) => {
+            // The answer is already earned: the bytes are on this node's disk. The
+            // replicas are brought up to date behind it, so a dead peer cannot turn a
+            // stored upload into a failed one.
+            serving.spawn_replication(&digest);
+            StatusCode::CREATED.into_response()
+        }
         Err(error) => {
             tracing::error!(%error, %digest, "could not write an internal media file");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -992,5 +1116,142 @@ mod tests {
             .expect("exists"));
         assert_eq!(live.requests(), 1, "the live replica kept its copy");
         assert_eq!(dead.requests(), 1, "the dead member was never asked");
+    }
+
+    /// A sink a test can read back, so a warning is asserted on its text and its count
+    /// rather than on the fact that nothing panicked.
+    #[derive(Clone)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log sink").extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The bytes of one digest, written here so the task has something to re-read.
+    async fn seed_local(root: &std::path::Path, digest: &str, bytes: &[u8]) {
+        tokio::fs::create_dir_all(root).await.expect("media root");
+        tokio::fs::write(root.join(digest), bytes)
+            .await
+            .expect("seed a local copy");
+    }
+
+    /// The upload's answer does not include the replication: the second member is asked,
+    /// once, with the digest and the token — after the caller already had its 201.
+    #[tokio::test]
+    async fn a_stored_upload_is_replicated_to_the_second_member_once() {
+        let body = b"replicate me".to_vec();
+        let digest = digest_of(&body);
+        let root = temp_root();
+        seed_local(&root, &digest, &body).await;
+        let serving = serving_in(&root, "test-node", Some("token"));
+        let peer = crate::testpeer::Peer::spawn("beta").await;
+        serving
+            .replicate_to(&digest, &[peer.member()], "token")
+            .await;
+        let seen = peer.seen();
+        assert_eq!(seen.len(), 1, "one PUT per digest: {seen:?}");
+        assert_eq!(seen[0].method, "PUT");
+        assert_eq!(seen[0].path, format!("/internal/media/{digest}"));
+        assert_eq!(seen[0].token, "token");
+        assert_eq!(peer.file(&digest).as_deref(), Some(body.as_slice()));
+    }
+
+    /// A digest that was deleted between the local write and the replication is not
+    /// pushed anywhere: the task reads the file, it does not keep the uploaded body.
+    #[tokio::test]
+    async fn a_digest_that_is_no_longer_local_is_not_replicated() {
+        let body = b"already gone".to_vec();
+        let digest = digest_of(&body);
+        let serving = serving_in(&temp_root(), "test-node", Some("token"));
+        let peer = crate::testpeer::Peer::spawn("beta").await;
+        serving
+            .replicate_to(&digest, &[peer.member()], "token")
+            .await;
+        assert_eq!(peer.requests(), 0, "a missing local file was pushed");
+    }
+
+    /// A live upload answers 201 and returns before a silent replica is even waited for.
+    #[tokio::test]
+    async fn an_upload_to_a_dead_replica_is_still_created_and_answered_at_once() {
+        let body = b"answered anyway".to_vec();
+        let digest = digest_of(&body);
+        let root = temp_root();
+        let serving = serving_in(&root, "test-node", Some("token"));
+        let request = HttpRequest::builder()
+            .method("PUT")
+            .uri(format!("/internal/media/{digest}"))
+            .header("x-nodus-cluster", "token")
+            .body(Body::from(body.clone()))
+            .expect("request");
+        let began = std::time::Instant::now();
+        let response = serving
+            .router()
+            .oneshot(request)
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(500),
+            "the upload waited for the cluster"
+        );
+
+        // The detached task is what tries the replica; it must not hold the caller.
+        let dead = FakePeer::spawn(Behaviour::Silent).await;
+        let began = std::time::Instant::now();
+        serving.spawn_replication_to(&digest, vec![dead.member("beta")]);
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(100),
+            "spawning the replication waited for the peer"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(dead.requests(), 1, "the replica was never tried");
+    }
+
+    /// Three attempts, then exactly one warning. Nothing retries after the schedule is
+    /// spent, because a later pass of the repair walk is what covers a peer that stayed
+    /// down.
+    #[tokio::test]
+    async fn a_dead_replica_is_warned_about_once_after_three_attempts() {
+        let body = b"nobody home".to_vec();
+        let digest = digest_of(&body);
+        let root = temp_root();
+        seed_local(&root, &digest, &body).await;
+        let serving = serving_in(&root, "test-node", Some("token"));
+        let dead = FakePeer::spawn(Behaviour::Gone).await;
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Sink(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let began = std::time::Instant::now();
+        serving
+            .replicate_to(&digest, &[dead.member("beta")], "token")
+            .await;
+        let waited = began.elapsed();
+        drop(guard);
+
+        assert_eq!(dead.requests(), cluster::REPLICATION_ATTEMPTS);
+        assert!(
+            waited < cluster::REPLICATION_BUDGET,
+            "replication overran its budget: {waited:?}"
+        );
+        let logs = String::from_utf8(buffer.lock().expect("log buffer").clone()).expect("utf8");
+        assert_eq!(
+            logs.matches("could not replicate media to a peer").count(),
+            1,
+            "expected exactly one warning, got: {logs}"
+        );
+        assert!(logs.contains("WARN"), "the line was not a warning: {logs}");
     }
 }

@@ -81,6 +81,59 @@ pub async fn fetch(endpoint: &str, token: &str, digest: &str) -> Option<Vec<u8>>
     }
 }
 
+/// How many times one digest is offered to one peer during replication.
+///
+/// A peer that is restarting refuses the connection for a few hundred milliseconds and
+/// is fine again later, so the first retries are quick; the last wait is long enough to
+/// ride out a container that is coming back up.
+pub const REPLICATION_ATTEMPTS: usize = 3;
+
+/// Waits after a failed replication attempt, by attempt number.
+pub const REPLICATION_BACKOFF: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(200),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(4),
+];
+
+/// The whole replication of one digest, across every peer and every attempt.
+///
+/// An upload answers as soon as the local write lands, so this only bounds a background
+/// task: a cluster of dead peers must not leave one task per upload running forever.
+pub const REPLICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `PUT /internal/media/{digest}` on one peer, bounded by [`PEER_DEADLINE`].
+///
+/// One attempt only: the retry schedule belongs to the caller, which re-reads the local
+/// file before every send so a copy that was deleted in the meantime is not pushed.
+#[must_use]
+pub async fn put(endpoint: &str, token: &str, digest: &str, bytes: &[u8]) -> bool {
+    let request = client()
+        .put(media_url(endpoint, digest))
+        .header(TOKEN_HEADER, token)
+        .body(bytes.to_vec())
+        .send();
+    matches!(
+        tokio::time::timeout(PEER_DEADLINE, request).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
+}
+
+/// `HEAD /internal/media/{digest}` on one peer, bounded by [`PEER_DEADLINE`].
+///
+/// Presence only: the repair walk uses this to decide whether a peer needs the bytes,
+/// and reading a whole file to answer that would move it twice.
+#[must_use]
+pub async fn has(endpoint: &str, token: &str, digest: &str) -> bool {
+    let request = client()
+        .head(media_url(endpoint, digest))
+        .header(TOKEN_HEADER, token)
+        .send();
+    matches!(
+        tokio::time::timeout(PEER_DEADLINE, request).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
+}
+
 /// `DELETE /internal/media/{digest}` on one peer, best effort.
 ///
 /// The fan-out marker says "delete your copy, but do not pass this on": the node that

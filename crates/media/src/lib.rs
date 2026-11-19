@@ -16,6 +16,9 @@ pub mod hash;
 pub mod process;
 pub mod serve;
 
+#[cfg(test)]
+mod testpeer;
+
 /// The three cache layers, cheapest and longest-lived first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
