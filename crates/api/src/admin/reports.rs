@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use nodus_server_store::moderation::{self, NewReport, ReportRow};
+use nodus_server_store::rules as store_rules;
 use nodus_server_store::{accounts, statuses};
 
 use super::Body;
@@ -30,6 +31,11 @@ pub struct ReportDto {
     pub category: String,
     pub comment: String,
     pub rule_ids: Vec<String>,
+    /// The cited rules with their current text, in the order they were cited.
+    pub rules: Vec<ReportRuleDto>,
+    /// Cited ids whose rule has since been deleted. The ids above stay in `rule_ids`
+    /// either way: a report is history, and history is not rewritten by a later delete.
+    pub missing_rule_ids: Vec<String>,
     pub action_taken: bool,
     pub action_taken_note: String,
     pub action_taken_at: Option<DateTime<Utc>>,
@@ -41,6 +47,14 @@ pub struct ReportDto {
     pub reporter: Option<AccountDto>,
     pub target_account: Option<AccountDto>,
     pub statuses: Vec<StatusDto>,
+}
+
+/// One rule a report cites, as the moderation payload carries it.
+#[derive(Debug, Serialize)]
+pub struct ReportRuleDto {
+    pub id: String,
+    /// `None` once the rule was deleted — the citation itself is kept.
+    pub text: Option<String>,
 }
 
 /// Builds one report for the queue. Statuses are hydrated in order: a report is about a
@@ -68,6 +82,26 @@ pub(super) async fn report_dto(state: &AppState, row: ReportRow) -> ApiResult<Re
         Some(id) => accounts::by_id(pool, id).await?,
         None => None,
     };
+    // A citation outlives the rule it names. Resolve what still exists and mark the rest
+    // rather than dropping them: the console has to be able to say "rule 4 (deleted)".
+    let cited = store_rules::by_ids(pool, &row.rule_ids).await?;
+    let mut rules = Vec::with_capacity(row.rule_ids.len());
+    let mut missing_rule_ids = Vec::new();
+    for id in &row.rule_ids {
+        match cited.iter().find(|rule| &rule.id == id) {
+            Some(rule) => rules.push(ReportRuleDto {
+                id: id.clone(),
+                text: Some(rule.text.clone()),
+            }),
+            None => {
+                missing_rule_ids.push(id.clone());
+                rules.push(ReportRuleDto {
+                    id: id.clone(),
+                    text: None,
+                });
+            }
+        }
+    }
     let instance = state.instance();
     Ok(ReportDto {
         id: row.id,
@@ -75,6 +109,8 @@ pub(super) async fn report_dto(state: &AppState, row: ReportRow) -> ApiResult<Re
         category: row.category,
         comment: row.comment,
         rule_ids: row.rule_ids,
+        rules,
+        missing_rule_ids,
         action_taken: row.action_taken,
         action_taken_note: row.action_taken_note,
         action_taken_at: row.action_taken_at,
@@ -252,6 +288,15 @@ fn split_ids(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// Keeps the first occurrence of each id, so a client that repeats one does not make the
+/// report cite it twice.
+fn unique_ids(ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
 /// The public half: anyone signed in can file a report.
 async fn create(
     State(state): State<AppState>,
@@ -268,6 +313,20 @@ async fn create(
         .await?
         .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     let status_ids = split_ids(&form.status_ids);
+    let rule_ids = unique_ids(split_ids(&form.rule_ids));
+    // A citation is checked here, where the reporter's request can still be answered: an
+    // id that names nothing is a mistake in this request, and blaming it on the rule is
+    // more useful than storing a reference nobody can resolve.
+    let existing = store_rules::existing_ids(state.store().pool(), &rule_ids).await?;
+    if let Some(unknown) = rule_ids.iter().find(|id| !existing.contains(id)) {
+        return Err(ApiError::unprocessable(format!(
+            "rule {unknown} does not exist; cite one of the ids from /api/v1/instance/rules"
+        )));
+    }
+    let stored_rules: Vec<String> = rule_ids
+        .into_iter()
+        .filter(|id| existing.contains(id))
+        .collect();
     let category = if form.category.trim().is_empty() {
         "other"
     } else {
@@ -281,7 +340,7 @@ async fn create(
             status_ids: &status_ids,
             category,
             comment: form.comment.trim(),
-            rule_ids: &split_ids(&form.rule_ids),
+            rule_ids: &stored_rules,
             activity_uri: None,
         },
     )

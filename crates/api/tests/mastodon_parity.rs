@@ -832,7 +832,7 @@ async fn rules_and_languages_describe_the_instance() {
         assert_eq!(status, StatusCode::OK, "body was {body}");
         assert_eq!(json_of(&body), json!([]), "an empty rule list is a list");
 
-        sqlx::query("INSERT INTO instance_rule (id, text, hint, ord) VALUES ($1, $2, $3, 1)")
+        sqlx::query("INSERT INTO instance_rule (id, text, hint, ordinal) VALUES ($1, $2, $3, 1)")
             .bind(Id::new().to_string())
             .bind("Be kind")
             .bind("Seriously")

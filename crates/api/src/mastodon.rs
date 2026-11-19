@@ -15,7 +15,8 @@ use nodus_server_core::{PageParams, PageSize};
 
 use crate::auth::{Auth, MaybeAuth};
 use crate::dto::{
-    AccountDto, ConfigurationDto, InstanceV1Dto, InstanceV2Dto, RegistrationsDto, StatusDto,
+    AccountDto, ConfigurationDto, InstanceV1Dto, InstanceV2Dto, RegistrationsDto, RuleDto,
+    StatusDto,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -57,6 +58,7 @@ impl PageQuery {
 /// `GET /api/v1/instance`
 pub async fn instance_v1(State(state): State<AppState>) -> ApiResult<Json<InstanceV1Dto>> {
     let instance = state.instance();
+    let rules = nodus_server_store::rules::rules(state.store().pool()).await?;
     Ok(Json(InstanceV1Dto {
         uri: instance.domain.clone(),
         title: instance.title.clone(),
@@ -72,12 +74,14 @@ pub async fn instance_v1(State(state): State<AppState>) -> ApiResult<Json<Instan
         approval_required: false,
         invites_enabled: false,
         configuration: ConfigurationDto::build(instance),
+        rules: rules.into_iter().map(RuleDto::from_row).collect(),
     }))
 }
 
 /// `GET /api/v2/instance`
 pub async fn instance_v2(State(state): State<AppState>) -> ApiResult<Json<InstanceV2Dto>> {
     let instance = state.instance();
+    let rules = nodus_server_store::rules::rules(state.store().pool()).await?;
     Ok(Json(InstanceV2Dto {
         domain: instance.domain.clone(),
         title: instance.title.clone(),
@@ -104,7 +108,7 @@ pub async fn instance_v2(State(state): State<AppState>) -> ApiResult<Json<Instan
             "email": instance.contact_email.clone().unwrap_or_default(),
             "account": null
         }),
-        rules: Vec::new(),
+        rules: rules.into_iter().map(RuleDto::from_row).collect(),
     }))
 }
 

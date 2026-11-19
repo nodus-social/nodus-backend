@@ -28,6 +28,7 @@ pub mod miauth;
 pub mod moderation;
 pub mod polls;
 pub mod remote_moderation;
+pub mod rules;
 pub mod scanners;
 pub mod schedules;
 pub mod social;

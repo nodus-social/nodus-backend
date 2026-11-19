@@ -371,6 +371,9 @@ pub struct InstanceV1Dto {
     pub approval_required: bool,
     pub invites_enabled: bool,
     pub configuration: ConfigurationDto,
+    /// The instance's code of conduct, in ordinal order. Mastodon clients that show the
+    /// rules before someone joins read this field on the instance document.
+    pub rules: Vec<RuleDto>,
 }
 
 /// `GET /api/v2/instance`.
@@ -387,7 +390,7 @@ pub struct InstanceV2Dto {
     pub configuration: ConfigurationDto,
     pub registrations: RegistrationsDto,
     pub contact: serde_json::Value,
-    pub rules: Vec<serde_json::Value>,
+    pub rules: Vec<RuleDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -456,6 +459,29 @@ impl ConfigurationDto {
                 "min_expiration": 300, "max_expiration": 2_629_746
             }),
             translation: serde_json::json!({ "enabled": false }),
+        }
+    }
+}
+
+/// One instance rule.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleDto {
+    pub id: String,
+    pub text: String,
+    /// Zero-based position in the list; the number a reporter cites.
+    pub ordinal: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+impl RuleDto {
+    #[must_use]
+    pub fn from_row(row: nodus_server_store::rules::RuleRow) -> Self {
+        Self {
+            id: row.id,
+            text: row.text,
+            ordinal: row.ordinal,
+            hint: row.hint,
         }
     }
 }

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use nodus_server_core::Id;
 
 use crate::auth::{Auth, MaybeAuth};
-use crate::dto::AccountDto;
+use crate::dto::{AccountDto, RuleDto};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -24,15 +24,6 @@ pub struct FeaturedTagDto {
     /// one (`FeaturedTag::statuses_count: Option<u64>` in the shared model).
     pub statuses_count: u64,
     pub last_status_at: Option<String>,
-}
-
-/// One instance rule.
-#[derive(Debug, Serialize)]
-pub struct RuleDto {
-    pub id: String,
-    pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
 }
 
 /// One language the instance has posts in.
@@ -142,16 +133,8 @@ pub async fn suggestions(
 
 /// `GET /api/v1/instance/rules`
 pub async fn rules(State(state): State<AppState>) -> ApiResult<Json<Vec<RuleDto>>> {
-    let rows = nodus_server_store::highlights::rules(state.store().pool()).await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(|row| RuleDto {
-                id: row.id,
-                text: row.text,
-                hint: row.hint,
-            })
-            .collect(),
-    ))
+    let rows = nodus_server_store::rules::rules(state.store().pool()).await?;
+    Ok(Json(rows.into_iter().map(RuleDto::from_row).collect()))
 }
 
 /// `GET /api/v1/instance/languages`

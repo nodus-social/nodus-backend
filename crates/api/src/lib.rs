@@ -184,28 +184,61 @@ mod tests {
     use super::*;
     use nodus_server_store::Store;
 
+    fn instance_config() -> InstanceConfig {
+        InstanceConfig {
+            domain: "social.test".to_owned(),
+            base_url: "https://social.test".to_owned(),
+            title: "Nodus test".to_owned(),
+            description: "A test instance".to_owned(),
+            contact_email: None,
+            api_version: "4.3.0".to_owned(),
+            version: "0.1.0".to_owned(),
+            registrations_open: false,
+        }
+    }
+
     fn state() -> AppState {
         // Lazy pool: these tests assert routing and serialisation, not queries, so no
         // database is opened. `/readyz` is the one endpoint that touches it, and it is
         // asserted to fail closed.
         let store = Store::connect_lazy("postgres://nodus:nodus@127.0.0.1:1/nodus", 1);
-        AppState::new(
-            store,
-            InstanceConfig {
-                domain: "social.test".to_owned(),
-                base_url: "https://social.test".to_owned(),
-                title: "Nodus test".to_owned(),
-                description: "A test instance".to_owned(),
-                contact_email: None,
-                api_version: "4.3.0".to_owned(),
-                version: "0.1.0".to_owned(),
-                registrations_open: false,
-            },
+        AppState::new(store, instance_config())
+    }
+
+    /// A migrated schema of its own, the way the integration harness builds one. An
+    /// endpoint that reads a table cannot be asserted against the lazy pool above, and
+    /// asserting it against the shared database would make the test depend on whatever
+    /// that database happens to hold. `None` when no database is configured, so the
+    /// suite still builds and runs without one.
+    async fn migrated_state() -> Option<(AppState, sqlx::PgPool, String)> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let admin = Store::connect(&url, 1).await.expect("connect to postgres");
+        let schema = format!("pgunit_{}", nodus_server_core::id::Id::new()).to_lowercase();
+        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+            .execute(admin.pool())
+            .await
+            .expect("create isolated test schema");
+        let separator = if url.contains('?') { '&' } else { '?' };
+        let store = Store::connect(
+            &format!("{url}{separator}options=-csearch_path%3D{schema}%2Cpublic"),
+            2,
         )
+        .await
+        .expect("connect isolated store");
+        store.migrate().await.expect("run migrations");
+        Some((
+            AppState::new(store, instance_config()),
+            admin.pool().clone(),
+            schema,
+        ))
     }
 
     async fn get_json(path: &str) -> (StatusCode, String) {
-        let response = router(state())
+        get_json_with(state(), path).await
+    }
+
+    async fn get_json_with(state: AppState, path: &str) -> (StatusCode, String) {
+        let response = router(state)
             .oneshot(
                 Request::builder()
                     .uri(path)
@@ -226,12 +259,23 @@ mod tests {
 
     #[tokio::test]
     async fn the_instance_document_advertises_the_api_generation() {
-        let (status, body) = get_json("/api/v2/instance").await;
-        assert_eq!(status, StatusCode::OK);
+        // The document carries the rules, which are a table, so this one needs a store.
+        let Some((state, admin, schema)) = migrated_state().await else {
+            return;
+        };
+        let (status, body) = get_json_with(state, "/api/v2/instance").await;
+        assert_eq!(status, StatusCode::OK, "body was {body}");
         assert!(body.contains(r#""version":"4.3.0""#), "body was {body}");
         assert!(body.contains(r#""domain":"social.test""#));
         // Limits come from the same constants the server enforces.
         assert!(body.contains(r#""max_characters":500"#));
+        assert!(
+            body.contains(r#""rules":[]"#),
+            "an instance starts with no rules: {body}"
+        );
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+            .execute(&admin)
+            .await;
     }
 
     #[tokio::test]

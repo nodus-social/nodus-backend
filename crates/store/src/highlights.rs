@@ -1,7 +1,7 @@
-//! Tags a profile highlights, the rules an instance publishes, and the languages it has
-//! seen.
+//! Tags a profile highlights and the languages an instance has seen.
 //!
-//! All three are small read-mostly lists that clients put on a profile or an about page.
+//! Both are small read-mostly lists that clients put on a profile or an about page.
+//! The instance rules moved to `rules`, which owns their ordered write path too.
 
 use sqlx::{FromRow, PgPool};
 
@@ -11,14 +11,6 @@ pub struct FeaturedTagRow {
     pub id: String,
     pub name: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// One instance rule as stored.
-#[derive(Debug, Clone, FromRow)]
-pub struct RuleRow {
-    pub id: String,
-    pub text: String,
-    pub hint: Option<String>,
 }
 
 /// One language the instance has seen posts in.
@@ -68,14 +60,6 @@ pub async fn unfeature_tag(pool: &PgPool, account_id: &str, id: &str) -> Result<
         .execute(pool)
         .await?;
     Ok(done.rows_affected() > 0)
-}
-
-pub async fn rules(pool: &PgPool) -> Result<Vec<RuleRow>, sqlx::Error> {
-    sqlx::query_as::<_, RuleRow>(
-        "SELECT id, text, hint FROM instance_rule ORDER BY ord ASC, id ASC",
-    )
-    .fetch_all(pool)
-    .await
 }
 
 /// The languages posts on this instance are written in, most used first.
