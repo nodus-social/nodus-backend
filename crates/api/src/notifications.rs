@@ -38,6 +38,9 @@ pub struct NotificationDto {
     pub status: Option<StatusDto>,
     /// Clients group duplicates by this; we notify once per event, so it is per row.
     pub group_key: String,
+    /// How many events this line covers. A poll with twenty voters is one line with the
+    /// latest voter in `account` and 20 here; every other kind reports 1.
+    pub group_count: i32,
 }
 
 /// The filter parameters Mastodon accepts as repeated `types[]` keys.
@@ -245,6 +248,7 @@ async fn dto(
             kind,
             row.status_id.as_deref().unwrap_or(&row.from_account_id)
         ),
+        group_count: row.group_count,
     })
 }
 

@@ -180,16 +180,26 @@ pub async fn vote(
     let counted = polls::vote(state.store().pool(), &row.id, account_id, &choices).await?;
     if counted {
         if let Some(status) = statuses::by_id(state.store().pool(), &row.status_id).await? {
-            // A vote on your own poll is a notification like a favourite; a second vote
-            // from the same account changes nothing and must not notify twice.
-            nodus_server_store::social::notify(
-                state.store().pool(),
-                &status.account_id,
-                "poll",
-                account_id,
-                Some(&status.id),
+            // The line is only useful to an author who can still open the poll; a deleted
+            // or moderated-away status has nobody to show it to.
+            let author_can_see = crate::statuses::can_view_for_viewer(
+                &state,
+                Some(status.account_id.as_str()),
+                &status,
             )
             .await?;
+            if author_can_see {
+                // A vote on your own poll is a notification like a favourite; the store
+                // aggregates every voter into one line naming the latest one.
+                nodus_server_store::social::notify(
+                    state.store().pool(),
+                    &status.account_id,
+                    "poll",
+                    account_id,
+                    Some(&status.id),
+                )
+                .await?;
+            }
             // The peer's copy of the poll has votes now; an `Update` carries the tally
             // through the same outbox that delivered the original `Question`.
             crate::outbox::deliver_update(&state, &status.account_id, &status).await;

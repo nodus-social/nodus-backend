@@ -332,6 +332,10 @@ pub async fn follow_page(
 }
 
 /// Adds a notification unless the actor is the recipient.
+///
+/// A `poll` notification is one line per poll: a second voter bumps the existing row's
+/// actor and tally instead of adding another line, which is what the partial unique index
+/// `notification_poll_group_idx` enforces. Every other kind stays one row per event.
 pub async fn notify(
     pool: &PgPool,
     account_id: &str,
@@ -340,6 +344,25 @@ pub async fn notify(
     status_id: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     if account_id == from_account_id {
+        return Ok(());
+    }
+    if kind == "poll" && status_id.is_some() {
+        sqlx::query(
+            "INSERT INTO notification (id, account_id, kind, from_account_id, status_id) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (account_id, status_id) WHERE kind = 'poll' \
+             DO UPDATE SET from_account_id = EXCLUDED.from_account_id, \
+                           group_count = notification.group_count + 1, \
+                           created_at = now(), \
+                           seen_at = NULL",
+        )
+        .bind(Id::new().to_string())
+        .bind(account_id)
+        .bind(kind)
+        .bind(from_account_id)
+        .bind(status_id)
+        .execute(pool)
+        .await?;
         return Ok(());
     }
     sqlx::query(
@@ -363,6 +386,8 @@ pub struct NotificationRow {
     pub account_id: String,
     pub from_account_id: String,
     pub status_id: Option<String>,
+    /// How many events this line stands for; only `poll` aggregates, so it is 1 elsewhere.
+    pub group_count: i32,
     pub seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -375,7 +400,8 @@ pub async fn notifications(
     kinds: &[String],
 ) -> Result<Vec<NotificationRow>, sqlx::Error> {
     sqlx::query_as::<_, NotificationRow>(
-        "SELECT id, kind, account_id, from_account_id, status_id, seen_at, created_at \
+        "SELECT id, kind, account_id, from_account_id, status_id, group_count, seen_at, \
+                created_at \
            FROM notification \
           WHERE account_id = $1 \
             AND ($2::text IS NULL OR id < $2) \
