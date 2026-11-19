@@ -4,6 +4,10 @@
 //! for a page, a row or a write; the query that answers it, and the transaction it
 //! needs, are in this crate. That is what makes the fan-out guarantees ("the entry and
 //! the status commit together") checkable in one place.
+//!
+//! The same rule is why a delivery's whole life — queued, retried, rejected, delivered —
+//! lives in [`delivery`]: an operator asking why a post never reached a peer reads a row,
+//! not a log line that may have rotated away.
 
 pub mod accounts;
 pub mod alerts;

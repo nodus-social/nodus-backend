@@ -430,6 +430,49 @@ pub async fn deliver_reaction(
     }
 }
 
+/// Why one delivery attempt failed.
+///
+/// The status is kept apart from the message because retrying is a decision about the
+/// status: a peer that rejected our signature answers the same way forever, while a peer
+/// that is down may be up in a minute. `None` means the request never got an answer at all
+/// (DNS, connect, TLS, timeout), which is the retryable case.
+struct DeliveryFailure {
+    status: Option<u16>,
+    message: String,
+}
+
+impl DeliveryFailure {
+    fn network(message: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            message: message.into(),
+        }
+    }
+
+    /// Whether another attempt could plausibly succeed.
+    ///
+    /// 408 and 429 name a temporary condition even though they are 4xx; every other 4xx is
+    /// the peer saying the request itself is wrong — a refused signature, a missing actor,
+    /// a forbidden inbox — and will be said again. 5xx and a request that never got an
+    /// answer are the peer being unwell, which is exactly what the queue exists for.
+    fn retryable(&self) -> bool {
+        match self.status {
+            None => true,
+            Some(408 | 429) => true,
+            Some(code) => code >= 500,
+        }
+    }
+}
+
+impl From<String> for DeliveryFailure {
+    fn from(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
 /// Sends one queued activity.
 ///
 /// Returns `true` when there was work, so the worker can keep draining the queue without
@@ -441,27 +484,43 @@ pub async fn deliver_once(state: &AppState) -> ApiResult<bool> {
         return Ok(false);
     };
     match post(state, &row).await {
-        Ok(()) => {
-            nodus_server_store::delivery::delivered(pool, &row.id).await?;
-            tracing::info!(inbox = %row.inbox_url, "activity delivered");
+        Ok(status) => {
+            nodus_server_store::delivery::delivered(pool, &row.id, Some(i32::from(status))).await?;
+            tracing::info!(inbox = %row.inbox_url, status, "activity delivered");
         }
-        Err(error) => {
+        Err(failure) => {
             let attempts = row.attempts + 1;
-            nodus_server_store::delivery::failed(pool, &row.id, attempts, &error).await?;
-            tracing::warn!(inbox = %row.inbox_url, attempts, %error, "activity delivery failed");
+            let retry = failure.retryable();
+            nodus_server_store::delivery::failed(
+                pool,
+                &row.id,
+                attempts,
+                failure.status.map(i32::from),
+                &failure.message,
+                retry,
+            )
+            .await?;
+            tracing::warn!(
+                inbox = %row.inbox_url,
+                attempts,
+                status = ?failure.status,
+                retry,
+                error = %failure.message,
+                "activity delivery failed"
+            );
         }
     }
     Ok(true)
 }
 
-/// Signs and posts an activity to the inbox it was queued for.
+/// Signs and posts an activity to the inbox it was queued for, returning the 2xx status.
 async fn post(
     state: &AppState,
     row: &nodus_server_store::delivery::DeliveryRow,
-) -> Result<(), String> {
+) -> Result<u16, DeliveryFailure> {
     let url = reqwest::Url::parse(&row.inbox_url).map_err(|error| error.to_string())?;
     let Some(host) = url.host_str().map(std::borrow::ToOwned::to_owned) else {
-        return Err("the inbox has no host".to_owned());
+        return Err(DeliveryFailure::network("the inbox has no host"));
     };
     let path = url.query().map_or_else(
         || url.path().to_owned(),
@@ -506,7 +565,7 @@ async fn post(
         .map_err(|error| error.to_string())?;
     let status = response.status();
     if status.is_success() {
-        return Ok(());
+        return Ok(status.as_u16());
     }
     let detail: String = response
         .text()
@@ -515,7 +574,10 @@ async fn post(
         .chars()
         .take(200)
         .collect();
-    Err(format!("inbox answered {status}: {detail}"))
+    Err(DeliveryFailure {
+        status: Some(status.as_u16()),
+        message: format!("inbox answered {status}: {detail}"),
+    })
 }
 
 /// Drains the queue until there is nothing due, at most `BATCH` activities per round.

@@ -14,6 +14,19 @@ use ulid::Ulid;
 /// How many times a delivery is retried before it is left for an operator to look at.
 pub const MAX_ATTEMPTS: i32 = 8;
 
+/// First retry waits half a minute.
+///
+/// Short enough that a peer restarting does not cost us the activity, long enough that a
+/// peer that is briefly overloaded is not hit again before it can recover.
+pub const RETRY_BASE_SECS: i64 = 30;
+
+/// The wait stops doubling after an hour.
+///
+/// A peer that has been down for a day is retried roughly hourly rather than every few
+/// minutes: the queue keeps the obligation without becoming a flood the peer has to survive
+/// before it can accept anything.
+pub const RETRY_CAP_SECS: i64 = 3_600;
+
 /// One queued activity, as the worker needs it.
 #[derive(Debug, Clone)]
 pub struct DeliveryRow {
@@ -24,13 +37,10 @@ pub struct DeliveryRow {
     pub attempts: i32,
 }
 
-/// How long to wait after a failed attempt.
-///
-/// Doubling from thirty seconds and capped at an hour: a peer that is down for a minute is
-/// retried promptly, and a peer that is down for a day is not hammered.
+/// How long to wait after a failed attempt: thirty seconds, doubling, capped at an hour.
 fn backoff(attempts: i32) -> Duration {
     let exponent = u32::try_from(attempts.clamp(0, 7)).unwrap_or(0);
-    Duration::seconds(30 * 2_i64.pow(exponent)).min(Duration::hours(1))
+    Duration::seconds(RETRY_BASE_SECS * 2_i64.pow(exponent)).min(Duration::seconds(RETRY_CAP_SECS))
 }
 
 /// Writes an activity down for every inbox it goes to.
@@ -87,10 +97,18 @@ async fn enqueue_with(
         return Ok(0);
     }
     let ids: Vec<String> = inboxes.iter().map(|_| Ulid::new().to_string()).collect();
+    // The host is written down here, not derived on every admin query: the filter is over
+    // the same parser blocks uses, so "blocked by host" and "deliveries to host" agree.
+    let hosts: Vec<String> = inboxes
+        .iter()
+        .map(|inbox| crate::blocks::host_of(inbox).unwrap_or_default())
+        .collect();
+    let kind = activity.get("type").and_then(Value::as_str);
     let queued = sqlx::query(
-        "INSERT INTO federation_delivery (id, account_id, activity_id, inbox_url, activity) \
-         SELECT queued.id, $2, $3, queued.inbox, $4 \
-           FROM UNNEST($1::text[], $5::text[]) AS queued (id, inbox) \
+        "INSERT INTO federation_delivery \
+             (id, account_id, activity_id, inbox_url, activity, host, activity_kind) \
+         SELECT queued.id, $2, $3, queued.inbox, $4, queued.host, $6 \
+           FROM UNNEST($1::text[], $5::text[], $7::text[]) AS queued (id, inbox, host) \
          ON CONFLICT (inbox_url, activity_id) DO NOTHING",
     )
     .bind(&ids)
@@ -98,17 +116,25 @@ async fn enqueue_with(
     .bind(&activity_id)
     .bind(activity)
     .bind(inboxes)
+    .bind(kind)
+    .bind(&hosts)
     .execute(pool)
     .await?
     .rows_affected();
     Ok(queued)
 }
 
+/// The states a delivery row can be in.
+pub const STATES: [&str; 4] = ["pending", "failed", "gave_up", "delivered"];
+
 /// The deliveries that are due, oldest first.
+///
+/// A `gave_up` row is never due again: it is an operator's decision whether to retry it,
+/// not the worker's. A `failed` row is still owed and still scheduled.
 pub async fn due(pool: &PgPool, limit: i64) -> Result<Vec<DeliveryRow>, sqlx::Error> {
     let rows: Vec<(String, String, String, Value, i32)> = sqlx::query_as(
         "SELECT id, account_id, inbox_url, activity, attempts FROM federation_delivery \
-          WHERE delivered_at IS NULL AND next_attempt_at <= now() \
+          WHERE state IN ('pending', 'failed') AND next_attempt_at <= now() \
           ORDER BY next_attempt_at, created_at LIMIT $1",
     )
     .bind(limit)
@@ -128,42 +154,212 @@ pub async fn due(pool: &PgPool, limit: i64) -> Result<Vec<DeliveryRow>, sqlx::Er
         .collect())
 }
 
-/// Marks a delivery as done.
-pub async fn delivered(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE federation_delivery SET delivered_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
+/// Marks a delivery as done, recording the 2xx that accepted it.
+pub async fn delivered(
+    pool: &PgPool,
+    id: &str,
+    status_code: Option<i32>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE federation_delivery \
+            SET state = 'delivered', delivered_at = now(), last_status_code = $2 \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status_code)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-/// Records a failed attempt and schedules the next one.
+/// Records a failed attempt and schedules the next one, or gives up.
 ///
-/// A delivery that has used up its attempts is closed rather than kept forever: the row
-/// stays, with its error, so an operator can see what was never sent.
+/// `retryable` is the sender's answer to whether another attempt could plausibly work. A
+/// peer that refused our signature with 401 will refuse it again, so that is closed at once
+/// with the error kept; a 500 or a connection that never opened is retried with backoff
+/// until [`MAX_ATTEMPTS`], then closed as `gave_up`. `delivered_at` stays NULL either way:
+/// it is the mark of success, not of not-owing.
 pub async fn failed(
     pool: &PgPool,
     id: &str,
     attempts: i32,
+    status_code: Option<i32>,
     error: &str,
+    retryable: bool,
 ) -> Result<(), sqlx::Error> {
     let next = Utc::now() + backoff(attempts);
     let trimmed: String = error.chars().take(500).collect();
     sqlx::query(
         "UPDATE federation_delivery \
-            SET attempts = $2, last_error = $3, \
-                delivered_at = CASE WHEN $2 >= $4 THEN now() ELSE delivered_at END, \
-                next_attempt_at = $5 \
+            SET attempts = $2, last_error = $3, last_status_code = $4, \
+                state = CASE WHEN $5 AND $2 < $6 THEN 'failed' ELSE 'gave_up' END, \
+                next_attempt_at = $7 \
           WHERE id = $1",
     )
     .bind(id)
     .bind(attempts)
     .bind(trimmed)
+    .bind(status_code)
+    .bind(retryable)
     .bind(MAX_ATTEMPTS)
     .bind(next)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// One delivery as an operator sees it.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecord {
+    pub id: String,
+    pub inbox_url: String,
+    pub host: String,
+    pub activity_id: String,
+    pub activity_kind: Option<String>,
+    pub state: String,
+    pub attempts: i32,
+    pub last_status_code: Option<i32>,
+    pub last_error: Option<String>,
+    pub next_attempt_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// How much of the queue is in each state.
+///
+/// Always the whole queue, never narrowed by the list filters: a moderator filtering to one
+/// host still needs to know that forty deliveries are stuck elsewhere.
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryCounts {
+    pub pending: i64,
+    pub failed: i64,
+    pub gave_up: i64,
+    pub delivered: i64,
+}
+
+/// What the admin list can be narrowed to.
+#[derive(Debug, Clone, Default)]
+pub struct DeliveryFilter<'a> {
+    pub state: Option<&'a str>,
+    pub host: Option<&'a str>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// One page of the delivery log, newest first, with the queue's state counts.
+pub async fn list(
+    pool: &PgPool,
+    filter: &DeliveryFilter<'_>,
+) -> Result<(Vec<DeliveryRecord>, DeliveryCounts), sqlx::Error> {
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i32,
+        Option<i32>,
+        Option<String>,
+        DateTime<Utc>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT id, inbox_url, host, activity_id, activity_kind, state, attempts, \
+                last_status_code, last_error, next_attempt_at, created_at, delivered_at \
+           FROM federation_delivery \
+          WHERE ($1::text IS NULL OR state = $1) \
+            AND ($2::text IS NULL OR host = $2) \
+          ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4",
+    )
+    .bind(filter.state)
+    .bind(filter.host)
+    .bind(filter.limit)
+    .bind(filter.offset)
+    .fetch_all(pool)
+    .await?;
+    let deliveries = rows
+        .into_iter()
+        .map(
+            |(
+                id,
+                inbox_url,
+                host,
+                activity_id,
+                activity_kind,
+                state,
+                attempts,
+                last_status_code,
+                last_error,
+                next_attempt_at,
+                created_at,
+                delivered_at,
+            )| DeliveryRecord {
+                id,
+                inbox_url,
+                host,
+                activity_id,
+                activity_kind,
+                state,
+                attempts,
+                last_status_code,
+                last_error,
+                next_attempt_at,
+                created_at,
+                delivered_at,
+            },
+        )
+        .collect();
+    let counts: Vec<(String, i64)> =
+        sqlx::query_as("SELECT state, count(*) FROM federation_delivery GROUP BY state")
+            .fetch_all(pool)
+            .await?;
+    let mut summary = DeliveryCounts::default();
+    for (state, count) in counts {
+        match state.as_str() {
+            "pending" => summary.pending = count,
+            "failed" => summary.failed = count,
+            "gave_up" => summary.gave_up = count,
+            "delivered" => summary.delivered = count,
+            _ => {}
+        }
+    }
+    Ok((deliveries, summary))
+}
+
+/// Re-queues one delivery now and resets its attempt budget.
+///
+/// Returns the id when the row existed. The last error is kept: it is the reason an operator
+/// is retrying, and the next failure overwrites it.
+pub async fn requeue(pool: &PgPool, id: &str) -> Result<Option<String>, sqlx::Error> {
+    let requeued: Option<String> = sqlx::query_scalar(
+        "UPDATE federation_delivery \
+            SET state = 'pending', attempts = 0, next_attempt_at = now(), delivered_at = NULL \
+          WHERE id = $1 RETURNING id",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(requeued)
+}
+
+/// Re-queues every delivery whose last attempt failed, optionally only one host.
+///
+/// Both `failed` and `gave_up` are included: the first is already scheduled for another
+/// attempt, but "retry the failures now" means now, not at the backoff's convenience.
+pub async fn requeue_failed(pool: &PgPool, host: Option<&str>) -> Result<u64, sqlx::Error> {
+    let requeued = sqlx::query(
+        "UPDATE federation_delivery \
+            SET state = 'pending', attempts = 0, next_attempt_at = now(), delivered_at = NULL \
+          WHERE state IN ('failed', 'gave_up') \
+            AND ($1::text IS NULL OR host = $1)",
+    )
+    .bind(host)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(requeued)
 }
 
 /// Every inbox a post from `account_id` should reach: the accepted followers' inboxes,

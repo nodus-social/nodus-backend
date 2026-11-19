@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use nodus_server_store::blocks as store_blocks;
+use nodus_server_store::delivery;
 use nodus_server_store::moderation::{
     self, DomainBlockFilter, DomainBlockRow, EmailDomainBlockRow, NewDomainBlock,
 };
@@ -271,6 +272,160 @@ async fn import(
     )
     .await?;
     Ok(Json(ImportDto { blocked, skipped }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeliveryQuery {
+    state: Option<String>,
+    host: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeliveryDto {
+    pub id: String,
+    pub inbox_url: String,
+    pub host: String,
+    pub activity_id: String,
+    pub activity_kind: Option<String>,
+    pub state: String,
+    pub attempts: i32,
+    pub last_status_code: Option<i32>,
+    pub last_error: Option<String>,
+    pub next_attempt_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+impl From<delivery::DeliveryRecord> for DeliveryDto {
+    fn from(row: delivery::DeliveryRecord) -> Self {
+        Self {
+            id: row.id,
+            inbox_url: row.inbox_url,
+            host: row.host,
+            activity_id: row.activity_id,
+            activity_kind: row.activity_kind,
+            state: row.state,
+            attempts: row.attempts,
+            last_status_code: row.last_status_code,
+            last_error: row.last_error,
+            next_attempt_at: row.next_attempt_at,
+            created_at: row.created_at,
+            delivered_at: row.delivered_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeliveryCountsDto {
+    pub pending: i64,
+    pub failed: i64,
+    pub gave_up: i64,
+    pub delivered: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeliveryListDto {
+    pub deliveries: Vec<DeliveryDto>,
+    pub counts: DeliveryCountsDto,
+}
+
+/// `GET /api/v1/admin/federation/deliveries` — every attempt, newest first.
+async fn deliveries(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<DeliveryQuery>,
+) -> ApiResult<Json<DeliveryListDto>> {
+    auth.require_admin("admin:read")?;
+    let wanted = query.state.as_deref().filter(|value| !value.is_empty());
+    if let Some(value) = wanted {
+        if !delivery::STATES.contains(&value) {
+            return Err(ApiError::unprocessable(
+                "state is pending, failed, gave_up or delivered",
+            ));
+        }
+    }
+    let host = query
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    let (rows, counts) = delivery::list(
+        state.store().pool(),
+        &delivery::DeliveryFilter {
+            state: wanted,
+            host: host.as_deref(),
+            limit: page(query.limit),
+            offset: offset(query.offset),
+        },
+    )
+    .await?;
+    Ok(Json(DeliveryListDto {
+        deliveries: rows.into_iter().map(DeliveryDto::from).collect(),
+        counts: DeliveryCountsDto {
+            pending: counts.pending,
+            failed: counts.failed,
+            gave_up: counts.gave_up,
+            delivered: counts.delivered,
+        },
+    }))
+}
+
+/// `POST /api/v1/admin/federation/deliveries/{id}/retry` — send one delivery again now.
+async fn retry_delivery(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    auth.require_admin("admin:write")?;
+    let id = delivery::requeue(state.store().pool(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("that delivery does not exist"))?;
+    super::audit_write_detail(
+        &state,
+        &auth,
+        "retry_federation_delivery",
+        "federation_delivery",
+        &id,
+        json!({}),
+    )
+    .await?;
+    Ok(Json(json!({ "id": id, "state": "pending" })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RetryFailedForm {
+    host: Option<String>,
+}
+
+/// `POST /api/v1/admin/federation/deliveries/retry-failed` — send every failure again.
+///
+/// Both `failed` and `gave_up` count as failed: neither has reached the peer, and an
+/// operator retrying after fixing a key or unblocking a host means now, not when the next
+/// backoff elapses. The answer is the number actually re-queued, so a UI can say it.
+async fn retry_failed_deliveries(
+    State(state): State<AppState>,
+    auth: Auth,
+    body: Option<Json<RetryFailedForm>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    auth.require_admin("admin:write")?;
+    let host = body
+        .and_then(|Json(form)| form.host)
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    let requeued = delivery::requeue_failed(state.store().pool(), host.as_deref()).await?;
+    super::audit_write_detail(
+        &state,
+        &auth,
+        "retry_failed_federation_deliveries",
+        "federation_delivery",
+        host.as_deref().unwrap_or("*"),
+        json!({ "requeued": requeued, "host": host }),
+    )
+    .await?;
+    Ok(Json(json!({ "requeued": requeued })))
 }
 
 #[derive(Debug, Serialize)]
@@ -696,6 +851,15 @@ async fn lift_remote_account(
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/api/v1/admin/federation/deliveries", get(deliveries))
+        .route(
+            "/api/v1/admin/federation/deliveries/retry-failed",
+            post(retry_failed_deliveries),
+        )
+        .route(
+            "/api/v1/admin/federation/deliveries/{id}/retry",
+            post(retry_delivery),
+        )
         .route(
             "/api/v1/admin/federation/remote-blocks",
             get(list_remote_blocks).delete(clear_remote_blocks),
