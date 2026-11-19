@@ -343,13 +343,26 @@ pub async fn notify(
     from_account_id: &str,
     status_id: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    notify_with_note(pool, account_id, kind, from_account_id, status_id, None).await
+}
+
+/// The same event with a sentence the reader is told, for kinds whose payload is text
+/// rather than a status: a decided appeal carries its outcome and the moderator's note.
+pub async fn notify_with_note(
+    pool: &PgPool,
+    account_id: &str,
+    kind: &str,
+    from_account_id: &str,
+    status_id: Option<&str>,
+    note: Option<&str>,
+) -> Result<(), sqlx::Error> {
     if account_id == from_account_id {
         return Ok(());
     }
     if kind == "poll" && status_id.is_some() {
         sqlx::query(
-            "INSERT INTO notification (id, account_id, kind, from_account_id, status_id) \
-             VALUES ($1, $2, $3, $4, $5) \
+            "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (account_id, status_id) WHERE kind = 'poll' \
              DO UPDATE SET from_account_id = EXCLUDED.from_account_id, \
                            group_count = notification.group_count + 1, \
@@ -361,19 +374,21 @@ pub async fn notify(
         .bind(kind)
         .bind(from_account_id)
         .bind(status_id)
+        .bind(note)
         .execute(pool)
         .await?;
         return Ok(());
     }
     sqlx::query(
-        "INSERT INTO notification (id, account_id, kind, from_account_id, status_id) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(Id::new().to_string())
     .bind(account_id)
     .bind(kind)
     .bind(from_account_id)
     .bind(status_id)
+    .bind(note)
     .execute(pool)
     .await?;
     Ok(())
@@ -386,6 +401,8 @@ pub struct NotificationRow {
     pub account_id: String,
     pub from_account_id: String,
     pub status_id: Option<String>,
+    /// The sentence a kind without a status carries; `appeal` is the only user today.
+    pub note: Option<String>,
     /// How many events this line stands for; only `poll` aggregates, so it is 1 elsewhere.
     pub group_count: i32,
     pub seen_at: Option<DateTime<Utc>>,
@@ -400,8 +417,8 @@ pub async fn notifications(
     kinds: &[String],
 ) -> Result<Vec<NotificationRow>, sqlx::Error> {
     sqlx::query_as::<_, NotificationRow>(
-        "SELECT id, kind, account_id, from_account_id, status_id, group_count, seen_at, \
-                created_at \
+        "SELECT id, kind, account_id, from_account_id, status_id, note, group_count, \
+                seen_at, created_at \
            FROM notification \
           WHERE account_id = $1 \
             AND ($2::text IS NULL OR id < $2) \

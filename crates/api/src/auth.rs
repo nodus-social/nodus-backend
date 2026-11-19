@@ -9,7 +9,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use sha2::{Digest, Sha256};
 
-use nodus_server_store::accounts::{verify_token, Authenticated};
+use nodus_server_store::accounts::{verify_token, verify_token_any_state, Authenticated};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -66,18 +66,7 @@ impl FromRequestParts<AppState> for Auth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let raw = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))?;
-        let token = raw
-            .strip_prefix("Bearer ")
-            .or_else(|| raw.strip_prefix("bearer "))
-            .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))?;
-        if token.is_empty() {
-            return Err(ApiError::unauthorized("The access token is invalid"));
-        }
+        let token = bearer(parts)?;
         let digest = hex_lower(&Sha256::digest(token.as_bytes()));
         let account = verify_token(state.store().pool(), &digest).await?;
         account
@@ -130,4 +119,46 @@ impl FromRequestParts<AppState> for MaybeAuth {
             .await
             .map(|auth| Self(Some(auth)))
     }
+}
+
+/// Authentication that still resolves when the account is restricted.
+///
+/// Every other route resolves its token through [`Auth`], whose store predicate refuses
+/// a suspended or refused account. That is the correct default, but it would also deny
+/// the one person who needs to speak: a suspended person must be able to read and answer
+/// their own appeal. Only the appeal handlers use this extractor.
+#[derive(Debug, Clone)]
+pub struct AppealAuth(pub Auth);
+
+impl FromRequestParts<AppState> for AppealAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = bearer(parts)?;
+        let digest = hex_lower(&Sha256::digest(token.as_bytes()));
+        verify_token_any_state(state.store().pool(), &digest)
+            .await?
+            .map(|authenticated| Self(Auth(authenticated)))
+            .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))
+    }
+}
+
+/// The bearer value from the `Authorization` header, or the one `401` these routes share.
+fn bearer(parts: &Parts) -> Result<&str, ApiError> {
+    let raw = parts
+        .headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))?;
+    let token = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+        .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))?;
+    if token.is_empty() {
+        return Err(ApiError::unauthorized("The access token is invalid"));
+    }
+    Ok(token)
 }

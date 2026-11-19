@@ -100,7 +100,7 @@ impl Authenticated {
     }
 }
 
-/// Resolves a bearer token by its SHA-256 digest.
+/// Resolves a bearer token by its SHA-256 digest, refusing a restricted account.
 pub async fn verify_token(
     pool: &PgPool,
     token_hash: &str,
@@ -111,7 +111,33 @@ pub async fn verify_token(
          WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND a.suspended_at IS NULL \
            AND a.approved"
     );
-    let row = sqlx::query_as::<_, Authenticated>(&sql)
+    resolve_token(pool, &sql, token_hash).await
+}
+
+/// The same resolution with the state predicates dropped.
+///
+/// Only the appeal endpoints use this: a suspended or refused person still owns the
+/// token and must be able to read and answer their own appeal, while every other route
+/// keeps refusing the token through [`verify_token`]. Silence never blocked the token in
+/// the first place, so this only widens it for suspension and refusal.
+pub async fn verify_token_any_state(
+    pool: &PgPool,
+    token_hash: &str,
+) -> Result<Option<Authenticated>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {ACCOUNT_COLUMNS_ALIASED}, t.scopes FROM oauth_token t \
+         JOIN account a ON a.id = t.account_id \
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL"
+    );
+    resolve_token(pool, &sql, token_hash).await
+}
+
+async fn resolve_token(
+    pool: &PgPool,
+    sql: &str,
+    token_hash: &str,
+) -> Result<Option<Authenticated>, sqlx::Error> {
+    let row = sqlx::query_as::<_, Authenticated>(sql)
         .bind(token_hash)
         .fetch_optional(pool)
         .await?;

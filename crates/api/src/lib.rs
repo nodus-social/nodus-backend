@@ -10,6 +10,7 @@ pub mod accounts;
 pub mod activitypub;
 pub mod admin;
 pub mod announcements;
+pub mod appeals;
 pub mod apps;
 pub mod assets;
 pub mod auth;
@@ -130,6 +131,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(miauth::router())
         .merge(nodus::router())
         .merge(announcements::router())
+        .merge(appeals::router())
         .merge(admin::router())
         .merge(admin::public_router())
         .merge(assets::router())

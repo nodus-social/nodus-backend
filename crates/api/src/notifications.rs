@@ -23,8 +23,17 @@ use crate::state::AppState;
 use crate::statuses;
 
 /// Every kind this server can produce. Mastodon also has `update` (an edited status) and
-/// `admin.sign_up`; both are accepted as filters and simply match nothing.
-const KINDS: [&str; 6] = ["follow", "favourite", "reblog", "mention", "status", "poll"];
+/// `admin.sign_up`; both are accepted as filters and simply match nothing. `appeal` is
+/// this instance's own: a decided appeal has no status to point at, only a sentence.
+const KINDS: [&str; 7] = [
+    "follow",
+    "favourite",
+    "reblog",
+    "mention",
+    "status",
+    "poll",
+    "appeal",
+];
 
 /// One notification, in Mastodon's shape.
 #[derive(Debug, Serialize)]
@@ -36,6 +45,10 @@ pub struct NotificationDto {
     pub account: AccountDto,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusDto>,
+    /// A sentence that carries the event itself, when there is no status to point at.
+    /// Today only `appeal` uses it: the outcome and the moderator's note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// Clients group duplicates by this; we notify once per event, so it is per row.
     pub group_key: String,
     /// How many events this line covers. A poll with twenty voters is one line with the
@@ -249,6 +262,7 @@ async fn dto(
             row.status_id.as_deref().unwrap_or(&row.from_account_id)
         ),
         group_count: row.group_count,
+        note: row.note.clone(),
     })
 }
 
