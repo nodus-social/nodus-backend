@@ -181,6 +181,13 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/admin/settings/export",
         owner: Owner::Api,
     },
+    // What we told a peer about its own user. The list of forwarded reports is the screen;
+    // the per-report forward route hangs off the report itself.
+    Capability {
+        name: "report_forwarding",
+        path: "/api/v1/admin/federation/forwarded",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -204,6 +211,7 @@ const MODULE_FEATURES: &[(&str, &[&str])] = &[
             "domain_pauses",
         ],
     ),
+    ("forwarded", &["report_forwarding"]),
     ("media", &["media_quarantine"]),
     ("moderation_rules", &["moderation_rules"]),
     ("reports", &["moderation"]),
@@ -238,6 +246,10 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     (
         "admin/federation.rs",
         include_str!("../src/admin/federation.rs"),
+    ),
+    (
+        "admin/forwarded.rs",
+        include_str!("../src/admin/forwarded.rs"),
     ),
     ("admin/media.rs", include_str!("../src/admin/media.rs")),
     (

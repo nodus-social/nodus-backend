@@ -26,7 +26,7 @@ use nodus_shared::{Meta, CONTRACT_VERSION, MIN_CONTRACT_VERSION};
 /// this instance's `nodus-feed` process on the same origin. The rest are answered by this
 /// API. `tests/capabilities.rs` holds the feature-to-path table and fails when a name here
 /// stops answering or a route appears that no name covers.
-pub const FEATURES: [&str; 23] = [
+pub const FEATURES: [&str; 24] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -63,6 +63,9 @@ pub const FEATURES: [&str; 23] = [
     // The whole console tuned once and carried to the next instance: rules, presets, the
     // ladder and both domain lists in one versioned document, and a two-phase import.
     "settings_transfer", // GET /api/v1/admin/settings/export
+    // The outbound half of the report queue: a report about a remote account leaves this
+    // instance as a signed Flag, so the peer's moderators can act on it too.
+    "report_forwarding", // POST|GET /api/v1/admin/reports/{id}/forward
 ];
 
 /// The capability names as owned strings, for documents that serialize their own envelope.
