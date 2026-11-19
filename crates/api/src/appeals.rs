@@ -35,7 +35,9 @@ pub struct AppealDto {
 }
 
 impl AppealDto {
-    fn from_row(row: AppealRow) -> Self {
+    /// Also used by the notification reader, which shows a pending appeal beside the
+    /// notice that prompted it.
+    pub fn from_row(row: AppealRow) -> Self {
         Self {
             id: row.id,
             action: row.action,

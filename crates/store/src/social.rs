@@ -401,8 +401,18 @@ pub struct NotificationRow {
     pub account_id: String,
     pub from_account_id: String,
     pub status_id: Option<String>,
-    /// The sentence a kind without a status carries; `appeal` is the only user today.
+    /// The sentence a kind without a status carries; `appeal` and `moderation` are the
+    /// users today.
     pub note: Option<String>,
+    /// For `moderation`: the decision, spelled as the audit log spells it (`silence`,
+    /// `unsuspend`, `warn`). `None` on every other kind.
+    pub moderation_action: Option<String>,
+    /// For `moderation`: the moderator's reason — the same text the audit row carries.
+    pub moderation_reason: Option<String>,
+    /// For `moderation`: the rule that decided, when a rule rather than a person did.
+    pub moderation_rule: Option<String>,
+    /// For `moderation`: when the restriction ends, when it has an end.
+    pub moderation_expires_at: Option<DateTime<Utc>>,
     /// How many events this line stands for; only `poll` aggregates, so it is 1 elsewhere.
     pub group_count: i32,
     pub seen_at: Option<DateTime<Utc>>,
@@ -418,7 +428,8 @@ pub async fn notifications(
 ) -> Result<Vec<NotificationRow>, sqlx::Error> {
     sqlx::query_as::<_, NotificationRow>(
         "SELECT id, kind, account_id, from_account_id, status_id, note, group_count, \
-                seen_at, created_at \
+                seen_at, created_at, moderation_action, moderation_reason, moderation_rule, \
+                moderation_expires_at \
            FROM notification \
           WHERE account_id = $1 \
             AND ($2::text IS NULL OR id < $2) \

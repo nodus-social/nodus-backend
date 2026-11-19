@@ -436,21 +436,35 @@ pub async fn screen(
             }
         };
 
+        // Decided before it is applied, so the person's notification can carry the same
+        // words the report does: one sentence, written once, read by both.
         let applied = match rule.action.as_str() {
-            "silence" | "suspend" if !target_is_staff => {
-                let action = if rule.action == "suspend" {
-                    Action::Suspend
-                } else {
-                    Action::Silence
-                };
-                moderation::apply_action_in(&mut *tx, account_id, action).await?;
-                rule.action.clone()
-            }
+            "silence" | "suspend" if !target_is_staff => rule.action.clone(),
             // Flag, and every action aimed at a staff account, only queues the post.
             _ => "flag".to_owned(),
         };
-
         let comment = report_comment(&rule, &applied, &hit);
+        // The account change and the sentence explaining it travel together: the same
+        // reason as the report, and the rule's name so the person can look it up.
+        if let Some(action) = match applied.as_str() {
+            "silence" => Some(Action::Silence),
+            "suspend" => Some(Action::Suspend),
+            _ => None,
+        } {
+            moderation::apply_action_noted_in(
+                &mut *tx,
+                account_id,
+                action,
+                &moderation::Notice {
+                    reason: &comment,
+                    rule: Some(&rule.name),
+                    actor_id: None,
+                    expires_at: None,
+                },
+            )
+            .await?;
+        }
+
         let report = moderation::create_report_in(
             &mut *tx,
             &NewReport {

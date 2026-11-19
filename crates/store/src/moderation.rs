@@ -726,12 +726,64 @@ pub async fn apply_action(
     apply_action_in(&mut conn, account_id, action).await
 }
 
+/// What a person is told about a decision, alongside the account change it makes.
+///
+/// Every field here is also in the audit row: `reason` is the moderator's `text`, `rule`
+/// the rule that decided when no person did. Callers build one string and pass it to both
+/// writes, so the account and the moderator cannot be told different stories.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Notice<'a> {
+    /// The moderator's words. Empty when a bare action carries none.
+    pub reason: &'a str,
+    /// The rule that caused the decision, when a rule rather than a person decided.
+    pub rule: Option<&'a str>,
+    /// Who decided; `None` when the instance did, which is recorded as the account itself
+    /// because `notification.from_account_id` has no "nobody" value.
+    pub actor_id: Option<&'a str>,
+    /// When the restriction ends, if it has an end.
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 /// The same enforcement on a caller-owned connection, so a batch can share a transaction.
 pub async fn apply_action_in(
     conn: &mut PgConnection,
     account_id: &str,
     action: Action,
 ) -> Result<Option<AccountRow>, sqlx::Error> {
+    apply_action_noted_in(conn, account_id, action, &Notice::default()).await
+}
+
+/// The enforcement plus the notification that tells the person it happened.
+///
+/// The notification is the point of this function: an action that is only an effect (a
+/// post that stops federating, a login that still works) leaves the person nothing to
+/// read and no reason to appeal. Every action writes its own row, so lifting a silence is
+/// a second sentence rather than an edit of the first one — the person keeps the record of
+/// what was decided and when it was undone.
+pub async fn apply_action_noted(
+    pool: &PgPool,
+    account_id: &str,
+    action: Action,
+    notice: &Notice<'_>,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    apply_action_noted_in(&mut conn, account_id, action, notice).await
+}
+
+/// The same, on a caller-owned connection, so the account change, its audit row and the
+/// person's notification commit or roll back together.
+pub async fn apply_action_noted_in(
+    conn: &mut PgConnection,
+    account_id: &str,
+    action: Action,
+    notice: &Notice<'_>,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let before = sqlx::query_as::<_, PreviousState>(
+        "SELECT approved, silenced_at, suspended_at FROM account WHERE id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(&mut *conn)
+    .await?;
     let set_clause = match action {
         Action::Approve | Action::Enable => {
             "approved = true, silenced_at = NULL, suspended_at = NULL"
@@ -743,10 +795,135 @@ pub async fn apply_action_in(
         Action::Unsuspend => "suspended_at = NULL",
     };
     let sql = format!("UPDATE account SET {set_clause} WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}");
-    sqlx::query_as::<_, AccountRow>(&sql)
+    let row = sqlx::query_as::<_, AccountRow>(&sql)
         .bind(account_id)
-        .fetch_optional(conn)
-        .await
+        .fetch_optional(&mut *conn)
+        .await?;
+    // A decision that changes nothing is not news. The audit row still records that the
+    // button was pressed; the person does not need a second copy of an event they were
+    // already told about.
+    if let Some(row) = &row {
+        if before.is_some_and(|before| before.changes(action)) {
+            notice_in(
+                conn,
+                account_id,
+                action.as_str(),
+                &sentence(action, notice),
+                notice,
+            )
+            .await?;
+        }
+        let _ = row;
+    }
+    Ok(row)
+}
+
+/// What the account looked like before the action, so [`PreviousState::changes`] can tell
+/// a decision from a repeated click.
+#[derive(Debug, Clone, Copy, FromRow)]
+struct PreviousState {
+    approved: bool,
+    silenced_at: Option<DateTime<Utc>>,
+    suspended_at: Option<DateTime<Utc>>,
+}
+
+impl PreviousState {
+    fn changes(&self, action: Action) -> bool {
+        match action {
+            Action::Approve | Action::Enable => {
+                !self.approved || self.silenced_at.is_some() || self.suspended_at.is_some()
+            }
+            Action::Reject => self.approved,
+            Action::Silence => self.silenced_at.is_none() || self.suspended_at.is_some(),
+            Action::Suspend => self.suspended_at.is_none(),
+            Action::Unsilence => self.silenced_at.is_some(),
+            Action::Unsuspend => self.suspended_at.is_some(),
+        }
+    }
+}
+
+/// Writes a warning: the person is told, the trail records it, and nothing about the
+/// account changes.
+///
+/// A warning is the answer when the moderator's reply is "stop" rather than "you may no
+/// longer post". It therefore shares the notification kind with the restrictions (one
+/// place for a person to look) while touching no state at all — no silence, no expiry, no
+/// unapproved flag.
+pub async fn warn_in(
+    conn: &mut PgConnection,
+    account_id: &str,
+    actor_id: &str,
+    text: &str,
+    rule: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    notice_in(
+        conn,
+        account_id,
+        WARN,
+        text,
+        &Notice {
+            reason: text,
+            rule,
+            actor_id: Some(actor_id),
+            expires_at: None,
+        },
+    )
+    .await
+}
+
+/// The action string a warning is recorded under. A warning is deliberately *not* an
+/// [`Action`]: nothing about the account changes, so there is no state transition for it
+/// to share the match arms of, and the type should not pretend otherwise.
+pub const WARN: &str = "warn";
+
+/// The one sentence a client without a moderation UI shows, plus the structured facts
+/// beside it in the same row.
+async fn notice_in(
+    conn: &mut PgConnection,
+    account_id: &str,
+    action: &str,
+    sentence: &str,
+    notice: &Notice<'_>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO notification (id, account_id, kind, from_account_id, note, \
+             moderation_action, moderation_reason, moderation_rule, moderation_expires_at) \
+         VALUES ($1, $2, 'moderation', $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(Id::new().to_string())
+    .bind(account_id)
+    // The instance acting is recorded as the account itself: there is no third account to
+    // name, and `from_account_id` is not nullable.
+    .bind(notice.actor_id.unwrap_or(account_id))
+    .bind(sentence)
+    .bind(action)
+    .bind(notice.reason)
+    .bind(notice.rule)
+    .bind(notice.expires_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The sentence the person reads. Kept here rather than in the API because every surface
+/// that applies an action gets the same words, and a client that only understands `note`
+/// still learns what happened.
+fn sentence(action: Action, notice: &Notice<'_>) -> String {
+    let what = match action {
+        Action::Silence => "Your account was silenced.",
+        Action::Suspend => "Your account was suspended.",
+        Action::Reject => "Your registration was refused.",
+        Action::Approve => "Your registration was approved.",
+        Action::Unsilence => "Your silence was lifted.",
+        Action::Unsuspend => "Your suspension was lifted.",
+        Action::Enable => "Your account was re-enabled.",
+    };
+    let reason = notice.reason.trim();
+    if reason.is_empty() {
+        what.to_owned()
+    } else {
+        format!("{what} Reason: {reason}")
+    }
 }
 
 /// Grants or revokes the staff flag. Kept apart from [`apply_action`] because it is the

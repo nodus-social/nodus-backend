@@ -1,8 +1,13 @@
 //! Mastodon notification endpoints.
 //!
 //! Notifications are written by the follow, favourite, reblog and mention paths through
-//! `social::notify`; this module only reads and acknowledges them, so a notification can
-//! never be produced by a read.
+//! `social::notify`, and by every account-level moderation decision through
+//! `moderation::apply_action_noted` / `moderation::warn_in`; this module only reads and
+//! acknowledges them, so a notification can never be produced by a read.
+//!
+//! `moderation` is the one kind the reader may see while restricted: a silenced or
+//! suspended person still has to learn what was decided, so the list resolves its token
+//! through [`AppealAuth`] rather than [`Auth`].
 
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::HeaderValue;
@@ -15,17 +20,22 @@ use nodus_server_core::limits::PAGE_MAX;
 use nodus_server_core::pagination::PageSize;
 use nodus_server_store::social::NotificationRow;
 
-use crate::auth::Auth;
+use crate::appeals::AppealDto;
+use crate::auth::{AppealAuth, Auth};
 use crate::dto::{AccountDto, StatusDto};
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
 use crate::state::AppState;
 use crate::statuses;
 
+use nodus_server_store::appeals;
+
 /// Every kind this server can produce. Mastodon also has `update` (an edited status) and
 /// `admin.sign_up`; both are accepted as filters and simply match nothing. `appeal` is
 /// this instance's own: a decided appeal has no status to point at, only a sentence.
-const KINDS: [&str; 7] = [
+/// `moderation` is the same shape for a decision *about* the reader, which is why it is
+/// the only kind that also carries structured fields beside the sentence.
+const KINDS: [&str; 8] = [
     "follow",
     "favourite",
     "reblog",
@@ -33,6 +43,7 @@ const KINDS: [&str; 7] = [
     "status",
     "poll",
     "appeal",
+    "moderation",
 ];
 
 /// One notification, in Mastodon's shape.
@@ -46,9 +57,14 @@ pub struct NotificationDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusDto>,
     /// A sentence that carries the event itself, when there is no status to point at.
-    /// Today only `appeal` uses it: the outcome and the moderator's note.
+    /// `appeal` and `moderation` use it: the outcome, the reason, and whatever the
+    /// moderator wrote.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Present on `moderation` only: the decision, its reason, the rule if a rule
+    /// decided, the expiry if there is one, and whether the reader may answer it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moderation: Option<ModerationNoticeDto>,
     /// Clients group duplicates by this; we notify once per event, so it is per row.
     pub group_key: String,
     /// How many events this line covers. A poll with twenty voters is one line with the
@@ -56,7 +72,29 @@ pub struct NotificationDto {
     pub group_count: i32,
 }
 
-/// The filter parameters Mastodon accepts as repeated `types[]` keys.
+/// The structured half of a `moderation` notification.
+///
+/// `note` says it in one sentence for a client that knows nothing about moderation;
+/// these fields let a client say "you were silenced for X until Y, you may appeal"
+/// without parsing prose.
+#[derive(Debug, Serialize)]
+pub struct ModerationNoticeDto {
+    /// `warn`, `silence`, `suspend`, `reject`, `approve`, `unsilence`, `unsuspend` —
+    /// spelled as the audit log spells it, so the two records can be read side by side.
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// True when the decision is a restriction still in force and nothing is waiting on a
+    /// moderator already: the reader has something to answer and no answer pending.
+    pub can_appeal: bool,
+    /// The appeal already waiting, so a person who filed one sees it is not lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appeal: Option<AppealDto>,
+}
 ///
 /// `serde_urlencoded` cannot express an array, so these are read from the raw query
 /// string rather than through a `Query<T>` extractor.
@@ -114,13 +152,16 @@ fn split_list(value: &str) -> Vec<String> {
 }
 
 /// `GET /api/v1/notifications`
+///
+/// Authentication is [`AppealAuth`], not [`Auth`]: a suspended account must be able to
+/// read the sentence that suspended it and find the appeal form (migration 39) from it.
 pub async fn list(
     State(state): State<AppState>,
-    auth: Auth,
+    auth: AppealAuth,
     Query(query): Query<PageQuery>,
     RawQuery(raw): RawQuery,
 ) -> ApiResult<Response> {
-    auth.require_scope("read:notifications")?;
+    auth.0.require_scope("read:notifications")?;
     let params = query.params()?;
     let size = PageSize::clamp(params.limit, PAGE_MAX);
     let filter = NotificationFilter::parse(raw.as_deref());
@@ -137,7 +178,7 @@ pub async fn list(
     let cursor = params.max_id.map(|id| id.to_string());
     let rows = nodus_server_store::social::notifications(
         state.store().pool(),
-        &auth.0.account.id,
+        &auth.0 .0.account.id,
         cursor.as_deref(),
         i64::from(size.get()),
         &kinds,
@@ -146,7 +187,7 @@ pub async fn list(
 
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
-        items.push(dto(&state, row, Some(&auth)).await?);
+        items.push(dto(&state, row, Some(&auth.0)).await?);
     }
 
     let next = rows.last().map(|row| row.id.clone());
@@ -250,6 +291,10 @@ async fn dto(
         .find(|kind| **kind == row.kind)
         .copied()
         .unwrap_or("status");
+    let moderation = match kind {
+        "moderation" => Some(moderation_dto(state, row).await?),
+        _ => None,
+    };
     Ok(NotificationDto {
         id: row.id.clone(),
         kind,
@@ -263,6 +308,43 @@ async fn dto(
         ),
         group_count: row.group_count,
         note: row.note.clone(),
+        moderation,
+    })
+}
+
+/// Fills in the structured half of a `moderation` row, including the answer the reader
+/// may give.
+///
+/// `can_appeal` is deliberately conservative: the notice must still be true of the account
+/// *now*. A silence that was later lifted keeps its own row (that is what requirement one
+/// asks of the trail), but its `can_appeal` becomes false, because there is nothing left to
+/// appeal. It is likewise false while an appeal is pending — the moderator, not the person,
+/// owes the next word.
+async fn moderation_dto(
+    state: &AppState,
+    row: &NotificationRow,
+) -> ApiResult<ModerationNoticeDto> {
+    let action = row
+        .moderation_action
+        .clone()
+        .unwrap_or_else(|| "warn".to_owned());
+    let restricted_now = matches!(action.as_str(), "silence" | "suspend" | "reject");
+    let pending = nodus_server_store::appeals::pending(state.store().pool(), &row.account_id)
+        .await?;
+    let mut can_appeal = false;
+    if restricted_now {
+        let in_force = appeals::restriction(state.store().pool(), &row.account_id)
+            .await?
+            .is_some_and(|restriction| restriction.as_str() == action);
+        can_appeal = in_force && pending.is_none();
+    }
+    Ok(ModerationNoticeDto {
+        action,
+        reason: row.moderation_reason.clone().filter(|text| !text.is_empty()),
+        rule: row.moderation_rule.clone(),
+        expires_at: row.moderation_expires_at,
+        can_appeal,
+        appeal: pending.map(AppealDto::from_row),
     })
 }
 

@@ -339,8 +339,9 @@ async fn rejecting_keeps_the_restriction_and_tells_the_person() {
         suspend(pool, &account).await;
         let token = create_token(pool, &account, &["read:accounts", "write:accounts"]).await;
 
-        // Every other route still refuses the suspended token; only the appeal door opens.
-        let (status, _) = send(&app, &token, "GET", "/api/v1/notifications", None).await;
+        // The appeal door and the notification list are the two routes that open for a
+        // suspended token; every other route still refuses it.
+        let (status, _) = send(&app, &token, "GET", "/api/v1/accounts/verify_credentials", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let (status, body) = send(
@@ -412,6 +413,8 @@ async fn deciding_twice_is_a_conflict() {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        // Accepting writes two sentences: the lift itself, and the appeal outcome.
+        let after_accept = notifications(pool, &account).await.len();
         let (status, body) = send(
             &app,
             &moderator_token,
@@ -423,7 +426,7 @@ async fn deciding_twice_is_a_conflict() {
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
         // Undoing the silence twice would also mean notifying twice.
-        assert_eq!(notifications(pool, &account).await.len(), 1);
+        assert_eq!(notifications(pool, &account).await.len(), after_accept);
     })
     .await;
 }

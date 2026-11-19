@@ -133,8 +133,9 @@ impl FromRequestParts<AppState> for MaybeAuth {
 ///
 /// Every other route resolves its token through [`Auth`], whose store predicate refuses
 /// a suspended or refused account. That is the correct default, but it would also deny
-/// the one person who needs to speak: a suspended person must be able to read and answer
-/// their own appeal. Only the appeal handlers use this extractor.
+/// the one person who needs to speak: a suspended person must be able to read their own
+/// notifications and answer their own appeal. Only the appeal handlers and the notification
+/// list use this extractor; the other notification writes keep the stricter [`Auth`].
 #[derive(Debug, Clone)]
 pub struct AppealAuth(pub Auth);
 

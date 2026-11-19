@@ -14,8 +14,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use nodus_server_store::moderation::{self, AccountFilter, Action, AdminAccountRow};
-use nodus_server_store::{accounts, scanners};
+use nodus_server_store::moderation::{
+    self, AccountFilter, Action, AdminAccountRow, Notice,
+};
+use nodus_server_store::{accounts, rules, scanners};
 
 use super::Body;
 use crate::auth::Auth;
@@ -293,9 +295,20 @@ async fn action(
             "demote an administrator before taking action against them",
         ));
     }
-    moderation::apply_action(state.store().pool(), &id, action)
-        .await?
-        .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
+    moderation::apply_action_noted(
+        state.store().pool(),
+        &id,
+        action,
+        &Notice {
+            reason: form.text.trim(),
+            // A moderator's own click names no rule; only the rule engine does.
+            rule: None,
+            actor_id: Some(&auth.0.account.id),
+            expires_at: None,
+        },
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     if let Some(report_id) = form.report_id.as_deref() {
         if moderation::resolve_report(
             state.store().pool(),
@@ -353,9 +366,17 @@ async fn approve(
     Path(id): Path<String>,
 ) -> ApiResult<Json<AdminAccountDto>> {
     auth.require_admin("admin:write")?;
-    moderation::apply_action(state.store().pool(), &id, Action::Approve)
-        .await?
-        .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
+    moderation::apply_action_noted(
+        state.store().pool(),
+        &id,
+        Action::Approve,
+        &Notice {
+            actor_id: Some(&auth.0.account.id),
+            ..Notice::default()
+        },
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     let row = moderation::admin_account(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
@@ -369,13 +390,130 @@ async fn reject(
     Path(id): Path<String>,
 ) -> ApiResult<Json<AdminAccountDto>> {
     auth.require_admin("admin:write")?;
-    moderation::apply_action(state.store().pool(), &id, Action::Reject)
-        .await?
-        .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
+    moderation::apply_action_noted(
+        state.store().pool(),
+        &id,
+        Action::Reject,
+        &Notice {
+            actor_id: Some(&auth.0.account.id),
+            ..Notice::default()
+        },
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     let row = moderation::admin_account(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     audit_write_detail(&state, &auth, "account_reject", "account", &id, json!({})).await?;
+    Ok(Json(AdminAccountDto::from_row(row, &state)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WarnForm {
+    /// A canned warning from the console's preset list. Its text stands in when the
+    /// moderator writes none of their own.
+    preset_id: Option<String>,
+    /// The moderator's words, stored verbatim on the notification *and* on the audit row
+    /// so the two records read as one decision.
+    #[serde(default)]
+    text: String,
+    /// Instance rules the warning cites, so the person can look up what they broke.
+    #[serde(default)]
+    rule_ids: Vec<String>,
+}
+
+/// The longest warning worth sending; longer than this is a report, not a warning.
+const WARN_TEXT_MAX: usize = 2000;
+
+/// `POST /api/v1/admin/accounts/{id}/warn` — tell a person to stop, change nothing.
+///
+/// Every other decision here changes what the account may do. A warning does not: it
+/// exists because the right answer to a first offence is often "we saw that" rather than
+/// a silence the person has to appeal. So this handler writes a notification and an audit
+/// row and touches no column of `account` — deliberately, so that a warning can never
+/// quietly become a restriction.
+async fn warn(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    Body(form): Body<WarnForm>,
+) -> ApiResult<Json<AdminAccountDto>> {
+    auth.require_admin("admin:write")?;
+    let target = moderation::admin_account(state.store().pool(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
+    if target.account.id == auth.0.account.id {
+        return Err(ApiError::unprocessable(
+            "you cannot warn your own account",
+        ));
+    }
+    let text = match form.text.trim() {
+        "" => match form.preset_id.as_deref() {
+            Some(preset_id) => moderation::warning_presets(state.store().pool())
+                .await?
+                .into_iter()
+                .find(|preset| preset.id == preset_id)
+                .ok_or_else(|| ApiError::not_found("that warning preset does not exist"))?
+                .text,
+            None => {
+                return Err(ApiError::unprocessable(
+                    "a warning needs text or a preset",
+                ))
+            }
+        },
+        written => written.to_owned(),
+    };
+    if text.chars().count() > WARN_TEXT_MAX {
+        return Err(ApiError::unprocessable(format!(
+            "text must be at most {WARN_TEXT_MAX} characters"
+        )));
+    }
+    // A warning that cites a rule nobody can read is worse than one that cites none: the
+    // person would be told they broke something they cannot find. Unknown ids are an
+    // error rather than skipped.
+    let cited = rules::by_ids(state.store().pool(), &form.rule_ids).await?;
+    let distinct: std::collections::BTreeSet<&str> =
+        form.rule_ids.iter().map(String::as_str).collect();
+    if cited.len() != distinct.len() {
+        return Err(ApiError::unprocessable("one of those rules does not exist"));
+    }
+    let rule = (!cited.is_empty()).then(|| {
+        cited
+            .iter()
+            .map(|rule| rule.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+
+    let mut tx = state.store().pool().begin().await?;
+    moderation::warn_in(
+        &mut tx,
+        &id,
+        &auth.0.account.id,
+        &text,
+        rule.as_deref(),
+    )
+    .await?;
+    moderation::audit_in(
+        &mut tx,
+        &auth.0.account.id,
+        "account_warn",
+        "account",
+        Some(&id),
+        &json!({
+            "type": "warn",
+            "text": text,
+            "preset_id": form.preset_id,
+            "rule_ids": form.rule_ids,
+            "rule": rule,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+
+    let row = moderation::admin_account(state.store().pool(), &id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     Ok(Json(AdminAccountDto::from_row(row, &state)))
 }
 
@@ -602,9 +740,19 @@ async fn apply_bulk_one(
             "demote an administrator before taking action against them".to_owned(),
         ));
     }
-    if moderation::apply_action_in(conn, id, action)
-        .await?
-        .is_none()
+    if moderation::apply_action_noted_in(
+        conn,
+        id,
+        action,
+        &Notice {
+            reason,
+            rule: None,
+            actor_id: Some(&auth.0.account.id),
+            expires_at: None,
+        },
+    )
+    .await?
+    .is_none()
     {
         return Err(BulkFailure::Rejected(
             "that account does not exist".to_owned(),
@@ -677,6 +825,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/admin/accounts/{id}/action", post(action))
         .route("/api/v1/admin/accounts/{id}/approve", post(approve))
         .route("/api/v1/admin/accounts/{id}/reject", post(reject))
+        .route("/api/v1/admin/accounts/{id}/warn", post(warn))
         .route("/api/v1/admin/accounts/{id}/staff", post(staff))
         .route("/api/v1/admin/accounts/{id}/role", put(set_role))
         .route("/api/v1/admin/accounts/{id}/notes", post(add_note))

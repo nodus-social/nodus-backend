@@ -144,6 +144,22 @@ pub async fn mine(pool: &PgPool, account_id: &str) -> Result<Vec<AppealRow>, sql
     .await
 }
 
+/// The appeal the account is waiting on, if one is open.
+///
+/// A pending appeal is not a private moderator concern: the person who filed it needs to
+/// see that it is waiting and not lost, so the notification reader asks for it directly
+/// rather than scanning [`mine`] and hoping the newest row is still open.
+pub async fn pending(pool: &PgPool, account_id: &str) -> Result<Option<AppealRow>, sqlx::Error> {
+    sqlx::query_as::<_, AppealRow>(&format!(
+        "SELECT {APPEAL_COLUMNS} FROM appeal \
+          WHERE account_id = $1 AND status = 'pending' \
+          ORDER BY created_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// One row of the moderator's queue, with the account and the restriction in force.
 #[derive(Debug, Clone, FromRow)]
 pub struct AdminAppealRow {
@@ -271,7 +287,21 @@ pub async fn decide(
             "reject" => Action::Approve,
             _ => Action::Unsuspend,
         };
-        moderation::apply_action_in(&mut tx, &row.account_id, lift).await?;
+        moderation::apply_action_noted_in(
+            &mut tx,
+            &row.account_id,
+            lift,
+            // Lifting a restriction is its own decision and gets its own sentence
+            // ("Your silence was lifted") rather than editing the one that imposed it;
+            // the moderator's decision note, when there is one, is the reason.
+            &moderation::Notice {
+                reason: note.unwrap_or_default(),
+                rule: None,
+                actor_id: Some(decided_by),
+                expires_at: None,
+            },
+        )
+        .await?;
     }
     moderation::audit_in(
         &mut tx,
