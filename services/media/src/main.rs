@@ -24,13 +24,26 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(15);
 const FORGET_EVERY: u32 = 40;
 
 /// The first repair pass waits a minute, so a node that just restarted is not competing
-/// with its own startup for the catalogue.
+/// with its own startup for the catalogue. A shortened cadence shortens this too: a node
+/// told to walk every two seconds should not sit idle for a minute first.
 const REPAIR_FIRST: Duration = Duration::from_secs(60);
 
 /// How often the repair walk compares the catalogue with the members that should hold
 /// each digest. Ten minutes is a tenth of [`cluster::MEMBER_MAX_AGE`], so a replica lost
 /// to a failed upload is back long before the membership itself would expire.
 const REPAIR_EVERY: Duration = Duration::from_secs(600);
+
+/// How often the walk runs here: [`REPAIR_EVERY`], or `NODUS_MEDIA_REPAIR_SECS` when set.
+///
+/// The override exists so a proof can watch a pass instead of waiting ten minutes for one.
+/// It is parsed like the other environment numbers: a value that is not a number is a
+/// deployment mistake and stops the process, rather than silently becoming the default.
+fn repair_every() -> Result<Duration, Box<dyn Error>> {
+    match std::env::var("NODUS_MEDIA_REPAIR_SECS") {
+        Ok(value) => Ok(Duration::from_secs(value.parse()?)),
+        Err(_) => Ok(REPAIR_EVERY),
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -63,7 +76,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     spawn_heartbeat(store.clone(), node.clone(), endpoint.clone());
     if let Some(token) = cluster_token.clone() {
         if repair_enabled() {
-            spawn_repair(store.clone(), runtime::media_dir(), node.clone(), token);
+            spawn_repair(
+                store.clone(),
+                runtime::media_dir(),
+                node.clone(),
+                token,
+                repair_every()?,
+            );
         }
     }
 
@@ -99,11 +118,6 @@ fn default_endpoint(bind: &Address) -> String {
     }
 }
 
-/// Records this node and forgets nodes that stopped answering.
-///
-/// A failure is logged and retried on the next tick: a database hiccup must not take the
-/// byte server down, and the membership row it could not write this time is written next
-/// time. The task therefore never returns, even on error.
 /// Whether this process runs the repair walk. `NODUS_MEDIA_REPAIR=off` leaves it to
 /// another node, and keeps an unclustered instance from scanning a catalogue it cannot
 /// repair.
@@ -111,10 +125,16 @@ fn repair_enabled() -> bool {
     std::env::var("NODUS_MEDIA_REPAIR").map_or(true, |value| !value.eq_ignore_ascii_case("off"))
 }
 
-fn spawn_repair(store: Store, root: std::path::PathBuf, node: String, token: String) {
+fn spawn_repair(
+    store: Store,
+    root: std::path::PathBuf,
+    node: String,
+    token: String,
+    cadence: Duration,
+) {
     tokio::spawn(async move {
-        tokio::time::sleep(REPAIR_FIRST).await;
-        let mut every = tokio::time::interval(REPAIR_EVERY);
+        tokio::time::sleep(REPAIR_FIRST.min(cadence)).await;
+        let mut every = tokio::time::interval(cadence);
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             every.tick().await;
@@ -125,6 +145,11 @@ fn spawn_repair(store: Store, root: std::path::PathBuf, node: String, token: Str
     });
 }
 
+/// Records this node and forgets nodes that stopped answering.
+///
+/// A failure is logged and retried on the next tick: a database hiccup must not take the
+/// byte server down, and the membership row it could not write this time is written next
+/// time. The task therefore never returns, even on error.
 fn spawn_heartbeat(store: Store, node: String, endpoint: String) {
     tokio::spawn(async move {
         let mut since_forget = 0u32;
