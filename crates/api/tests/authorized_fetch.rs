@@ -5,20 +5,20 @@
 //! a passing test is evidence that what a peer sends is what this instance checks —
 //! not that a helper agrees with itself.
 
-use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{header, Request, StatusCode};
+use axum::Router;
 use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
 use nodus_federation::signature::crypto::RsaSigner;
 use nodus_federation::{HttpSignature, Signer};
-use nodus_server_api::{AppState, InstanceConfig, root_router};
+use nodus_server_api::{root_router, AppState, InstanceConfig};
 use nodus_server_core::Id;
-use nodus_server_store::Store;
 use nodus_server_store::accounts::{self, NewAccount, RemoteAccount};
-use rsa::RsaPrivateKey;
+use nodus_server_store::Store;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::rand_core::OsRng;
+use rsa::RsaPrivateKey;
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -106,8 +106,8 @@ fn http_date(at: chrono::DateTime<Utc>) -> String {
 /// `Digest: SHA-256=<base64>`, independent of the server's own helper: the test must not
 /// agree with the code under test about what a digest is.
 fn digest_of(body: &[u8]) -> String {
-    use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
     use sha2::{Digest, Sha256};
     format!("SHA-256={}", STANDARD.encode(Sha256::digest(body)))
 }

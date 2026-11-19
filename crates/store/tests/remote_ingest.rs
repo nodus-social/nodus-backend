@@ -246,13 +246,9 @@ async fn a_note_keeps_two_hashtags_one_mention_and_one_emoji(pool: PgPool) {
     let mentioned = seed_remote(&pool, "https://remote.test/users/alice").await;
     let row = ingest(&pool, &eve, "https://remote.test/notes/tags").await;
 
-    statuses::replace_tags(
-        &pool,
-        &row.id,
-        &["rust".to_owned(), "fedi".to_owned()],
-    )
-    .await
-    .expect("store hashtags");
+    statuses::replace_tags(&pool, &row.id, &["rust".to_owned(), "fedi".to_owned()])
+        .await
+        .expect("store hashtags");
     statuses::replace_mentions(&pool, &row.id, std::slice::from_ref(&mentioned))
         .await
         .expect("store mention");
@@ -343,12 +339,11 @@ async fn a_remote_poll_keeps_the_peers_options_and_counts(pool: PgPool) {
         .await
         .expect("read tallies");
     assert_eq!(counts.iter().map(|count| count.votes).sum::<i64>(), 2);
-    let local_votes: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM poll_vote WHERE poll_id = $1")
-            .bind(&poll.id)
-            .fetch_one(&pool)
-            .await
-            .expect("count local votes");
+    let local_votes: i64 = sqlx::query_scalar("SELECT count(*) FROM poll_vote WHERE poll_id = $1")
+        .bind(&poll.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count local votes");
     assert_eq!(local_votes, 0, "peer votes must not become local accounts");
 }
 

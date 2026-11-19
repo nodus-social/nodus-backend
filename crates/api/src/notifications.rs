@@ -320,17 +320,14 @@ async fn dto(
 /// asks of the trail), but its `can_appeal` becomes false, because there is nothing left to
 /// appeal. It is likewise false while an appeal is pending — the moderator, not the person,
 /// owes the next word.
-async fn moderation_dto(
-    state: &AppState,
-    row: &NotificationRow,
-) -> ApiResult<ModerationNoticeDto> {
+async fn moderation_dto(state: &AppState, row: &NotificationRow) -> ApiResult<ModerationNoticeDto> {
     let action = row
         .moderation_action
         .clone()
         .unwrap_or_else(|| "warn".to_owned());
     let restricted_now = matches!(action.as_str(), "silence" | "suspend" | "reject");
-    let pending = nodus_server_store::appeals::pending(state.store().pool(), &row.account_id)
-        .await?;
+    let pending =
+        nodus_server_store::appeals::pending(state.store().pool(), &row.account_id).await?;
     let mut can_appeal = false;
     if restricted_now {
         let in_force = appeals::restriction(state.store().pool(), &row.account_id)
@@ -340,7 +337,10 @@ async fn moderation_dto(
     }
     Ok(ModerationNoticeDto {
         action,
-        reason: row.moderation_reason.clone().filter(|text| !text.is_empty()),
+        reason: row
+            .moderation_reason
+            .clone()
+            .filter(|text| !text.is_empty()),
         rule: row.moderation_rule.clone(),
         expires_at: row.moderation_expires_at,
         can_appeal,

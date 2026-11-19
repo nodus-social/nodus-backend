@@ -210,11 +210,7 @@ pub async fn replace_remote(
         .bind(attachment.description)
         .bind(sensitive)
         .bind(attachment.url)
-        .bind(
-            carried
-                .get(attachment.url)
-                .map_or("none", String::as_str),
-        )
+        .bind(carried.get(attachment.url).map_or("none", String::as_str))
         .execute(&mut *tx)
         .await?;
     }

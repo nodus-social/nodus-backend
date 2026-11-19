@@ -215,9 +215,7 @@ fn moderation<'a>(items: &'a Value, action: &str) -> &'a Value {
         .as_array()
         .expect("notification array")
         .iter()
-        .find(|item| {
-            item["type"] == "moderation" && item["moderation"]["action"] == action
-        })
+        .find(|item| item["type"] == "moderation" && item["moderation"]["action"] == action)
         .unwrap_or_else(|| panic!("no moderation notification for {action}: {items}"))
 }
 
@@ -259,8 +257,7 @@ async fn silencing_tells_the_person_why_and_that_they_may_appeal() {
         assert!(note.contains("a spam wave, not you"), "{note}");
 
         // And the person's own view says they may answer it.
-        let (status, body) =
-            send(&app, &member_token, "GET", "/api/v1/notifications", None).await;
+        let (status, body) = send(&app, &member_token, "GET", "/api/v1/notifications", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let items = parse(&body);
         let notice = moderation(&items, "silence");
@@ -368,8 +365,7 @@ async fn a_warning_is_delivered_and_changes_nothing_about_the_account() {
             "audit and notification must agree"
         );
 
-        let (status, body) =
-            send(&app, &member_token, "GET", "/api/v1/notifications", None).await;
+        let (status, body) = send(&app, &member_token, "GET", "/api/v1/notifications", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let notice = parse(&body);
         let notice = moderation(&notice, "warn");
@@ -414,7 +410,11 @@ async fn a_rule_caused_action_names_the_rule_to_the_person() {
         assert_eq!(fired.len(), 1, "the rule fires once");
 
         let rows = notices(pool, &author).await;
-        assert_eq!(rows.len(), 1, "a rule that silences tells the person: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a rule that silences tells the person: {rows:?}"
+        );
         assert_eq!(rows[0].kind, "moderation");
         assert_eq!(rows[0].moderation_action.as_deref(), Some("silence"));
         assert_eq!(
@@ -458,8 +458,7 @@ async fn a_suspended_account_reads_its_own_notices_and_the_appeal_it_filed() {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        let (status, body) =
-            send(&app, &member_token, "GET", "/api/v1/notifications", None).await;
+        let (status, body) = send(&app, &member_token, "GET", "/api/v1/notifications", None).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -481,8 +480,7 @@ async fn a_suspended_account_reads_its_own_notices_and_the_appeal_it_filed() {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        let (status, body) =
-            send(&app, &member_token, "GET", "/api/v1/notifications", None).await;
+        let (status, body) = send(&app, &member_token, "GET", "/api/v1/notifications", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let items = parse(&body);
         let notice = moderation(&items, "suspend");

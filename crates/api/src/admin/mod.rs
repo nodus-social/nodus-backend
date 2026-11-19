@@ -10,15 +10,16 @@
 
 mod accounts;
 mod appeals;
-mod escalation;
 /// The block-list transfer surface, which also owns the subscription sweep.
 pub mod blocklist;
+mod escalation;
 mod federation;
 mod media;
 mod moderation_rules;
 mod reports;
 mod rules;
 mod scanners;
+mod settings_transfer;
 pub(crate) mod stats;
 mod topology;
 
@@ -882,6 +883,7 @@ pub fn router() -> Router<AppState> {
         .merge(media::router())
         .merge(rules::router())
         .merge(moderation_rules::router())
+        .merge(settings_transfer::router())
         .merge(topology::router())
         .route("/api/v1/admin/meta", get(meta))
         .route("/api/v1/admin/overview", get(overview))

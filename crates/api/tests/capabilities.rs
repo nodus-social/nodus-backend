@@ -176,6 +176,11 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/admin/federation/domain-pauses",
         owner: Owner::Api,
     },
+    Capability {
+        name: "settings_transfer",
+        path: "/api/v1/admin/settings/export",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -204,6 +209,7 @@ const MODULE_FEATURES: &[(&str, &[&str])] = &[
     ("reports", &["moderation"]),
     ("rules", &["instance_rules"]),
     ("scanners", &["scanners"]),
+    ("settings_transfer", &["settings_transfer"]),
     ("stats", &["moderation_stats"]),
     ("topology", &["topology"]),
 ];
@@ -224,6 +230,10 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     (
         "admin/blocklist.rs",
         include_str!("../src/admin/blocklist.rs"),
+    ),
+    (
+        "admin/settings_transfer.rs",
+        include_str!("../src/admin/settings_transfer.rs"),
     ),
     (
         "admin/federation.rs",

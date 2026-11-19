@@ -177,12 +177,7 @@ async fn insert_report(
     id
 }
 
-async fn insert_resolution(
-    pool: &PgPool,
-    actor: &str,
-    report_id: &str,
-    created_at: DateTime<Utc>,
-) {
+async fn insert_resolution(pool: &PgPool, actor: &str, report_id: &str, created_at: DateTime<Utc>) {
     sqlx::query(
         "INSERT INTO audit_log (id, actor_id, action, target_type, target_id, created_at) \
          VALUES ($1, $2, 'resolve_report_with_note', 'report', $3, $4)",
@@ -267,9 +262,12 @@ async fn an_unresolved_report_is_only_pending_and_the_answer_is_cached() {
         assert_eq!(body["reports"]["resolved"], 0);
         assert_eq!(body["reports"]["reopened"], 0);
         assert_eq!(body["reports"]["pending"], 1);
-        assert_eq!(body["decisions_by_action"], json!({
-            "approve": 0, "reject": 0, "silence": 0, "suspend": 0, "enable": 0,
-        }));
+        assert_eq!(
+            body["decisions_by_action"],
+            json!({
+                "approve": 0, "reject": 0, "silence": 0, "suspend": 0, "enable": 0,
+            })
+        );
         assert!(body["median_time_to_decision_seconds"].is_null(), "{body}");
 
         // A second report arrives; the console polling again within the minute sees the
@@ -284,7 +282,10 @@ async fn an_unresolved_report_is_only_pending_and_the_answer_is_cached() {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
-        assert_eq!(body["reports"]["pending"], 1, "the 7d answer was not cached");
+        assert_eq!(
+            body["reports"]["pending"], 1,
+            "the 7d answer was not cached"
+        );
         assert_eq!(body["reports"]["opened"], 1);
     })
     .await;

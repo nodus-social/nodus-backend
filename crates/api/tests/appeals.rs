@@ -341,7 +341,14 @@ async fn rejecting_keeps_the_restriction_and_tells_the_person() {
 
         // The appeal door and the notification list are the two routes that open for a
         // suspended token; every other route still refuses it.
-        let (status, _) = send(&app, &token, "GET", "/api/v1/accounts/verify_credentials", None).await;
+        let (status, _) = send(
+            &app,
+            &token,
+            "GET",
+            "/api/v1/accounts/verify_credentials",
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
         let (status, body) = send(

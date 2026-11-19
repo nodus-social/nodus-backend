@@ -14,9 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use nodus_server_store::moderation::{
-    self, AccountFilter, Action, AdminAccountRow, Notice,
-};
+use nodus_server_store::moderation::{self, AccountFilter, Action, AdminAccountRow, Notice};
 use nodus_server_store::{accounts, rules, scanners};
 
 use super::Body;
@@ -453,23 +451,19 @@ async fn warn(
         .await?
         .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     if target.account.id == auth.0.account.id {
-        return Err(ApiError::unprocessable(
-            "you cannot warn your own account",
-        ));
+        return Err(ApiError::unprocessable("you cannot warn your own account"));
     }
     let text = match form.text.trim() {
         "" => match form.preset_id.as_deref() {
-            Some(preset_id) => moderation::warning_presets(state.store().pool())
-                .await?
-                .into_iter()
-                .find(|preset| preset.id == preset_id)
-                .ok_or_else(|| ApiError::not_found("that warning preset does not exist"))?
-                .text,
-            None => {
-                return Err(ApiError::unprocessable(
-                    "a warning needs text or a preset",
-                ))
+            Some(preset_id) => {
+                moderation::warning_presets(state.store().pool())
+                    .await?
+                    .into_iter()
+                    .find(|preset| preset.id == preset_id)
+                    .ok_or_else(|| ApiError::not_found("that warning preset does not exist"))?
+                    .text
             }
+            None => return Err(ApiError::unprocessable("a warning needs text or a preset")),
         },
         written => written.to_owned(),
     };
@@ -496,14 +490,7 @@ async fn warn(
     });
 
     let mut tx = state.store().pool().begin().await?;
-    moderation::warn_in(
-        &mut tx,
-        &id,
-        &auth.0.account.id,
-        &text,
-        rule.as_deref(),
-    )
-    .await?;
+    moderation::warn_in(&mut tx, &id, &auth.0.account.id, &text, rule.as_deref()).await?;
     moderation::audit_in(
         &mut tx,
         &auth.0.account.id,

@@ -11,12 +11,12 @@
 //! identities. Nothing new is signed or hashed here.
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, Method, header};
+use axum::http::{header, HeaderMap, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use nodus_server_federation::{
-    PreparedRequest, parse_header, signing_string, verify_digest, verify_prepared,
+    parse_header, signing_string, verify_digest, verify_prepared, PreparedRequest,
 };
 
 use crate::activitypub::{ensure_domain_allowed, validate_remote_url};

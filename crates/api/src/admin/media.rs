@@ -69,7 +69,9 @@ async fn list(
 ) -> ApiResult<Json<Vec<QuarantinedMediaDto>>> {
     auth.require_admin("admin:read")?;
     let rows = media::quarantined(state.store().pool(), page(query.limit)).await?;
-    Ok(Json(rows.into_iter().map(QuarantinedMediaDto::from).collect()))
+    Ok(Json(
+        rows.into_iter().map(QuarantinedMediaDto::from).collect(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,9 +134,14 @@ async fn decide(
         }
         // Releasing means the post was fine, so the report is dismissed; deleting means it
         // was not, so the report keeps `action_taken`. Either way one report, one decision.
-        reports_resolved =
-            moderation::resolve_reports_for_status(pool, status_id, &auth.0.account.id, &note, !body.release)
-                .await?;
+        reports_resolved = moderation::resolve_reports_for_status(
+            pool,
+            status_id,
+            &auth.0.account.id,
+            &note,
+            !body.release,
+        )
+        .await?;
     }
 
     audit_write_detail(

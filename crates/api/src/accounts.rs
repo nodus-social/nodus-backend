@@ -473,7 +473,10 @@ pub async fn export(
         pool,
         &account.id,
         query.max_id.as_deref(),
-        query.limit.map_or(i64::from(nodus_server_store::statuses::EXPORT_PAGE_MAX), i64::from),
+        query.limit.map_or(
+            i64::from(nodus_server_store::statuses::EXPORT_PAGE_MAX),
+            i64::from,
+        ),
     )
     .await?;
     let status_ids: Vec<String> = page.items.iter().map(|row| row.id.clone()).collect();

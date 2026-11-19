@@ -222,16 +222,28 @@ async fn a_near_hash_matches_and_one_outside_the_reach_does_not() {
         upload_set(pool, SET_NAME, &[format!("{listed:016x}")]).await;
 
         let near_status = create_status(pool, &author, "near", "public", &[], &[]).await;
-        let near_media = attach_remote(pool, &near_status, &author, "https://peer.test/near.png").await;
-        media::set_hashes(pool, &near_media, &hex_sha("near"), Some(&format!("{near:016x}")))
-            .await
-            .expect("record the near hash");
+        let near_media =
+            attach_remote(pool, &near_status, &author, "https://peer.test/near.png").await;
+        media::set_hashes(
+            pool,
+            &near_media,
+            &hex_sha("near"),
+            Some(&format!("{near:016x}")),
+        )
+        .await
+        .expect("record the near hash");
 
         let far_status = create_status(pool, &author, "far", "public", &[], &[]).await;
-        let far_media = attach_remote(pool, &far_status, &author, "https://peer.test/far.png").await;
-        media::set_hashes(pool, &far_media, &hex_sha("far"), Some(&format!("{far:016x}")))
-            .await
-            .expect("record the far hash");
+        let far_media =
+            attach_remote(pool, &far_status, &author, "https://peer.test/far.png").await;
+        media::set_hashes(
+            pool,
+            &far_media,
+            &hex_sha("far"),
+            Some(&format!("{far:016x}")),
+        )
+        .await
+        .expect("record the far hash");
 
         let distance = (near ^ listed).count_ones();
         assert!(distance <= PERCEPTUAL_DISTANCE_MAX, "the test's premise");
@@ -280,14 +292,8 @@ async fn releasing_puts_the_post_back_and_closes_the_report() {
         assert!(!on_public_timeline(&app, &status_id).await);
 
         // Staff see the match, named, before they decide.
-        let (status, body) = send(
-            &app,
-            &token,
-            "GET",
-            "/api/v1/admin/media/quarantined",
-            None,
-        )
-        .await;
+        let (status, body) =
+            send(&app, &token, "GET", "/api/v1/admin/media/quarantined", None).await;
         assert_eq!(status, 200, "queue: {body}");
         assert!(
             body.contains(SET_NAME) && body.contains(&media_id),
@@ -317,8 +323,10 @@ async fn releasing_puts_the_post_back_and_closes_the_report() {
         assert!(report.is_none(), "the release closes the queue entry");
         let entries = audit_actions(pool, &media_id).await;
         assert!(
-            entries.iter().any(|(action, detail)| action == "release_media_quarantine"
-                && detail["reason"] == "it is a stock photo of a fence"),
+            entries
+                .iter()
+                .any(|(action, detail)| action == "release_media_quarantine"
+                    && detail["reason"] == "it is a stock photo of a fence"),
             "the decision is written down: {entries:?}"
         );
     })
@@ -357,7 +365,10 @@ async fn deleting_removes_the_attachment_and_keeps_the_report_resolved() {
         assert_eq!(status, 200, "delete: {body}");
 
         assert!(
-            media::by_id(pool, &media_id).await.expect("read media").is_none(),
+            media::by_id(pool, &media_id)
+                .await
+                .expect("read media")
+                .is_none(),
             "the attachment is gone"
         );
         assert!(

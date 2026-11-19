@@ -298,8 +298,7 @@ async fn a_queued_activity_arrives_signed_and_is_marked_delivered() {
             digest,
             format!(
                 "SHA-256={}",
-                base64::engine::general_purpose::STANDARD
-                    .encode(Sha256::digest(body.as_bytes()))
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body.as_bytes()))
             ),
             "the digest has to cover the bytes on the wire"
         );

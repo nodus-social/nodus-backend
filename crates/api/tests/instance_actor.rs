@@ -20,7 +20,10 @@ use support::{instance_config, run_db_test};
 
 fn key() -> (FederationKey, String) {
     let private = rsa::RsaPrivateKey::new(&mut OsRng, 2048).expect("key");
-    let pem = private.to_pkcs8_pem(LineEnding::LF).expect("pem").to_string();
+    let pem = private
+        .to_pkcs8_pem(LineEnding::LF)
+        .expect("pem")
+        .to_string();
     let key = FederationKey::from_pem(&instance_config(), &pem).expect("federation key");
     (key, pem)
 }
@@ -44,7 +47,11 @@ async fn get(app: &axum::Router, uri: &str) -> (StatusCode, String, String) {
         .await
         .expect("body")
         .to_bytes();
-    (status, content_type, String::from_utf8_lossy(&bytes).into_owned())
+    (
+        status,
+        content_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
 }
 
 #[tokio::test]
@@ -74,11 +81,8 @@ async fn the_instance_actor_publishes_the_key_the_signer_names() {
                 .as_str()
                 .expect("preferredUsername")
         );
-        let (status, _content_type, body) = get(
-            &app,
-            &format!("/.well-known/webfinger?resource={handle}"),
-        )
-        .await;
+        let (status, _content_type, body) =
+            get(&app, &format!("/.well-known/webfinger?resource={handle}")).await;
         assert_eq!(status, StatusCode::OK, "{handle}: {body}");
         assert_eq!(document["url"], "https://social.test/actor");
         assert_eq!(document["inbox"], "https://social.test/inbox");
@@ -149,7 +153,10 @@ async fn the_instance_actor_handle_resolves_to_the_actor_document() {
             assert_eq!(content_type, "application/jrd+json", "{resource}");
 
             let jrd: Value = serde_json::from_str(&body).expect("json");
-            assert_eq!(jrd["subject"], "acct:instance.actor@social.test", "{resource}");
+            assert_eq!(
+                jrd["subject"], "acct:instance.actor@social.test",
+                "{resource}"
+            );
             assert_eq!(
                 jrd["aliases"],
                 serde_json::json!(["https://social.test/actor"]),
@@ -172,7 +179,10 @@ async fn an_unknown_handle_still_404s() {
     run_db_test(|store, _app| async move {
         let app = root_router(AppState::new(store.clone(), instance_config()));
 
-        for resource in ["acct:nobody@social.test", "acct:instance.actor@elsewhere.test"] {
+        for resource in [
+            "acct:nobody@social.test",
+            "acct:instance.actor@elsewhere.test",
+        ] {
             let uri = format!(
                 "/.well-known/webfinger?resource={}",
                 url::form_urlencoded::byte_serialize(resource.as_bytes()).collect::<String>()

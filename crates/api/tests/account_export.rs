@@ -42,7 +42,8 @@ async fn a_populated_account_exports_its_statuses_and_its_moderation_history() {
     run_db_test(|store, app| async move {
         let pool = store.pool();
         let id = create_account(pool, "export_subject").await;
-        let status = create_status(pool, &id, "a post that is mine to take", "public", &[], &[]).await;
+        let status =
+            create_status(pool, &id, "a post that is mine to take", "public", &[], &[]).await;
         let (moderator, _) = staff(pool, "export_moderator").await;
 
         // The three records moderation leaves: an audit row (the action), a strike (what
@@ -104,7 +105,10 @@ async fn a_populated_account_exports_its_statuses_and_its_moderation_history() {
             "an action without its reason is not an export"
         );
         assert_eq!(moderation["strikes"][0]["action"], "silence");
-        assert_eq!(moderation["strikes"][0]["reason"], "kept posting the same slur");
+        assert_eq!(
+            moderation["strikes"][0]["reason"],
+            "kept posting the same slur"
+        );
         assert_eq!(
             moderation["warnings"][0]["moderation_reason"], "first and only warning",
             "a warning carries the sentence it was issued with"

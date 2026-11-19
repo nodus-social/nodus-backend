@@ -212,7 +212,11 @@ async fn vote(app: &Router, poll_id: &str, token: &str) -> (StatusCode, Value) {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
     let response = app
         .clone()
-        .oneshot(request.body(Body::from("choices[]=0")).expect("build request"))
+        .oneshot(
+            request
+                .body(Body::from("choices[]=0"))
+                .expect("build request"),
+        )
         .await
         .expect("route request");
     let status = response.status();
@@ -259,7 +263,14 @@ async fn several_voters_are_one_line_naming_the_latest() {
         assert_eq!(from, voters[2]);
         assert_eq!(count, 3);
 
-        let (code, body) = call(&app, "GET", "/api/v1/notifications", Some(&author_token), None).await;
+        let (code, body) = call(
+            &app,
+            "GET",
+            "/api/v1/notifications",
+            Some(&author_token),
+            None,
+        )
+        .await;
         assert_eq!(code, StatusCode::OK);
         let lines = body.as_array().expect("a page of notifications");
         assert_eq!(lines.len(), 1, "{body}");

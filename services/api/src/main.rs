@@ -33,12 +33,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // serves requests: one pool, one set of signing keys, and no second deployable to
     // keep in step with this one.
     let federation = FederationKey::from_env(&config.instance);
-    let state = AppState::with_federation(
-        store.clone(),
-        config.instance.clone(),
-        federation.clone(),
-    )
-    .with_authorized_fetch(config.authorized_fetch);
+    let state =
+        AppState::with_federation(store.clone(), config.instance.clone(), federation.clone())
+            .with_authorized_fetch(config.authorized_fetch);
     tokio::spawn(nodus_server_api::schedules::run(state.clone()));
     // The subscription sweep lives here rather than in the pruning worker: it is an
     // outbound fetch, and the outbound guard, the client and the import path all live in

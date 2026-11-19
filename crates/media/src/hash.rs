@@ -121,7 +121,10 @@ mod tests {
             let decoded = image::load_from_memory(&png).expect("decode");
             let mut out = Vec::new();
             decoded
-                .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut out),
+                    image::ImageFormat::Jpeg,
+                )
                 .expect("encode jpeg");
             out
         };
