@@ -10,6 +10,7 @@
 
 mod accounts;
 mod appeals;
+mod escalation;
 /// The block-list transfer surface, which also owns the subscription sweep.
 pub mod blocklist;
 mod federation;
@@ -873,6 +874,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .merge(reports::router())
         .merge(accounts::router())
+        .merge(escalation::router())
         .merge(appeals::router())
         .merge(blocklist::router())
         .merge(federation::router())

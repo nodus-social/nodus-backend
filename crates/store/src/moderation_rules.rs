@@ -458,8 +458,10 @@ pub async fn screen(
                 &moderation::Notice {
                     reason: &comment,
                     rule: Some(&rule.name),
+                    rule_id: Some(&rule.id),
                     actor_id: None,
                     expires_at: None,
+                    strike: None,
                 },
             )
             .await?;

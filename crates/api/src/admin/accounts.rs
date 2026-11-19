@@ -53,6 +53,12 @@ pub struct AdminAccountDto {
     pub lossless_images: bool,
     /// Whether this account's video is stored at full size.
     pub lossless_videos: bool,
+    /// Live strikes inside the policy window. A moderator reads this instead of opening the
+    /// audit log to reconstruct how many times this account has been here.
+    pub strike_count: i64,
+    /// What the escalation policy would do next, and at how many strikes: `null` when the
+    /// policy is disabled or the account already sits at its top step.
+    pub next_escalation: Option<serde_json::Value>,
     pub account: AccountDto,
 }
 
@@ -77,6 +83,8 @@ impl AdminAccountDto {
             notes_count: row.notes,
             lossless_images: row.account.lossless_images_default,
             lossless_videos: row.account.lossless_videos_default,
+            strike_count: row.strike_count,
+            next_escalation: row.next_escalation,
             account,
         }
     }
@@ -303,8 +311,10 @@ async fn action(
             reason: form.text.trim(),
             // A moderator's own click names no rule; only the rule engine does.
             rule: None,
+            rule_id: None,
             actor_id: Some(&auth.0.account.id),
             expires_at: None,
+            strike: None,
         },
     )
     .await?
@@ -747,8 +757,10 @@ async fn apply_bulk_one(
         &Notice {
             reason,
             rule: None,
+            rule_id: None,
             actor_id: Some(&auth.0.account.id),
             expires_at: None,
+            strike: None,
         },
     )
     .await?

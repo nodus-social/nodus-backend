@@ -20,6 +20,7 @@ pub mod collections;
 pub mod conversations;
 pub mod delivery;
 pub mod discovery;
+pub mod escalation;
 pub mod events;
 pub mod external_ids;
 pub mod filters;

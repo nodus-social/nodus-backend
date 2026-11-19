@@ -297,8 +297,10 @@ pub async fn decide(
             &moderation::Notice {
                 reason: note.unwrap_or_default(),
                 rule: None,
+                rule_id: None,
                 actor_id: Some(decided_by),
                 expires_at: None,
+                strike: None,
             },
         )
         .await?;

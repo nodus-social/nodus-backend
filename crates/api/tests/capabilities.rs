@@ -158,6 +158,11 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/admin/warning_presets",
         owner: Owner::Api,
     },
+    Capability {
+        name: "escalation",
+        path: "/api/v1/admin/escalation",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -170,6 +175,7 @@ const CAPABILITIES: &[Capability] = &[
 const MODULE_FEATURES: &[(&str, &[&str])] = &[
     ("accounts", &["admin"]),
     ("appeals", &["appeals"]),
+    ("escalation", &["escalation"]),
     ("blocklist", &["block_lists"]),
     ("federation", &["remote_blocks", "remote_accounts"]),
     ("media", &["media_quarantine"]),
@@ -190,6 +196,10 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/admin/accounts.rs"),
     ),
     ("admin/appeals.rs", include_str!("../src/admin/appeals.rs")),
+    (
+        "admin/escalation.rs",
+        include_str!("../src/admin/escalation.rs"),
+    ),
     (
         "admin/blocklist.rs",
         include_str!("../src/admin/blocklist.rs"),

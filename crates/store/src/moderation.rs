@@ -566,7 +566,24 @@ pub struct AdminAccountRow {
     pub open_reports: i64,
     /// Private moderator notes on this account.
     pub notes: i64,
+    /// Live strikes: the count escalation reads, so the console shows the same number the
+    /// write path acts on.
+    pub strike_count: i64,
+    /// The next rung of the policy, as `{strikes, action, duration_days}`, or `null` when the
+    /// policy is off or already at its top. Computed here so every read surface agrees.
+    pub next_escalation: Option<Value>,
 }
+
+/// The strike columns appended to both admin account queries: one definition, so the list and
+/// the detail cannot disagree about how many strikes an account has.
+const STRIKE_COLUMNS: &str = "(SELECT count(*) FROM moderation_strike s \
+         WHERE s.account_id = a.id AND s.expires_at > now())::bigint AS strike_count, \
+     (SELECT step FROM escalation_policy p \
+         CROSS JOIN LATERAL jsonb_array_elements(p.steps) AS step \
+         WHERE p.enabled \
+             AND (step->>'strikes')::bigint > (SELECT count(*) FROM moderation_strike s \
+                 WHERE s.account_id = a.id AND s.expires_at > now()) \
+         ORDER BY (step->>'strikes')::bigint LIMIT 1) AS next_escalation";
 
 /// The account list, narrowed by anything the console can show: origin, standing,
 /// a username/email fragment, or whether the account is staff.
@@ -621,7 +638,8 @@ pub async fn admin_accounts(
         "SELECT {ACCOUNT_COLUMNS_ALIASED}, c.email::text AS email, \
              (SELECT count(*) FROM report r \
                  WHERE r.target_account_id = a.id AND r.state = 'open')::bigint AS open_reports, \
-             (SELECT count(*) FROM moderator_note n WHERE n.account_id = a.id)::bigint AS notes \
+             (SELECT count(*) FROM moderator_note n WHERE n.account_id = a.id)::bigint AS notes, \
+             {STRIKE_COLUMNS} \
          FROM account a \
          LEFT JOIN account_credential c ON c.account_id = a.id \
          WHERE ($1::boolean IS NULL OR a.local = $1) \
@@ -671,7 +689,8 @@ pub async fn admin_account_in(
         "SELECT {ACCOUNT_COLUMNS_ALIASED}, c.email::text AS email, \
              (SELECT count(*) FROM report r \
                  WHERE r.target_account_id = a.id AND r.state = 'open')::bigint AS open_reports, \
-             (SELECT count(*) FROM moderator_note n WHERE n.account_id = a.id)::bigint AS notes \
+             (SELECT count(*) FROM moderator_note n WHERE n.account_id = a.id)::bigint AS notes, \
+             {STRIKE_COLUMNS} \
          FROM account a \
          LEFT JOIN account_credential c ON c.account_id = a.id \
          WHERE a.id = $1"
@@ -737,11 +756,16 @@ pub struct Notice<'a> {
     pub reason: &'a str,
     /// The rule that caused the decision, when a rule rather than a person decided.
     pub rule: Option<&'a str>,
+    /// The rule's id, when there is one, so the strike it leaves points at the rule itself
+    /// rather than only at the name.
+    pub rule_id: Option<&'a str>,
     /// Who decided; `None` when the instance did, which is recorded as the account itself
     /// because `notification.from_account_id` has no "nobody" value.
     pub actor_id: Option<&'a str>,
     /// When the restriction ends, if it has an end.
     pub expires_at: Option<DateTime<Utc>>,
+    /// The strike that brought this action, when escalation rather than a person did.
+    pub strike: Option<i64>,
 }
 
 /// The same enforcement on a caller-owned connection, so a batch can share a transaction.
@@ -778,6 +802,43 @@ pub async fn apply_action_noted_in(
     action: Action,
     notice: &Notice<'_>,
 ) -> Result<Option<AccountRow>, sqlx::Error> {
+    let row = apply_core_in(conn, account_id, action, notice).await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    // Only a restriction is an offence. Lifting one, approving a registration and enabling
+    // an account are the instance relenting, and a relenting instance must not escalate the
+    // person it just let back in.
+    if !matches!(action, Action::Silence | Action::Suspend) {
+        return Ok(Some(row));
+    }
+    // Every restriction leaves a strike, and every strike is a chance to escalate. Both sit
+    // here rather than in each caller because this is the one place a silence or suspension
+    // is applied: a rule, a bulk action and a single click all pass through it.
+    let policy = crate::escalation::policy_in(&mut *conn).await?;
+    crate::escalation::record_strike_in(
+        &mut *conn,
+        account_id,
+        notice.rule_id,
+        action.as_str(),
+        notice.reason,
+        policy.window_days,
+    )
+    .await?;
+    crate::escalation::escalate_in(&mut *conn, account_id, notice.actor_id, &policy).await?;
+    Ok(Some(row))
+}
+
+/// The account change and the sentence explaining it, with no strike and no escalation.
+///
+/// Escalation calls this: its action is a consequence of a strike, not another offence.
+/// Counting it again would let one silence suspend somebody on the next click.
+pub(crate) async fn apply_core_in(
+    conn: &mut PgConnection,
+    account_id: &str,
+    action: Action,
+    notice: &Notice<'_>,
+) -> Result<Option<AccountRow>, sqlx::Error> {
     let before = sqlx::query_as::<_, PreviousState>(
         "SELECT approved, silenced_at, suspended_at FROM account WHERE id = $1",
     )
@@ -804,14 +865,7 @@ pub async fn apply_action_noted_in(
     // already told about.
     if let Some(row) = &row {
         if before.is_some_and(|before| before.changes(action)) {
-            notice_in(
-                conn,
-                account_id,
-                action.as_str(),
-                &sentence(action, notice),
-                notice,
-            )
-            .await?;
+            notice_for(conn, account_id, action.as_str(), notice).await?;
         }
         let _ = row;
     }
@@ -856,25 +910,74 @@ pub async fn warn_in(
     text: &str,
     rule: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    notice_in(
+    notice_for(
         conn,
         account_id,
         WARN,
-        text,
         &Notice {
             reason: text,
             rule,
+            rule_id: None,
             actor_id: Some(actor_id),
             expires_at: None,
+            strike: None,
         },
     )
-    .await
+    .await?;
+    // A warning is a strike too: a fifth "please stop" that nobody counted is how an account
+    // reaches a silence with no history behind it.
+    let policy = crate::escalation::policy_in(&mut *conn).await?;
+    crate::escalation::record_strike_in(
+        &mut *conn,
+        account_id,
+        None,
+        WARN,
+        text,
+        policy.window_days,
+    )
+    .await?;
+    crate::escalation::escalate_in(&mut *conn, account_id, Some(actor_id), &policy).await?;
+    Ok(())
 }
 
 /// The action string a warning is recorded under. A warning is deliberately *not* an
 /// [`Action`]: nothing about the account changes, so there is no state transition for it
 /// to share the match arms of, and the type should not pretend otherwise.
 pub const WARN: &str = "warn";
+
+/// Writes the one notification a decision produces, from the facts already in hand.
+pub(crate) async fn notice_for(
+    conn: &mut PgConnection,
+    account_id: &str,
+    action: &str,
+    notice: &Notice<'_>,
+) -> Result<(), sqlx::Error> {
+    let sentence = match action {
+        WARN => {
+            let reason = notice.reason.trim();
+            if reason.is_empty() {
+                "You were warned.".to_owned()
+            } else {
+                format!("You were warned. Reason: {reason}")
+            }
+        }
+        _ => sentence_for(action, notice),
+    };
+    let sentence = match notice.strike {
+        Some(strike) => format!("{sentence} (strike {strike} of the escalation policy)"),
+        None => sentence,
+    };
+    notice_in(conn, account_id, action, &sentence, notice).await
+}
+
+/// The sentence an [`Action`] produces; the warning has its own above.
+pub(crate) fn sentence_for(action: &str, notice: &Notice<'_>) -> String {
+    let parsed = Action::parse(action);
+    match parsed {
+        Some(action) => sentence(action, notice),
+        None => notice.reason.trim().to_owned(),
+    }
+}
 
 /// The one sentence a client without a moderation UI shows, plus the structured facts
 /// beside it in the same row.
