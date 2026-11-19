@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod hash;
 pub mod process;
 pub mod serve;
 

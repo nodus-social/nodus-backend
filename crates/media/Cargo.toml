@@ -10,6 +10,7 @@ publish = false
 axum = { workspace = true }
 nodus-server-store = { path = "../store" }
 serde.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 blurhash = "0.2.3"

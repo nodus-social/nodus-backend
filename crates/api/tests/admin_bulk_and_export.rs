@@ -336,7 +336,7 @@ async fn bulk_resolve_closes_the_selected_reports_and_audits_each_one() {
             let row = moderation::create_report(
                 pool,
                 &NewReport {
-                    account_id: &reporter,
+                    account_id: Some(&reporter),
                     target_account_id: &target,
                     status_ids: &[],
                     category,

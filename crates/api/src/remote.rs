@@ -226,6 +226,81 @@ fn unavailable() -> ApiError {
     ApiError::new(StatusCode::BAD_GATEWAY, "That instance did not answer.")
 }
 
+/// The largest media file the content-set check will pull into memory.
+///
+/// The bytes are hashed and dropped, so this is a work budget rather than storage: eight
+/// megabytes covers a photo at any sane size and refuses a video that would spend the whole
+/// ingest window on a check nobody asked for.
+const MEDIA_FETCH_MAX: usize = 8 * 1024 * 1024;
+
+/// A media host that has not answered in this long is not going to answer usefully.
+const MEDIA_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Reads a remote attachment, so the content-set check can hash it.
+///
+/// The same client as every other outbound read: the host is resolved here, checked against
+/// the private-address guard, and the connection pinned to the address that was checked.
+/// Only `https`, only names (`client_for` refuses an address literal), and no redirects —
+/// the target of a redirect was never checked. Every failure is `None`, because a media
+/// host that is down is not a reason to refuse a post; it only means we cannot look.
+pub(crate) async fn fetch_media_bytes(url: &str) -> Option<Vec<u8>> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let client = match client_for(&host).await {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!(%host, message = error.message(), "refused a media fetch");
+            return None;
+        }
+    };
+    let request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "image/*, video/*, */*;q=0.1");
+    let mut response = match tokio::time::timeout(MEDIA_FETCH_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::debug!(%url, %error, "media fetch failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!(%url, "media fetch timed out");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::debug!(%url, status = %response.status(), "media host refused the read");
+        return None;
+    }
+    if response.content_length().unwrap_or(0) > MEDIA_FETCH_MAX as u64 {
+        tracing::debug!(%url, "media is larger than the check will read");
+        return None;
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        let chunk = match tokio::time::timeout(MEDIA_FETCH_TIMEOUT, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                tracing::debug!(%url, %error, "media read failed midway");
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!(%url, "media read timed out midway");
+                return None;
+            }
+        };
+        if bytes.len() + chunk.len() > MEDIA_FETCH_MAX {
+            tracing::debug!(%url, "media grew past the size the check will read");
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
+}
+
 /// Finds the actor document for `@user@host` through WebFinger.
 async fn webfinger(user: &str, host: &str, signer: Option<&Signer>) -> ApiResult<String> {
     let resource = url::form_urlencoded::byte_serialize(format!("acct:{user}@{host}").as_bytes())

@@ -10,6 +10,7 @@
 
 mod accounts;
 mod federation;
+mod media;
 mod reports;
 mod scanners;
 mod topology;
@@ -868,6 +869,7 @@ pub fn router() -> Router<AppState> {
         .merge(accounts::router())
         .merge(federation::router())
         .merge(scanners::router())
+        .merge(media::router())
         .merge(topology::router())
         .route("/api/v1/admin/meta", get(meta))
         .route("/api/v1/admin/overview", get(overview))

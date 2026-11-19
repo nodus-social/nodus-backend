@@ -22,6 +22,7 @@ pub mod dto;
 pub mod error;
 pub mod filters;
 pub mod follow_requests;
+pub mod guard;
 pub mod highlights;
 pub mod html;
 pub mod hydrate;

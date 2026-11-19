@@ -8,6 +8,13 @@ use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
 /// A row of `media_attachment`.
+/// The flags are a row's state, not a bag of options: whether the bytes stayed on the
+/// peer, whether the author marked it sensitive, whether it is lossless, and whether the
+/// original was pruned are four independent facts about one attachment.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "a database row, not an option struct"
+)]
 #[derive(Debug, Clone, FromRow)]
 pub struct MediaRow {
     pub id: String,
@@ -26,14 +33,26 @@ pub struct MediaRow {
     pub processing_progress: i16,
     pub processing_error: Option<String>,
     pub original_pruned: bool,
+    /// True when the bytes stayed on the peer and only a link is stored here.
+    pub remote: bool,
     /// Where a remote attachment lives when we never copied the bytes.
     pub remote_url: Option<String>,
+    /// SHA-256 of the bytes as they arrived, lowercase hex; null until the check ran.
+    pub content_hash: Option<String>,
+    /// 64-bit dHash of the decoded image, 16 hex characters; null for anything that is
+    /// not a picture we could decode.
+    pub perceptual_hash: Option<String>,
+    /// 'none', 'quarantined' or 'released'. See `0036_media_hashes.sql`.
+    pub quarantine_state: String,
+    /// The content set that matched, when one did.
+    pub quarantine_set: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
 const MEDIA_COLUMNS: &str = "id, account_id, status_id, digest, content_type, size, width, \
      height, blurhash, description, sensitive, lossless, processing_state, processing_progress, \
-     processing_error, original_pruned, NULLIF(meta->>'url', '') AS remote_url, created_at";
+     processing_error, original_pruned, remote, NULLIF(meta->>'url', '') AS remote_url, \
+     content_hash, perceptual_hash, quarantine_state, quarantine_set, created_at";
 
 /// Inserts an unattached upload.
 pub async fn insert(pool: &PgPool, media: &MediaRow) -> Result<(), sqlx::Error> {
@@ -157,6 +176,17 @@ pub async fn replace_remote(
     attachments: &[RemoteAttachment<'_>],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // A moderator's release outlives the peer's edit: the state travels with the URL it was
+    // decided about, so an `Update` that resends the same picture does not quarantine it
+    // again. Without this the release would last until the author edited their post.
+    let previous: Vec<(String, String)> = sqlx::query_as(
+        "SELECT meta->>'url' AS url, quarantine_state FROM media_attachment \
+         WHERE status_id = $1 AND remote AND meta->>'url' IS NOT NULL",
+    )
+    .bind(status_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let carried: std::collections::HashMap<String, String> = previous.into_iter().collect();
     sqlx::query("DELETE FROM media_attachment WHERE status_id = $1 AND remote")
         .bind(status_id)
         .execute(&mut *tx)
@@ -165,9 +195,9 @@ pub async fn replace_remote(
         sqlx::query(
             "INSERT INTO media_attachment (id, account_id, status_id, digest, content_type, \
                  size, width, height, blurhash, description, sensitive, remote, \
-                 processing_state, processing_progress, meta, created_at) \
+                 processing_state, processing_progress, meta, quarantine_state, created_at) \
              VALUES ($1, $2, $3, $4, $5, 0, $6, $7, $8, $9, $10, true, 'ready', 100, \
-                 jsonb_build_object('url', $11::text), now())",
+                 jsonb_build_object('url', $11::text), $12, now())",
         )
         .bind(nodus_server_core::Id::new().to_string())
         .bind(account_id)
@@ -180,6 +210,11 @@ pub async fn replace_remote(
         .bind(attachment.description)
         .bind(sensitive)
         .bind(attachment.url)
+        .bind(
+            carried
+                .get(attachment.url)
+                .map_or("none", String::as_str),
+        )
         .execute(&mut *tx)
         .await?;
     }
@@ -425,6 +460,90 @@ pub async fn original_digest_referenced(pool: &PgPool, digest: &str) -> Result<b
     Ok(row.0 > 0)
 }
 
+/// Records what the accepted bytes hashed to.
+///
+/// Called once per attachment, right after the fetch that produced them; the hash is the
+/// only thing kept, the bytes stay on the peer.
+pub async fn set_hashes(
+    pool: &PgPool,
+    id: &str,
+    content_hash: &str,
+    perceptual_hash: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE media_attachment SET content_hash = $1, perceptual_hash = $2 WHERE id = $3",
+    )
+    .bind(content_hash)
+    .bind(perceptual_hash)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Marks one attachment as matched by a named content set.
+///
+/// Only an unquarantined row moves: a second match on a picture a moderator already
+/// released must not put it back in the queue. Returns whether this call changed
+/// anything, so the caller can avoid opening a duplicate report.
+pub async fn quarantine(pool: &PgPool, id: &str, set: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE media_attachment SET quarantine_state = 'quarantined', quarantine_set = $2 \
+         WHERE id = $1 AND quarantine_state = 'none'",
+    )
+    .bind(id)
+    .bind(set)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Clears a quarantine, keeping the record that one happened.
+pub async fn release_quarantine(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE media_attachment SET quarantine_state = 'released' \
+         WHERE id = $1 AND quarantine_state = 'quarantined'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// How many attachments of a status are still hidden, so the status itself can be
+/// un-hidden only when the last one is cleared.
+pub async fn quarantined_count(pool: &PgPool, status_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM media_attachment \
+         WHERE status_id = $1 AND quarantine_state = 'quarantined'",
+    )
+    .bind(status_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Every attachment a content set has acted on, newest first.
+pub async fn quarantined(pool: &PgPool, limit: i64) -> Result<Vec<MediaRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {MEDIA_COLUMNS} FROM media_attachment \
+         WHERE quarantine_state <> 'none' ORDER BY created_at DESC LIMIT $1"
+    );
+    sqlx::query_as::<_, MediaRow>(&sql)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+/// Removes an attachment row for good. Variants go with it (`ON DELETE CASCADE`); there is
+/// no original to unlink, because a federated attachment never had one here.
+pub async fn delete(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM media_attachment WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +589,11 @@ mod tests {
                 processing_progress: 50,
                 processing_error: None,
                 original_pruned: false,
+                remote: false,
+                content_hash: None,
+                perceptual_hash: None,
+                quarantine_state: "none".to_owned(),
+                quarantine_set: None,
                 remote_url: None,
                 created_at: now,
             },
@@ -605,6 +729,11 @@ mod tests {
                     processing_progress: 100,
                     processing_error: None,
                     original_pruned: false,
+                    remote: false,
+                    content_hash: None,
+                    perceptual_hash: None,
+                    quarantine_state: "none".to_owned(),
+                    quarantine_set: None,
                     remote_url: None,
                     created_at: old,
                 },

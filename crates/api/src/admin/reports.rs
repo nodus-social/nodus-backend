@@ -53,7 +53,12 @@ pub(super) async fn report_dto(state: &AppState, row: ReportRow) -> ApiResult<Re
             hydrated.push(crate::statuses::dto(state, &status, None).await?);
         }
     }
-    let reporter = accounts::by_id(pool, &row.account_id).await?;
+    // The instance files some reports itself (a content-set match), so a report may have
+    // no reporter account; the console renders the field as optional either way.
+    let reporter = match row.account_id.as_deref() {
+        Some(id) => accounts::by_id(pool, id).await?,
+        None => None,
+    };
     let target = accounts::by_id(pool, &row.target_account_id).await?;
     let assigned = match row.assigned_account_id.as_deref() {
         Some(id) => accounts::by_id(pool, id).await?,
@@ -271,7 +276,7 @@ async fn create(
     let row = moderation::create_report(
         state.store().pool(),
         &NewReport {
-            account_id: &auth.0.account.id,
+            account_id: Some(&auth.0.account.id),
             target_account_id: &target.id,
             status_ids: &status_ids,
             category,

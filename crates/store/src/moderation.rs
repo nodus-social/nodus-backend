@@ -20,8 +20,8 @@ const REPORT_COLUMNS: &str = "id, account_id, target_account_id, status_ids, cat
 #[derive(Debug, Clone, FromRow)]
 pub struct ReportRow {
     pub id: String,
-    /// The account that filed the report.
-    pub account_id: String,
+    /// The account that filed the report; null when the instance filed it itself.
+    pub account_id: Option<String>,
     /// The account the report is about.
     pub target_account_id: String,
     pub status_ids: Vec<String>,
@@ -40,7 +40,10 @@ pub struct ReportRow {
 
 #[derive(Debug, Clone)]
 pub struct NewReport<'a> {
-    pub account_id: &'a str,
+    /// The reader who pressed "report"; `None` when the instance opened it, which is what
+    /// a content-set match does. Naming an account that did not act would put words in its
+    /// mouth, and the console already renders the reporter as optional.
+    pub account_id: Option<&'a str>,
     pub target_account_id: &'a str,
     pub status_ids: &'a [String],
     pub category: &'a str,
@@ -78,6 +81,49 @@ pub async fn report_for_activity(
         .bind(activity_uri)
         .fetch_optional(pool)
         .await
+}
+
+/// Whether the report queue already holds an open report about this post.
+///
+/// The ingest check asks before opening one, so a status whose attachment is fetched again
+/// does not fill the queue with duplicates of the same match.
+pub async fn open_report_for_status(
+    pool: &PgPool,
+    status_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM report WHERE state = 'open' AND $1 = ANY(status_ids) \
+         ORDER BY created_at ASC LIMIT 1",
+    )
+    .bind(status_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Closes every open report about a post, which is what clearing a quarantine does.
+///
+/// One decision covers the post: two moderators looking at the same queue entry must not
+/// have to resolve it twice, and a report left open about media that no longer exists is a
+/// task nobody can finish.
+pub async fn resolve_reports_for_status(
+    pool: &PgPool,
+    status_id: &str,
+    actor_id: &str,
+    note: &str,
+    action_taken: bool,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE report SET state = 'resolved', action_taken = $4, action_taken_note = $3, \
+             action_taken_by_account_id = $2, action_taken_at = now(), updated_at = now() \
+         WHERE state = 'open' AND $1 = ANY(status_ids)",
+    )
+    .bind(status_id)
+    .bind(actor_id)
+    .bind(note)
+    .bind(action_taken)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// What a moderator is looking at: any combination of state, reporter, subject and
@@ -216,6 +262,28 @@ pub async fn audit(
 ) -> Result<(), sqlx::Error> {
     let mut conn = pool.acquire().await?;
     audit_in(&mut conn, actor_id, action, target_type, target_id, detail).await
+}
+
+/// The same audit row with no actor: the instance did it, not a person.
+pub async fn audit_system(
+    pool: &PgPool,
+    action: &str,
+    target_type: &str,
+    target_id: Option<&str>,
+    detail: &Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO audit_log (id, action, target_type, target_id, detail) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Id::new().to_string())
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(detail)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// The same audit row on a caller-owned connection, so an action and its entry commit

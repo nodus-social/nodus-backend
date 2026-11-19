@@ -784,7 +784,7 @@ async fn report_remote_flag(
     nodus_server_store::moderation::create_report(
         pool,
         &nodus_server_store::moderation::NewReport {
-            account_id: &remote.id,
+            account_id: Some(&remote.id),
             target_account_id: &target_account_id,
             status_ids: &status_ids,
             category: "federation",
@@ -1195,6 +1195,14 @@ async fn store_note_extras(
         &remote_attachments(note, value),
     )
     .await?;
+    // The attachments are ours to judge now that they are stored. This is the check site:
+    // `screen_status` looks only at `remote` rows, so an upload by one of our own accounts
+    // is never quarantined — it was accepted under this instance's rules and its author can
+    // answer for it. A failed check must not fail the ingest: the post is already here, and
+    // the alternative to a missed match is a delivery the peer will retry forever.
+    if let Err(error) = crate::guard::screen_status(pool, &row.id, &remote.id).await {
+        tracing::warn!(status = %row.id, %error, "inbound media check could not run");
+    }
     Ok(())
 }
 
@@ -2733,7 +2741,7 @@ mod tests {
                 1,
                 "a replayed flag must not open a second report"
             );
-            assert_eq!(reports[0].account_id, reporter.id);
+            assert_eq!(reports[0].account_id.as_deref(), Some(reporter.id.as_str()));
             assert_eq!(reports[0].target_account_id, target.id);
             assert_eq!(reports[0].comment, "spam & abuse");
         })
