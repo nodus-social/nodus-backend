@@ -39,6 +39,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         federation.clone(),
     );
     tokio::spawn(nodus_server_api::schedules::run(state.clone()));
+    // The subscription sweep lives here rather than in the pruning worker: it is an
+    // outbound fetch, and the outbound guard, the client and the import path all live in
+    // this process. One more loop on a clock, not a third service.
+    tokio::spawn(nodus_server_api::admin::blocklist::run(state.clone()));
     tokio::spawn(nodus_server_api::outbox::run(state));
 
     tracing::info!(

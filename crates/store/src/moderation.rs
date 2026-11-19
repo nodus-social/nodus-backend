@@ -296,6 +296,21 @@ pub async fn audit_in(
     target_id: Option<&str>,
     detail: &Value,
 ) -> Result<(), sqlx::Error> {
+    audit_in_as(conn, Some(actor_id), action, target_type, target_id, detail).await
+}
+
+/// The same row with the actor optional, for work no person asked for.
+///
+/// A subscription sync is applied by the instance on a clock: naming a moderator would be a
+/// lie, and an empty string is worse than a null because it sorts as a real account id.
+pub async fn audit_in_as(
+    conn: &mut PgConnection,
+    actor_id: Option<&str>,
+    action: &str,
+    target_type: &str,
+    target_id: Option<&str>,
+    detail: &Value,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO audit_log (id, actor_id, action, target_type, target_id, detail) \
          VALUES ($1, $2, $3, $4, $5, $6)",

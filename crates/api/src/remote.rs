@@ -187,6 +187,16 @@ fn trusted_private_hosts() -> &'static [String] {
 
 /// Anything about the target itself that cannot succeed, without touching the network.
 async fn client_for(host: &str) -> ApiResult<reqwest::Client> {
+    client_for_with(host, TIMEOUT).await
+}
+
+/// The same guard, with a budget of the caller's choosing.
+///
+/// A peer block list is a download, not a probe: the default eight seconds is right for
+/// asking an actor's inbox to accept a delivery, and too little to read a few thousand
+/// lines from a list host over a slow link. The address check is identical either way —
+/// only how long we are willing to wait for the body changes.
+async fn client_for_with(host: &str, timeout: Duration) -> ApiResult<reqwest::Client> {
     let addrs: Vec<_> = tokio::net::lookup_host((host, 443))
         .await
         .map_err(|_| unreachable(host))?
@@ -206,7 +216,7 @@ async fn client_for(host: &str) -> ApiResult<reqwest::Client> {
         .copied()
         .ok_or_else(|| unreachable(host))?;
     reqwest::Client::builder()
-        .timeout(TIMEOUT)
+        .timeout(timeout)
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
         .resolve(host, address)
@@ -215,6 +225,25 @@ async fn client_for(host: &str) -> ApiResult<reqwest::Client> {
             tracing::warn!(%host, %error, "could not build the outbound client");
             unavailable()
         })
+}
+
+/// The client for an `https` URL an administrator supplied, built by the same guard.
+///
+/// The scheme check lives here rather than in the handler because it is the same decision
+/// either way: what this instance is willing to talk to. `client_for_with` then resolves the
+/// host once, refuses a private answer, and pins the connection to the address it checked,
+/// so a host that answers differently on the second lookup gains nothing.
+pub(crate) async fn outbound_client(url: &str, timeout: Duration) -> ApiResult<reqwest::Client> {
+    let parsed =
+        url::Url::parse(url).map_err(|_| ApiError::unprocessable("that URL is not a URL"))?;
+    if parsed.scheme() != "https" {
+        return Err(ApiError::unprocessable("only https URLs can be fetched"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::unprocessable("that URL has no host"))?
+        .to_ascii_lowercase();
+    client_for_with(&host, timeout).await
 }
 
 fn unreachable(host: &str) -> ApiError {
