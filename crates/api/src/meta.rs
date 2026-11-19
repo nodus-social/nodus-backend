@@ -6,24 +6,33 @@
 //! opens onto a 404. One document, one list, one process: a client must not have to ask a
 //! second host what this one can do.
 
-use axum::Json;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 
-use nodus_shared::{CONTRACT_VERSION, MIN_CONTRACT_VERSION, Meta};
+use nodus_shared::{Meta, CONTRACT_VERSION, MIN_CONTRACT_VERSION};
 
 /// Capabilities this instance serves.
 ///
 /// Names are part of the contract: rename one and old clients lose the feature, because an
 /// absent name means unsupported. Additions are safe; removals and renames are not.
 ///
-/// The first three are the recommender's (`feed_accounts`, `events`, `sync_token`), whose
-/// service shares this instance; the rest are this API's own doors and panels. `batch`
-/// belongs to the nodus extension, which is also served from here.
-pub const FEATURES: [&str; 11] = [
+/// A name must describe a surface a client can actually call, and a surface with no name is
+/// a panel no console can gate on — which is how `moderation` came to mean "there are
+/// reports" while appeals, the instance rules, the spam autopilot, quarantined media and the
+/// block-list transfer were all served and all unannounced.
+///
+/// The first three are the recommender's (`feed_accounts`, `events`, `sync_token`), served by
+/// this instance's `nodus-feed` process on the same origin. The rest are answered by this
+/// API. `tests/capabilities.rs` holds the feature-to-path table and fails when a name here
+/// stops answering or a route appears that no name covers.
+pub const FEATURES: [&str; 19] = [
+    // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
+    // `/api/v1/sync/token`.
     "feed_accounts",
     "events",
     "sync_token",
+    // This API's own doors, in the order they were published.
     "admin",
     "moderation",
     "scanners",
@@ -32,6 +41,16 @@ pub const FEATURES: [&str; 11] = [
     "remote_blocks",
     "polls",
     "batch",
+    // The moderation surfaces the console could not previously see. Each one is a route
+    // group in `crate::admin` or `crate::appeals`; the comment names its first path.
+    "appeals",          // GET|POST /api/v1/appeals, GET /api/v1/admin/appeals
+    "instance_rules",   // GET|POST /api/v1/admin/rules
+    "moderation_rules", // GET|POST /api/v1/admin/moderation-rules
+    "media_quarantine", // GET /api/v1/admin/media/quarantined
+    "block_lists",      // GET /api/v1/admin/domain-blocks/export
+    "moderation_stats", // GET /api/v1/admin/stats
+    "remote_accounts",  // GET /api/v1/admin/federation/remote-accounts
+    "warnings",         // GET /api/v1/admin/warning_presets
 ];
 
 /// The capability names as owned strings, for documents that serialize their own envelope.

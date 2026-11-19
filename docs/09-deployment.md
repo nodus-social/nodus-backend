@@ -315,5 +315,5 @@ allowlist = []
 forward = {}                 # route -> upstream, limited mode only
 
 [extensions]
-enabled = ["batch", "events", "state_sync"]
+enabled = ["batch", "events", "protocol"]
 ```

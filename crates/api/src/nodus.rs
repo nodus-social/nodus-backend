@@ -134,8 +134,14 @@ async fn events_stream(
 
 /// The capability vocabulary, as `GET /api/v1/meta` publishes it.
 ///
-/// A protocol screen and a door must not disagree, so this is read from the one constant
-/// instead of keeping a second, staler list beside it.
+/// This document is a view of that one list, not a second one: `features` here is
+/// [`crate::meta::FEATURES`] verbatim, so `/api/v1/nodus/capabilities` is a subset of the
+/// same set with the same meaning — in practice, equal to it. The earlier
+/// `["batch", "events", "state_sync"]` was a second vocabulary for the same idea:
+/// `state_sync` named nothing a client could call, and none of the three told a console
+/// anything `/api/v1/meta` did not. Only `contract` is this document's own; it says which
+/// dialect answered, not what the instance can do. `tests/capabilities.rs` asserts that the
+/// two lists are the same set.
 #[derive(Debug, serde::Serialize)]
 struct CapabilitiesDto {
     contract: String,

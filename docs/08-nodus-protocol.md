@@ -20,7 +20,7 @@ The extensions exist for three things the Mastodon API cannot do well:
 ```json
 {
   "contract": "nodus-1",
-  "features": ["batch", "events", "state_sync"],
+  "features": ["feed_accounts", "events", "sync_token", "protocol", "batch"],
   "limits": {
     "batch_calls": 20,
     "batch_bytes": 1048576,
@@ -29,6 +29,24 @@ The extensions exist for three things the Mastodon API cannot do well:
   }
 }
 ```
+
+The `features` array above is an excerpt. It is not this document's list: both
+`/api/v1/nodus/capabilities` and `/api/v1/meta` publish `crates/api/src/meta.rs`
+`FEATURES` verbatim, character for character, and `crates/api/tests/capabilities.rs`
+fails when the two documents disagree or when an advertised name stops answering.
+
+### One vocabulary
+
+This document used to name its own three extensions — `["batch", "events",
+"state_sync"]` — beside the eleven names `/api/v1/meta` published. Two vocabularies for
+one meaning is what made a console's gate untrustworthy: a screen gated on
+`moderation` could not tell whether appeals existed, and `state_sync` named nothing a
+client could call (the sync routes are `/api/v1/nodus/sync/root|diff|snapshot`, and
+`protocol` is the name that covers them). So `state_sync` was withdrawn and the
+protocol document is now a *view* of the handshake list, not a second list beside it.
+Only `contract` is this document's own: it says which dialect answered, not what the
+instance can do. A client reads one list; the protocol document cannot advertise a
+feature the handshake does not, and cannot fall behind it.
 
 A client uses an extension only after seeing its feature. If it is absent, the
 client falls back to the standard endpoint, never to a degraded Nodus-only path.
