@@ -311,7 +311,9 @@ async fn staff_report_of_a_remote_account_queues_one_flag() {
         let object = flag["object"].as_array().expect("object is an array");
         assert_eq!(object[0], "https://remote.test/users/mallory");
         assert!(
-            object.iter().any(|item| item == "https://remote.test/notes/1"),
+            object
+                .iter()
+                .any(|item| item == "https://remote.test/notes/1"),
             "the reported post travels with the account: {object:?}"
         );
         let moderator_name = accounts::by_id(pool, &moderator)
@@ -367,7 +369,10 @@ async fn forwarding_twice_queues_once_and_replays_the_state() {
         assert_eq!(second_body["state"], first_body["state"]);
         assert_eq!(queued_flags(pool).await.len(), 1, "one Flag, not two");
         assert_eq!(
-            forwarded::list(pool, None, None, 50, 0).await.unwrap().len(),
+            forwarded::list(pool, None, None, 50, 0)
+                .await
+                .unwrap()
+                .len(),
             1
         );
     })
@@ -435,7 +440,10 @@ async fn a_paused_or_blocked_domain_is_refused_with_its_reason() {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(
-            body["error"].as_str().unwrap_or_default().contains("paused"),
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("paused"),
             "refusal names the pause: {body}"
         );
 
@@ -463,7 +471,10 @@ async fn a_paused_or_blocked_domain_is_refused_with_its_reason() {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert!(
-            body["error"].as_str().unwrap_or_default().contains("blocked"),
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("blocked"),
             "a block outranks the pause: {body}"
         );
         assert!(
@@ -509,7 +520,10 @@ async fn forwarded_content_carries_rules_but_not_the_reporter() {
         let flags = queued_flags(pool).await;
         let content = flags[0]["content"].as_str().expect("content is text");
         assert!(content.contains("they keep at it"), "{content}");
-        assert!(content.contains("No harassment of other members"), "{content}");
+        assert!(
+            content.contains("No harassment of other members"),
+            "{content}"
+        );
         assert!(content.contains("we warned them last week"), "{content}");
 
         let reporter_row = accounts::by_id(pool, &reporter)
@@ -554,11 +568,10 @@ async fn a_refusing_peer_marks_the_forward_gave_up() {
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 
-        let delivery_id: String =
-            sqlx::query_scalar("SELECT id FROM federation_delivery LIMIT 1")
-                .fetch_one(pool)
-                .await
-                .expect("queued delivery");
+        let delivery_id: String = sqlx::query_scalar("SELECT id FROM federation_delivery LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .expect("queued delivery");
         delivery::failed(pool, &delivery_id, 1, Some(400), "bad request", false)
             .await
             .expect("record the refusal");
@@ -571,7 +584,10 @@ async fn a_refusing_peer_marks_the_forward_gave_up() {
         assert_eq!(row.attempts, 1);
         assert!(row.last_error.unwrap_or_default().contains("bad request"));
         assert!(
-            delivery::due(pool, 10).await.expect("due deliveries").is_empty(),
+            delivery::due(pool, 10)
+                .await
+                .expect("due deliveries")
+                .is_empty(),
             "a give-up is not due again"
         );
     })

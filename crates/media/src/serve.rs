@@ -682,11 +682,7 @@ mod tests {
         std::env::temp_dir().join(format!("nodus-media-{}", ulid::Ulid::new()))
     }
 
-    fn serving_in(
-        root: &std::path::Path,
-        node: &str,
-        cluster_token: Option<&str>,
-    ) -> Arc<Serving> {
+    fn serving_in(root: &std::path::Path, node: &str, cluster_token: Option<&str>) -> Arc<Serving> {
         let store =
             nodus_server_store::Store::connect_lazy("postgres://nodus:nodus@127.0.0.1:1/nodus", 1);
         Arc::new(Serving::new(

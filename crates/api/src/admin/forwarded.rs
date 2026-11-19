@@ -95,10 +95,7 @@ fn remote_domain(target: &AccountRow) -> Option<String> {
 /// blocked. A blocked domain is checked before a paused one because the block is final.
 /// Both are checked before the inbox is read, so a refusal never echoes the account's
 /// remote addresses back to the caller.
-async fn sendable_domain(
-    state: &AppState,
-    target: &AccountRow,
-) -> ApiResult<(String, String)> {
+async fn sendable_domain(state: &AppState, target: &AccountRow) -> ApiResult<(String, String)> {
     let Some(domain) = remote_domain(target) else {
         return Err(ApiError::unprocessable(
             "only a remote account can be forwarded to its own instance; \
@@ -242,9 +239,20 @@ pub(super) async fn forward_report(
         }
     }
     let content = forward_content(state, &report, note).await?;
-    let actor = actor_of(state, &auth.0.account.username, auth.0.account.uri.as_deref());
+    let actor = actor_of(
+        state,
+        &auth.0.account.username,
+        auth.0.account.uri.as_deref(),
+    );
     let activity_uri = format!("{actor}#flags/{}", Id::new());
-    let activity = flag_activity(state, &auth.0.account, &target, &posts, &content, &activity_uri)?;
+    let activity = flag_activity(
+        state,
+        &auth.0.account,
+        &target,
+        &posts,
+        &content,
+        &activity_uri,
+    )?;
 
     // Reserve the row before queueing: the unique report id is what makes two concurrent
     // requests produce one Flag. A loser re-reads the winner's row and returns it.

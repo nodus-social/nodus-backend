@@ -29,10 +29,7 @@ const COLUMNS: &str = "id, report_id, target_domain, activity_uri, state, attemp
      last_error, created_at, updated_at";
 
 /// Whether this report was already forwarded, whatever the outcome.
-pub async fn by_report(
-    pool: &PgPool,
-    report_id: &str,
-) -> Result<Option<ForwardRow>, sqlx::Error> {
+pub async fn by_report(pool: &PgPool, report_id: &str) -> Result<Option<ForwardRow>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM report_forward WHERE report_id = $1"
     ))
