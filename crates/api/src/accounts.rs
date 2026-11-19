@@ -84,6 +84,11 @@ pub async fn update_credentials(
         &update,
     )
     .await?;
+    // Peers cache the actor document, so the change is only visible to them once it is
+    // announced. Identity is established first because the queued activity is signed with
+    // the account's key when the worker sends it.
+    let row = crate::activitypub::ensure_identity(&state, row).await?;
+    crate::outbox::deliver_actor_update(&state, &row.id).await;
     Ok(Json(AccountDto::from_row(&row, state.instance())))
 }
 

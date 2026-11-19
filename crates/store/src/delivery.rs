@@ -127,6 +127,111 @@ async fn enqueue_with(
     Ok(queued)
 }
 
+/// How long an actor `Update` stays open for more edits.
+///
+/// A profile form saves several fields at once, and a person who changes an avatar and then
+/// a display name saves twice in a row. One minute folds that burst into the single activity
+/// a peer needs, while staying short enough that an edit made later is not held behind a
+/// version the followers have already seen.
+pub const ACTOR_UPDATE_WINDOW_SECS: i64 = 60;
+
+/// Queues an actor `Update`, reusing the one already owed for this actor inside the window.
+///
+/// The newest document replaces the queued object, so the followers receive the profile as
+/// it is at the end of the burst rather than the first edit in it. A row already delivered is
+/// never rewritten: the peer has that version, and a later edit is a new activity.
+pub async fn enqueue_actor_update(
+    pool: &PgPool,
+    account_id: &str,
+    activity: &Value,
+    inboxes: &[String],
+) -> Result<u64, sqlx::Error> {
+    let mut activity = activity.clone();
+    let Some(actor) = activity
+        .get("actor")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(0);
+    };
+    let mut activity_id = activity
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    if activity_id.is_empty() || inboxes.is_empty() {
+        return Ok(0);
+    }
+
+    let blocked = crate::blocks::blocked_hosts(pool).await?;
+    let paused = crate::pauses::active_domains(pool).await?;
+    let mut inboxes = allowed_inboxes(inboxes, &blocked, &paused);
+    // The queue's `blocked_hosts` is the set of peers that told us they block this instance.
+    // A domain this instance blocked is a separate list and must stop an announcement too.
+    let domain_blocked: Vec<String> = sqlx::query_scalar(
+        "SELECT domain::text FROM instance_block WHERE severity IN ('suspend', 'silence')",
+    )
+    .fetch_all(pool)
+    .await?;
+    inboxes.retain(|inbox| {
+        crate::blocks::host_of(inbox).is_none_or(|host| !domain_blocked.contains(&host))
+    });
+    let suspended = crate::remote_moderation::suspended_inboxes(pool).await?;
+    inboxes.retain(|inbox| !suspended.contains(inbox));
+    if inboxes.is_empty() {
+        return Ok(0);
+    }
+
+    // One actor, one pending update: the id of the activity already in the queue is reused
+    // so the `(inbox_url, activity_id)` conflict turns this save into an object replacement.
+    let prefix = format!("{actor}#updates/");
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT activity_id FROM federation_delivery \
+          WHERE account_id = $1 AND delivered_at IS NULL \
+            AND left(activity_id, length($2)) = $2 \
+            AND created_at > now() - make_interval(secs => $3) \
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(account_id)
+    .bind(&prefix)
+    .bind(ACTOR_UPDATE_WINDOW_SECS as f64)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((id,)) = existing {
+        activity_id = id.clone();
+        if let Some(map) = activity.as_object_mut() {
+            map.insert("id".to_owned(), Value::String(id));
+        }
+    }
+
+    let ids: Vec<String> = inboxes.iter().map(|_| Ulid::new().to_string()).collect();
+    let hosts: Vec<String> = inboxes
+        .iter()
+        .map(|inbox| crate::blocks::host_of(inbox).unwrap_or_default())
+        .collect();
+    let kind = activity.get("type").and_then(Value::as_str);
+    let queued = sqlx::query(
+        "INSERT INTO federation_delivery \
+             (id, account_id, activity_id, inbox_url, activity, host, activity_kind) \
+         SELECT queued.id, $2, $3, queued.inbox, $4, queued.host, $6 \
+           FROM UNNEST($1::text[], $5::text[], $7::text[]) AS queued (id, inbox, host) \
+         ON CONFLICT (inbox_url, activity_id) DO UPDATE \
+           SET activity = EXCLUDED.activity \
+         WHERE federation_delivery.delivered_at IS NULL",
+    )
+    .bind(&ids)
+    .bind(account_id)
+    .bind(&activity_id)
+    .bind(&activity)
+    .bind(&inboxes)
+    .bind(kind)
+    .bind(&hosts)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(queued)
+}
+
 /// The states a delivery row can be in.
 pub const STATES: [&str; 4] = ["pending", "failed", "gave_up", "delivered"];
 

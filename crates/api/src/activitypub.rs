@@ -1804,6 +1804,26 @@ pub(crate) fn actor_url(state: &AppState, account: &AccountRow) -> String {
     })
 }
 
+/// The `Update` that tells a follower the actor document changed.
+///
+/// The object is the whole actor document, not a patch: peers replace what they cached, and
+/// the fields a reader sees — name, summary, avatar and header — are all read from one
+/// document. The activity is addressed to the public collection and copied to the followers
+/// collection, the same shape Mastodon sends for a profile edit.
+pub(crate) fn actor_update(state: &AppState, account: &AccountRow) -> Activity {
+    let actor = actor_url(state, account);
+    Activity::new(
+        ActivityKind::Update,
+        &actor,
+        ActivityObject::Value(actor_document(state, account).to_json()),
+    )
+    .addressed_to(
+        vec!["https://www.w3.org/ns/activitystreams#Public".to_owned()],
+        vec![format!("{actor}/followers")],
+    )
+    .with_id(format!("{actor}#updates/{}", nodus_server_core::Id::new()))
+}
+
 pub(crate) fn status_url(state: &AppState, row: &StatusRow) -> String {
     row.uri
         .clone()

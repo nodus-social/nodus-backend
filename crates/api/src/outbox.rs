@@ -189,6 +189,39 @@ pub async fn deliver_create(
     enqueue(state, account_id, value, inboxes).await;
 }
 
+/// Tells the followers that a local profile changed.
+///
+/// A peer caches the actor document it fetched, so the `Update` carries that document again
+/// and no diff. It goes through the same queue as every other activity, which is where the
+/// block and pause filters and the retry policy live; coalescing is the queue's, too, so a
+/// burst of saves leaves one activity per actor rather than one per field.
+pub async fn deliver_actor_update(state: &AppState, account_id: &str) {
+    let pool = state.store().pool();
+    let Ok(Some(account)) = nodus_server_store::accounts::by_id(pool, account_id).await else {
+        return;
+    };
+    let activity = crate::activitypub::actor_update(state, &account);
+    let value = match serde_json::to_value(&activity) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "could not serialise an actor Update");
+            return;
+        }
+    };
+    let inboxes = follower_inboxes(state, account_id).await;
+    if inboxes.is_empty() {
+        return;
+    }
+    match nodus_server_store::delivery::enqueue_actor_update(pool, account_id, &value, &inboxes)
+        .await
+    {
+        Ok(queued) => {
+            tracing::debug!(inboxes = inboxes.len(), queued, "actor update queued");
+        }
+        Err(error) => tracing::warn!(%error, "could not queue an actor Update"),
+    }
+}
+
 /// Tells the followers that a post changed.
 ///
 /// Poll tallies move after publication, so the same outbox that carried the `Create`
