@@ -29,6 +29,7 @@ pub mod remote_moderation;
 pub mod scanners;
 pub mod schedules;
 pub mod social;
+pub mod stats;
 pub mod statuses;
 
 use sqlx::postgres::PgPoolOptions;

@@ -13,6 +13,7 @@ mod federation;
 mod media;
 mod reports;
 mod scanners;
+pub(crate) mod stats;
 mod topology;
 
 use axum::body::Bytes;
@@ -873,6 +874,7 @@ pub fn router() -> Router<AppState> {
         .merge(topology::router())
         .route("/api/v1/admin/meta", get(meta))
         .route("/api/v1/admin/overview", get(overview))
+        .route("/api/v1/admin/stats", get(stats::stats))
         .route("/api/v1/admin/measures", get(measures))
         .route("/api/v1/admin/audit", get(audit))
         .route("/api/v1/admin/audit.csv", get(audit_csv))

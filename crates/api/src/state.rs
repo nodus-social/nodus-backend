@@ -4,19 +4,28 @@
 //! `Arc<Inner>` rather than several fields so cloning into each router is one pointer
 //! increment; the config is read-only for the process's lifetime.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use nodus_activitypub_client::{ActivityPub, HttpSigner};
 use nodus_server_store::Store;
 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
 
+use crate::admin::stats::StatsDto;
+
 pub use nodus_server_core::instance::InstanceConfig;
+
+/// How long an admin stats answer may be reused. The console polls this view.
+const STATS_CACHE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct Inner {
     store: Store,
     instance: InstanceConfig,
     federation: Option<Arc<FederationKey>>,
+    /// Process-local, keyed by the `range` the console asked for.
+    stats_cache: Mutex<HashMap<&'static str, (Instant, StatsDto)>>,
 }
 
 /// Cloned into every handler; `Store` is a pool handle and `InstanceConfig` is small.
@@ -117,6 +126,7 @@ impl AppState {
                 store,
                 instance,
                 federation: federation.map(Arc::new),
+                stats_cache: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -134,6 +144,28 @@ impl AppState {
     #[must_use]
     pub fn federation(&self) -> Option<&FederationKey> {
         self.inner.federation.as_deref()
+    }
+
+    /// A stats answer younger than [`STATS_CACHE_TTL`], or `None` when it must be rebuilt.
+    ///
+    /// The lock is never held across an `await`: the caller copies the document out and
+    /// then does its queries.
+    pub(crate) fn cached_stats(&self, range: &str) -> Option<StatsDto> {
+        let mut cache = self.inner.stats_cache.lock().ok()?;
+        match cache.get(range) {
+            Some((at, value)) if at.elapsed() < STATS_CACHE_TTL => Some(value.clone()),
+            Some(_) => {
+                cache.remove(range);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub(crate) fn cache_stats(&self, range: &'static str, value: StatsDto) {
+        if let Ok(mut cache) = self.inner.stats_cache.lock() {
+            cache.insert(range, (Instant::now(), value));
+        }
     }
 
     /// The reader for documents owned by no local account: signed when a key is set.

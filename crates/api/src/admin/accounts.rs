@@ -297,13 +297,33 @@ async fn action(
         .await?
         .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     if let Some(report_id) = form.report_id.as_deref() {
-        moderation::resolve_report(
+        if moderation::resolve_report(
             state.store().pool(),
             report_id,
             &auth.0.account.id,
             form.text.trim(),
         )
-        .await?;
+        .await?
+        .is_some()
+        {
+            // The report's own audit row is what the dashboard's resolution count and
+            // median time to decision are read from; without it a report closed through
+            // this path would be invisible to both.
+            let action = if form.text.trim().is_empty() {
+                "resolve_report"
+            } else {
+                "resolve_report_with_note"
+            };
+            audit_write_detail(
+                &state,
+                &auth,
+                action,
+                "report",
+                report_id,
+                json!({ "note": form.text.trim(), "action": form.kind }),
+            )
+            .await?;
+        }
     }
     let row = moderation::admin_account(state.store().pool(), &id)
         .await?
