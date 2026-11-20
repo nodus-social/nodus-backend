@@ -39,6 +39,7 @@ sqlx = { version = "0.8", default-features = false, features = [
   "json",
   "migrate",
   "macros",
+  "uuid",
 ] }
 thiserror = "2"
 time = "0.3"
@@ -52,6 +53,7 @@ tracing = "0.1"
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ulid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v7"] }
 url = "2"
 
 [workspace.lints.rust]
