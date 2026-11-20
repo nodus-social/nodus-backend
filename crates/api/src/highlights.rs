@@ -120,15 +120,29 @@ pub async fn unfeature(
 
 /// Suggested tags: the tags this instance sees most, which is what a profile editor can
 /// offer without asking the reader to remember a name.
+///
+/// Answered as `FeaturedTag` documents rather than bare names: a Mastodon client parses
+/// this endpoint with the same model as `/api/v1/featured_tags`, and a list of strings
+/// makes every one of them fail to deserialise. `id` is the name here because a suggestion
+/// is not a featured tag yet — nothing has an id until it is featured.
 pub async fn suggestions(
     State(state): State<AppState>,
     auth: Auth,
-) -> ApiResult<Json<Vec<String>>> {
+) -> ApiResult<Json<Vec<FeaturedTagDto>>> {
     auth.require_scope("read:accounts")?;
     let rows = nodus_server_store::discovery::search_tags(state.store().pool(), "", 20)
         .await
         .unwrap_or_default();
-    Ok(Json(rows.into_iter().map(|row| row.name).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| FeaturedTagDto {
+                id: row.name.clone(),
+                name: row.name,
+                statuses_count: u64::try_from(row.uses).unwrap_or_default(),
+                last_status_at: None,
+            })
+            .collect(),
+    ))
 }
 
 /// `GET /api/v1/instance/rules`
