@@ -1250,3 +1250,103 @@ pub async fn context(
         .await?;
     Ok((ancestors, descendants))
 }
+
+/// Who may appear in the accounts behind a status's favourites or reblogs.
+///
+/// The status row decides this, not the interaction: a private post lists only accepted
+/// followers of its author, and a direct one only the people it was addressed to. The
+/// author is always part of their own audience.
+#[derive(Debug, Clone, Copy)]
+pub enum InteractionAudience<'a> {
+    Everyone,
+    Followers(&'a str),
+    Participants(&'a str),
+}
+
+/// The accounts that favourited a status, newest interaction first by account id.
+///
+/// The id is the cursor: account ids are ULIDs, so `max_id` is a stable page boundary
+/// without a separate favourite id the client API never exposed.
+pub async fn favourited_by(
+    pool: &PgPool,
+    status_id: &str,
+    audience: InteractionAudience<'_>,
+    max_id: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<crate::accounts::AccountRow>, sqlx::Error> {
+    let (audience_clause, author) = audience_clause(audience, "f.account_id");
+    let sql = format!(
+        "SELECT {columns} FROM favourite f JOIN account a ON a.id = f.account_id \
+          WHERE f.status_id = $1 \
+            AND a.suspended_at IS NULL AND a.deleted_at IS NULL \
+            AND ($2::text IS NULL OR a.id < $2) \
+            AND {audience_clause} \
+          ORDER BY a.id DESC LIMIT $4 OFFSET $5",
+        columns = crate::accounts::ACCOUNT_COLUMNS_ALIASED,
+    );
+    sqlx::query_as(&sql)
+        .bind(status_id)
+        .bind(max_id)
+        .bind(author)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+}
+
+/// The accounts that boosted a status, newest boost first by account id.
+pub async fn reblogged_by(
+    pool: &PgPool,
+    status_id: &str,
+    audience: InteractionAudience<'_>,
+    max_id: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<crate::accounts::AccountRow>, sqlx::Error> {
+    let (audience_clause, author) = audience_clause(audience, "s.account_id");
+    let sql = format!(
+        "SELECT {columns} FROM status s JOIN account a ON a.id = s.account_id \
+          WHERE s.reblog_of_id = $1 AND s.deleted_at IS NULL \
+            AND a.suspended_at IS NULL AND a.deleted_at IS NULL \
+            AND ($2::text IS NULL OR a.id < $2) \
+            AND {audience_clause} \
+          ORDER BY a.id DESC LIMIT $4 OFFSET $5",
+        columns = crate::accounts::ACCOUNT_COLUMNS_ALIASED,
+    );
+    sqlx::query_as(&sql)
+        .bind(status_id)
+        .bind(max_id)
+        .bind(author)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+}
+
+/// The SQL fragment limiting an interaction list to the audience the status allows,
+/// plus the author id it needs (bound as `$3`).
+fn audience_clause<'a>(
+    audience: InteractionAudience<'a>,
+    actor: &str,
+) -> (String, Option<&'a str>) {
+    match audience {
+        InteractionAudience::Everyone => ("TRUE".to_owned(), None),
+        InteractionAudience::Followers(author) => (
+            format!(
+                "({actor} = $3 OR EXISTS ( \
+                     SELECT 1 FROM follow ff WHERE ff.account_id = {actor} \
+                       AND ff.target_account_id = $3 AND ff.state = 'accepted'))"
+            ),
+            Some(author),
+        ),
+        InteractionAudience::Participants(author) => (
+            format!(
+                "({actor} = $3 OR EXISTS ( \
+                     SELECT 1 FROM status_mention m \
+                      WHERE m.status_id = $1 AND m.account_id = {actor}))"
+            ),
+            Some(author),
+        ),
+    }
+}

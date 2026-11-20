@@ -12,10 +12,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use nodus_server_core::limits::STATUS_MAX_CHARS;
-use nodus_server_core::Id;
+use nodus_server_core::limits::{PAGE_MAX_ACCOUNTS, STATUS_MAX_CHARS};
+use nodus_server_core::{Id, PageSize};
 use nodus_server_store::social::ViewerFlags;
-use nodus_server_store::statuses::{NewStatus, StatusRow};
+use nodus_server_store::statuses::{InteractionAudience, NewStatus, StatusRow};
 
 use crate::auth::{Auth, MaybeAuth};
 use crate::dto::{account_url, AccountDto, StatusDto};
@@ -470,6 +470,87 @@ pub async fn history(
                 created_at: edit.created_at,
                 account: account.clone(),
             })
+            .collect(),
+    ))
+}
+
+/// Pagination for the accounts behind a status. `max_id` is the last account id the
+/// client saw, because these lists are ordered by account id rather than by an
+/// interaction id the client never receives.
+#[derive(Debug, Deserialize)]
+pub struct InteractionQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default)]
+    pub max_id: Option<String>,
+}
+
+fn interaction_audience(row: &StatusRow) -> InteractionAudience<'_> {
+    match row.visibility.as_str() {
+        "private" => InteractionAudience::Followers(&row.account_id),
+        "direct" => InteractionAudience::Participants(&row.account_id),
+        _ => InteractionAudience::Everyone,
+    }
+}
+
+/// `GET /api/v1/statuses/{id}/favourited_by`
+///
+/// The visibility of the status limits the list, not merely the viewer's right to read
+/// it: a private post lists only accepted followers of its author, and a direct one only
+/// its participants. A viewer who cannot see the post gets the same 404 as the post.
+pub async fn favourited_by(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    Query(query): Query<InteractionQuery>,
+) -> ApiResult<Json<Vec<AccountDto>>> {
+    auth.require_scope("read:statuses")?;
+    let row = visible_status(&state, Some(&auth), &id).await?;
+    let size = PageSize::clamp(query.limit, PAGE_MAX_ACCOUNTS);
+    let accounts = nodus_server_store::statuses::favourited_by(
+        state.store().pool(),
+        &row.id,
+        interaction_audience(&row),
+        query.max_id.as_deref(),
+        query.offset.unwrap_or(0).max(0),
+        i64::from(size.get()),
+    )
+    .await?;
+    Ok(Json(
+        accounts
+            .iter()
+            .map(|account| AccountDto::from_row(account, state.instance()))
+            .collect(),
+    ))
+}
+
+/// `GET /api/v1/statuses/{id}/reblogged_by`
+///
+/// Same audience rule as [`favourited_by`], applied to boosts.
+pub async fn reblogged_by(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    Query(query): Query<InteractionQuery>,
+) -> ApiResult<Json<Vec<AccountDto>>> {
+    auth.require_scope("read:statuses")?;
+    let row = visible_status(&state, Some(&auth), &id).await?;
+    let size = PageSize::clamp(query.limit, PAGE_MAX_ACCOUNTS);
+    let accounts = nodus_server_store::statuses::reblogged_by(
+        state.store().pool(),
+        &row.id,
+        interaction_audience(&row),
+        query.max_id.as_deref(),
+        query.offset.unwrap_or(0).max(0),
+        i64::from(size.get()),
+    )
+    .await?;
+    Ok(Json(
+        accounts
+            .iter()
+            .map(|account| AccountDto::from_row(account, state.instance()))
             .collect(),
     ))
 }

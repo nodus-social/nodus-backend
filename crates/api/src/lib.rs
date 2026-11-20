@@ -135,6 +135,14 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/api/v1/statuses/{id}/context", get(statuses::context))
         .route("/api/v1/statuses/{id}/history", get(statuses::history))
         .route(
+            "/api/v1/statuses/{id}/favourited_by",
+            get(statuses::favourited_by),
+        )
+        .route(
+            "/api/v1/statuses/{id}/reblogged_by",
+            get(statuses::reblogged_by),
+        )
+        .route(
             "/api/v1/accounts/{id}/statuses",
             get(statuses::account_statuses),
         )
