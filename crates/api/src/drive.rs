@@ -424,6 +424,62 @@ pub async fn upload_file(
     Ok((StatusCode::CREATED, Json(dto)).into_response())
 }
 
+/// `POST /api/v1/drive/files/{id}/attach` — puts a stored file on a post, zero-copy.
+///
+/// The status is checked here rather than trusted to the foreign key: `media_attachment`
+/// is not account-scoped, so without this check another account's status id would attach.
+pub async fn attach_file(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    body: Option<Json<AttachRequest>>,
+) -> ApiResult<(StatusCode, Json<Attached>)> {
+    auth.require_scope("write:drive")?;
+    let pool = state.store().pool();
+    let account = &auth.0.account.id;
+    let id = parse_uuid(&id)?;
+    let input = body.map(|Json(body)| body).unwrap_or_default();
+    let status_id = input
+        .status_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(status_id) = status_id {
+        let owned = nodus_server_store::statuses::by_id(pool, status_id)
+            .await?
+            .is_some_and(|row| &row.account_id == account);
+        if !owned {
+            return Err(ApiError::not_found("Record not found"));
+        }
+    }
+    let description = input.description.as_deref().unwrap_or_default();
+    if description.chars().count() > crate::media::MAX_DESCRIPTION {
+        return Err(ApiError::unprocessable("The description is too long"));
+    }
+    let Some(attachment_id) =
+        drive::attach_object(pool, account, id, status_id, description, None, None).await?
+    else {
+        return Err(ApiError::not_found("Record not found"));
+    };
+    let instance = state.instance();
+    Ok((
+        StatusCode::CREATED,
+        Json(Attached {
+            url: instance.url(&format!("/media/{attachment_id}/compressed")),
+            preview_url: instance.url(&format!("/media/{attachment_id}/preview")),
+            attachment_id,
+        }),
+    ))
+}
+
+/// What `attach` answers: the attachment's id, and the two urls a post would render.
+#[derive(Debug, Serialize)]
+pub struct Attached {
+    pub attachment_id: String,
+    pub url: String,
+    pub preview_url: String,
+}
+
 /// `PATCH /api/v1/drive/files/{id}`
 pub async fn update_file(
     State(state): State<AppState>,
@@ -491,6 +547,17 @@ pub async fn delete_file(
 pub struct ShareRequest {
     #[serde(default)]
     pub expires_in_seconds: Option<u64>,
+}
+
+/// The body of `POST /api/v1/drive/files/{id}/attach`. Both fields are optional: a
+/// file can be attached to nothing yet, with no alt text.
+#[derive(Debug, Default, Deserialize)]
+pub struct AttachRequest {
+    #[serde(default)]
+    pub status_id: Option<String>,
+    /// The alt text the post shows for this attachment.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// A minted link, as the owner reads it.
@@ -916,7 +983,7 @@ fn required_name(value: &str) -> ApiResult<String> {
 }
 
 /// A filename is echoed in a header and shown in a listing: no separators, no controls.
-fn clean_filename(value: &str) -> String {
+pub(crate) fn clean_filename(value: &str) -> String {
     value
         .chars()
         .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
@@ -970,6 +1037,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/drive/files/{id}/content", get(file_content))
         .route("/api/v1/drive/files/{id}/share", post(share_file))
+        .route("/api/v1/drive/files/{id}/attach", post(attach_file))
         // Unauthenticated on purpose: the token is the credential. It lives in this
         // router rather than the media service's because verifying it needs no database,
         // and the bytes may be on either host.

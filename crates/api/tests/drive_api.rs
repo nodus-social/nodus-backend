@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 use nodus_server_core::Id;
+use uuid::Uuid;
 
 use support::{create_account, create_token, run_db_test};
 
@@ -731,6 +732,205 @@ async fn a_private_file_cannot_mint_a_share_link() {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(s(&body, "error"), "this file is private");
+    })
+    .await;
+}
+
+/// A multipart POST with only text fields — the shape `stored_object_id` arrives in.
+async fn form(
+    app: &Router,
+    uri: &str,
+    token: &str,
+    fields: &[(&str, &str)],
+) -> (StatusCode, serde_json::Value) {
+    let boundary = format!("----nodus-form-{}", Id::new());
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(body))
+        .expect("form request");
+    let response = app.clone().oneshot(request).await.expect("form response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// Attaching a stored object mints a second name for the same bytes and copies nothing.
+#[tokio::test]
+async fn a_stored_object_becomes_an_attachment_without_copying_its_bytes() {
+    init_drive_env();
+    run_db_test(|store, app| async move {
+        let account = create_account(store.pool(), "drive_attach_media").await;
+        let token = create_token(
+            store.pool(),
+            &account,
+            &["read:drive", "write:drive", "write"],
+        )
+        .await;
+        let payload = b"zero-copy attachment".as_slice();
+        let (status, object) = upload(
+            &app,
+            &token,
+            "photo.png",
+            payload,
+            &[("visibility", "unlisted_link")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{object}");
+        let object_id = s(&object, "id");
+
+        let (_, before) = json(&app, "GET", "/api/v1/drive", &token, None).await;
+        let (status, attachment) = form(
+            &app,
+            "/api/v1/media",
+            &token,
+            &[
+                ("stored_object_id", object_id.as_str()),
+                ("description", "the same bytes"),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{attachment}");
+        let attachment_id = s(&attachment, "id");
+        assert!(
+            s(&attachment, "url").ends_with(&format!("/media/{attachment_id}/compressed")),
+            "{attachment}"
+        );
+        assert_eq!(s(&attachment, "description"), "the same bytes");
+        assert_eq!(s(&attachment, "processing"), "ready");
+        // The attachment carries the drive object's own mime type, not a guess.
+        assert_eq!(s(&attachment, "type"), "unknown");
+
+        // No bytes were written for the attachment: same quota figure, same object count.
+        let (_, after) = json(&app, "GET", "/api/v1/drive", &token, None).await;
+        assert_eq!(after["used_bytes"], before["used_bytes"]);
+        assert_eq!(after["objects"], before["objects"]);
+        assert_eq!(before["used_bytes"], payload.len());
+        assert!(media_dir().join(hex(payload)).exists());
+
+        // One attachment per call, and another account can name none of these bytes.
+        let stranger = create_account(store.pool(), "drive_attach_stranger").await;
+        let stranger_token = create_token(store.pool(), &stranger, &["write"]).await;
+        let (status, _) = form(
+            &app,
+            "/api/v1/media",
+            &stranger_token,
+            &[("stored_object_id", object_id.as_str())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    })
+    .await;
+}
+
+/// The drive route that puts a file on a post, without a byte of it moving.
+#[tokio::test]
+async fn an_object_attaches_to_a_post_through_the_drive_route() {
+    init_drive_env();
+    run_db_test(|store, app| async move {
+        let account = create_account(store.pool(), "drive_attach_route").await;
+        let token = create_token(store.pool(), &account, &["read:drive", "write:drive"]).await;
+        let payload = b"a file with somewhere to go".as_slice();
+        let (status, object) = upload(&app, &token, "post.txt", payload, &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{object}");
+        let id = s(&object, "id");
+
+        let status_id = Id::new().to_string();
+        sqlx::query(
+            "INSERT INTO status (id, account_id, content, visibility) \
+             VALUES ($1, $2, 'a post with a file', 'public')",
+        )
+        .bind(&status_id)
+        .bind(&account)
+        .execute(store.pool())
+        .await
+        .expect("insert status");
+
+        let (status, attached) = json(
+            &app,
+            "POST",
+            &format!("/api/v1/drive/files/{id}/attach"),
+            &token,
+            Some(serde_json::json!({ "status_id": status_id, "description": "alt text" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{attached}");
+        let attachment_id = s(&attached, "attachment_id");
+        assert!(
+            s(&attached, "url").ends_with(&format!("/media/{attachment_id}/compressed")),
+            "{attached}"
+        );
+        assert!(
+            s(&attached, "preview_url").ends_with(&format!("/media/{attachment_id}/preview")),
+            "{attached}"
+        );
+
+        // Zero-copy: the quota figure is still exactly the upload's.
+        let (_, drive) = json(&app, "GET", "/api/v1/drive", &token, None).await;
+        assert_eq!(drive["used_bytes"], payload.len());
+
+        let (description, status_of): (String, Option<String>) =
+            sqlx::query_as("SELECT description, status_id FROM media_attachment WHERE id = $1")
+                .bind(&attachment_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("attachment row");
+        assert_eq!(description, "alt text");
+        assert_eq!(status_of.as_deref(), Some(status_id.as_str()));
+
+        // Someone else's post is not a place to put this file, and a missing file is 404.
+        let stranger = create_account(store.pool(), "drive_attach_other").await;
+        let other_status = Id::new().to_string();
+        sqlx::query(
+            "INSERT INTO status (id, account_id, content, visibility) \
+             VALUES ($1, $2, 'not yours', 'public')",
+        )
+        .bind(&other_status)
+        .bind(&stranger)
+        .execute(store.pool())
+        .await
+        .expect("insert other status");
+        let (status, _) = json(
+            &app,
+            "POST",
+            &format!("/api/v1/drive/files/{id}/attach"),
+            &token,
+            Some(serde_json::json!({ "status_id": other_status })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = json(
+            &app,
+            "POST",
+            &format!("/api/v1/drive/files/{}/attach", Uuid::new_v4()),
+            &token,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     })
     .await;
 }

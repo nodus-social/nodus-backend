@@ -500,3 +500,58 @@ async fn attach_object_copies_the_digest_and_outlives_the_object(pool: PgPool) {
             .is_some()
     );
 }
+
+/// Detaching is not deleting: when the post goes, the file stays where the drive put it.
+#[sqlx::test(migrations = "./migrations")]
+async fn deleting_the_status_leaves_the_drive_object_intact(pool: PgPool) {
+    let alice = seed_account(&pool, "alice").await;
+    let status_id = seed_status(&pool, &alice).await;
+    let object = drive::create_object(&pool, &alice, None, "photo.jpg", "image/jpeg", SHA_A, 4_096)
+        .await
+        .expect("object");
+    drive::set_state(&pool, &alice, object.id, drive::ProcessingState::Ready)
+        .await
+        .expect("ready");
+    let attachment = drive::attach_object(
+        &pool,
+        &alice,
+        object.id,
+        Some(&status_id),
+        "a cat on a keyboard",
+        None,
+        None,
+    )
+    .await
+    .expect("attach")
+    .expect("object exists");
+
+    // The product's delete is a soft delete, which is the path the API takes.
+    assert!(
+        nodus_server_store::statuses::delete_owned(&pool, &status_id, &alice)
+            .await
+            .expect("delete the post")
+    );
+
+    let survived = drive::object(&pool, &alice, object.id)
+        .await
+        .expect("object")
+        .expect("the drive still has the file after the post is gone");
+    assert_eq!(survived.sha256, SHA_A);
+    assert_eq!(survived.byte_size, 4_096);
+    assert_eq!(survived.processing_state, "ready");
+    assert_eq!(drive::used_bytes(&pool, &alice).await.expect("sum"), 4_096);
+    assert_eq!(
+        drive::stored_bytes(&pool, &alice).await.expect("stored"),
+        4_096
+    );
+
+    // The attachment is a view of the file, so it outlives the post too.
+    let (digest, stored): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT digest, stored_object_id FROM media_attachment WHERE id = $1")
+            .bind(&attachment)
+            .fetch_one(&pool)
+            .await
+            .expect("attachment survives the post");
+    assert_eq!(digest, SHA_A);
+    assert_eq!(stored, Some(object.id));
+}

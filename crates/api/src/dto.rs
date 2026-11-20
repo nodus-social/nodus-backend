@@ -234,9 +234,36 @@ pub struct MediaAttachmentDto {
     pub sensitive: bool,
     pub processing_state: String,
     pub processing_progress: i16,
+    /// Mastodon's coarse three-value view of `processing_state`, for clients that poll a
+    /// `202` upload: the catalogue records the steps, the client wants the verdict.
+    pub processing: String,
 }
 
 impl MediaAttachmentDto {
+    /// The `type` a client understands for a stored content type.
+    #[must_use]
+    pub fn kind_name(content_type: &str) -> &'static str {
+        match content_type {
+            "image/gif" => "gifv",
+            "video/mp4" | "video/webm" | "video/quicktime" | "video/ogg" => "video",
+            "audio/mpeg" | "audio/ogg" | "audio/wav" => "audio",
+            content_type if content_type.starts_with("image/") => "image",
+            _ => "unknown",
+        }
+    }
+
+    /// The three-value progress a polling client sees. Anything the pipeline is still
+    /// working on (`pending`, `processing`) reads as pending: from the outside the row is
+    /// not ready either way.
+    #[must_use]
+    pub fn processing(state: &str) -> &'static str {
+        match state {
+            "ready" => "ready",
+            "failed" => "failed",
+            _ => "pending",
+        }
+    }
+
     #[must_use]
     pub fn from_row(row: &MediaRow, instance: &InstanceConfig) -> Self {
         let url = row
@@ -247,13 +274,6 @@ impl MediaAttachmentDto {
             .remote_url
             .clone()
             .unwrap_or_else(|| instance.url(&format!("/media/{}/preview", row.id)));
-        let kind = match row.content_type.as_str() {
-            "image/gif" => "gifv",
-            "video/mp4" | "video/webm" | "video/quicktime" | "video/ogg" => "video",
-            "audio/mpeg" | "audio/ogg" | "audio/wav" => "audio",
-            content_type if content_type.starts_with("image/") => "image",
-            _ => "unknown",
-        };
         let mut original = serde_json::Map::new();
         original.insert(
             "size".to_owned(),
@@ -275,7 +295,7 @@ impl MediaAttachmentDto {
         original.insert("size_bytes".to_owned(), serde_json::json!(row.size));
         Self {
             id: row.id.clone(),
-            kind: kind.to_owned(),
+            kind: Self::kind_name(&row.content_type).to_owned(),
             url,
             preview_url,
             remote_url: row.remote_url.clone(),
@@ -286,6 +306,7 @@ impl MediaAttachmentDto {
             sensitive: row.sensitive,
             processing_state: row.processing_state.clone(),
             processing_progress: row.processing_progress,
+            processing: Self::processing(&row.processing_state).to_owned(),
         }
     }
 }

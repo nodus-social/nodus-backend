@@ -9,17 +9,21 @@ use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use nodus_server_core::id::Id;
 use nodus_server_core::limits::{IMAGE_SIZE_LIMIT, VIDEO_SIZE_LIMIT};
 use nodus_server_media::{
     expires_in, plan_with_permissions, CachePolicy, Kind, Layer, LosslessPermissions, VariantSpec,
 };
+use nodus_server_store::drive::{self, ProcessingState};
 use nodus_server_store::media::{self, MediaRow, VariantRow};
 
 use crate::auth::Auth;
@@ -28,7 +32,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 const MAX_UPLOAD: usize = 40 * 1024 * 1024;
-const MAX_DESCRIPTION: usize = 1_500;
+pub(crate) const MAX_DESCRIPTION: usize = 1_500;
 
 /// `/api/v1/media`, `/api/v2/media`.
 ///
@@ -37,7 +41,7 @@ const MAX_DESCRIPTION: usize = 1_500;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/media", post(upload))
-        .route("/api/v2/media", post(upload))
+        .route("/api/v2/media", post(upload_deferred))
         .route("/api/v1/media/{id}", get(show).put(update))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
 }
@@ -236,18 +240,46 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// `POST /api/v1/media` — multipart `file`, `description`, `sensitive`.
-#[allow(clippy::too_many_lines)]
+///
+/// Also accepts `stored_object_id` instead of `file`, which attaches bytes the drive
+/// already holds: no second copy is written and the quota does not move.
 pub async fn upload(
     State(state): State<AppState>,
     auth: Auth,
+    multipart: Multipart,
+) -> ApiResult<Response> {
+    receive(state, auth, multipart, false).await
+}
+
+/// `POST /api/v2/media` — Mastodon's asynchronous upload.
+///
+/// The answer is `202` with an id to poll; the variants are rendered behind it. The
+/// `id` is the same attachment `/api/v1/media/{id}` reports.
+pub async fn upload_deferred(
+    State(state): State<AppState>,
+    auth: Auth,
+    multipart: Multipart,
+) -> ApiResult<Response> {
+    receive(state, auth, multipart, true).await
+}
+
+/// The body both upload routes share. `deferred` only decides the shape of the answer:
+/// v2 hands back an id before the variants exist, v1 answers with the full row.
+#[allow(clippy::too_many_lines)]
+async fn receive(
+    state: AppState,
+    auth: Auth,
     mut multipart: Multipart,
-) -> ApiResult<Json<MediaAttachmentDto>> {
+    deferred: bool,
+) -> ApiResult<Response> {
     auth.require_scope("write")?;
     let mut bytes: Option<Vec<u8>> = None;
     let mut content_type = "application/octet-stream".to_owned();
     let mut description = String::new();
     let mut sensitive = false;
     let mut lossless = false;
+    let mut filename = String::new();
+    let mut stored_object_id: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -260,12 +292,23 @@ pub async fn upload(
                 if let Some(value) = field.content_type() {
                     content_type = value.to_owned();
                 }
+                if let Some(name) = field.file_name() {
+                    filename = name.to_owned();
+                }
                 bytes = Some(
                     field
                         .bytes()
                         .await
                         .map_err(|_| ApiError::unprocessable("Could not read the upload"))?
                         .to_vec(),
+                );
+            }
+            "stored_object_id" => {
+                stored_object_id = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|_| ApiError::unprocessable("Invalid stored_object_id"))?,
                 );
             }
             "description" => {
@@ -292,6 +335,11 @@ pub async fn upload(
             }
             _ => {}
         }
+    }
+
+    // The zero-copy path: the bytes are already stored, so only the attachment is minted.
+    if let Some(object_id) = stored_object_id {
+        return attach_stored(&state, &auth, &object_id, &description, deferred).await;
     }
 
     let bytes = bytes.ok_or_else(|| ApiError::unprocessable("A file is required"))?;
@@ -387,6 +435,33 @@ pub async fn upload(
 
     media::insert(state.store().pool(), &row).await?;
 
+    // The same bytes now have a drive row too, so an upload can be listed, renamed, or
+    // shared like any other file. A failure here must not fail the upload: the bytes and
+    // the catalogue row are already stored, and the attachment does not depend on it.
+    let name = crate::drive::clean_filename(&filename);
+    let name = if name.is_empty() {
+        "upload".to_owned()
+    } else {
+        name
+    };
+    let object_id = match drive::create_object(
+        state.store().pool(),
+        &auth.0.account.id,
+        None,
+        &name,
+        &row.content_type,
+        &row.digest,
+        row.size,
+    )
+    .await
+    {
+        Ok(object) => Some(object.id),
+        Err(error) => {
+            tracing::warn!(%error, %id, "could not file an upload in the drive");
+            None
+        }
+    };
+
     let plan = plan_with_permissions(
         kind,
         u32::try_from(row.width.unwrap_or(1280)).unwrap_or(1280),
@@ -399,10 +474,11 @@ pub async fn upload(
     let media_id = id.clone();
     let source_digest = row.digest.clone();
     let content_type = row.content_type.clone();
+    let account = auth.0.account.id.clone();
     tokio::spawn(async move {
         process_upload(
-            pool,
-            media_id,
+            pool.clone(),
+            media_id.clone(),
             source,
             source_digest,
             content_type,
@@ -411,6 +487,7 @@ pub async fn upload(
             lossless,
         )
         .await;
+        mirror_drive_state(&pool, &account, object_id, &media_id).await;
         if let Some(path) = scratch {
             if let Err(error) = tokio::fs::remove_file(&path).await {
                 tracing::warn!(%error, path = %path.display(), "could not remove an upload's scratch copy");
@@ -418,7 +495,110 @@ pub async fn upload(
         }
     });
 
-    Ok(Json(MediaAttachmentDto::from_row(&row, state.instance())))
+    Ok(media_response(&row, state.instance(), deferred))
+}
+
+/// Copies the pipeline's verdict onto the drive row, so a listing does not show a file
+/// that will be "pending" forever.
+async fn mirror_drive_state(pool: &PgPool, account: &str, object_id: Option<Uuid>, id: &str) {
+    let Some(object_id) = object_id else {
+        return;
+    };
+    let Ok(Some(row)) = media::by_id(pool, id).await else {
+        return;
+    };
+    let state = match row.processing_state.as_str() {
+        "ready" => ProcessingState::Ready,
+        "failed" => ProcessingState::Failed,
+        _ => return,
+    };
+    if let Err(error) = drive::set_state(pool, account, object_id, state).await {
+        tracing::warn!(%error, %object_id, "could not mirror a media state onto the drive");
+    }
+}
+
+/// What a media route answers for a row.
+///
+/// A `202` is only honest while something is still running: once the row is `ready` or
+/// `failed` the client gets the full attachment either way.
+fn media_response(
+    row: &MediaRow,
+    instance: &crate::state::InstanceConfig,
+    deferred: bool,
+) -> Response {
+    if deferred && MediaAttachmentDto::processing(&row.processing_state) == "pending" {
+        return (StatusCode::ACCEPTED, Json(AcceptedMedia::from_row(row))).into_response();
+    }
+    Json(MediaAttachmentDto::from_row(row, instance)).into_response()
+}
+
+/// The `202` body Mastodon's asynchronous upload answers with: an id to poll, and the
+/// fields a client reads unconditionally set to null because they do not exist yet.
+#[derive(Debug, Serialize)]
+struct AcceptedMedia {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    url: Option<String>,
+    preview_url: Option<String>,
+    description: Option<String>,
+    blurhash: Option<String>,
+    meta: serde_json::Value,
+    processing: &'static str,
+}
+
+impl AcceptedMedia {
+    fn from_row(row: &MediaRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            kind: MediaAttachmentDto::kind_name(&row.content_type),
+            url: None,
+            preview_url: None,
+            description: (!row.description.is_empty()).then(|| row.description.clone()),
+            blurhash: None,
+            meta: serde_json::json!({}),
+            processing: "pending",
+        }
+    }
+}
+
+/// Attaches bytes the drive already holds, without reading or writing a single byte.
+///
+/// TODO(3c): a drive object has no rendered variants, so the returned `url` and
+/// `preview_url` point at `/media/{id}/compressed` and `/media/{id}/preview`, which the
+/// media service answers with 404 until the attach path renders them. Naming the gap is
+/// better than pretending: generating variants here would copy the file this route exists
+/// to avoid copying.
+async fn attach_stored(
+    state: &AppState,
+    auth: &Auth,
+    object_id: &str,
+    description: &str,
+    deferred: bool,
+) -> ApiResult<Response> {
+    let Ok(object_id) = Uuid::parse_str(object_id.trim()) else {
+        return Err(ApiError::unprocessable("stored_object_id is not an id"));
+    };
+    if description.chars().count() > MAX_DESCRIPTION {
+        return Err(ApiError::unprocessable("The description is too long"));
+    }
+    let account = &auth.0.account.id;
+    let pool = state.store().pool();
+    if drive::object(pool, account, object_id).await?.is_none() {
+        return Err(ApiError::not_found("Record not found"));
+    }
+    let Some(attachment_id) =
+        drive::attach_object(pool, account, object_id, None, description, None, None).await?
+    else {
+        return Err(ApiError::not_found("Record not found"));
+    };
+    let Some(row) = media::by_id(pool, &attachment_id).await? else {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not read the attachment back",
+        ));
+    };
+    Ok(media_response(&row, state.instance(), deferred))
 }
 
 #[allow(clippy::too_many_arguments)]
