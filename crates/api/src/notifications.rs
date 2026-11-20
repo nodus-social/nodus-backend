@@ -253,23 +253,16 @@ pub async fn clear(
 
 /// One of the reader's own notifications, or a `404` that says nothing about others'.
 async fn notification(state: &AppState, auth: &Auth, id: &str) -> ApiResult<NotificationRow> {
-    // There is no single-row lookup in the store, and a page of one is not worth a query
-    // of its own; the list is bounded by the reader's own newest hundred.
-    let rows = nodus_server_store::social::notifications(
-        state.store().pool(),
-        &auth.0.account.id,
-        None,
-        100,
-        &KINDS.iter().map(ToString::to_string).collect::<Vec<_>>(),
-    )
-    .await?;
-    rows.into_iter()
-        .find(|row| row.id == id)
+    nodus_server_store::social::notification_by_id(state.store().pool(), &auth.0.account.id, id)
+        .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))
 }
 
 /// Builds the payload, loading the sender and the status it refers to.
-async fn dto(
+///
+/// Public inside the crate: the streaming handler renders the notification it was just
+/// told about through this same function, so an SSE frame and a list row cannot drift.
+pub(crate) async fn dto(
     state: &AppState,
     row: &NotificationRow,
     viewer: Option<&Auth>,

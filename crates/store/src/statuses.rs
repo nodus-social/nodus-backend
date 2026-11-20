@@ -717,7 +717,6 @@ struct DeletedOwned {
     content: String,
     content_source: Option<String>,
 }
-
 /// Soft-deletes a status owned by `account_id`, removes its timeline entries, and
 /// updates `statuses_count`, `replies_count`, and `reblogs_count` in one transaction.
 pub async fn delete_owned(
@@ -738,6 +737,9 @@ pub async fn delete_owned(
     let Some(deleted) = deleted else {
         return Ok(false);
     };
+    // `cleanup_deleted_status` removes the timeline rows, so the live stream's recipients
+    // have to be read first: after it, nobody knows who had this status any more.
+    let home = home_recipients_in(&mut tx, status_id).await?;
     cleanup_deleted_status(
         &mut tx,
         status_id,
@@ -759,7 +761,20 @@ pub async fn delete_owned(
         .await?;
     }
     tx.commit().await?;
+    crate::live::status_deleted(account_id, status_id, &home);
     Ok(true)
+}
+
+/// The same read as [`home_recipients`], inside a transaction that is about to delete the
+/// rows it reads.
+async fn home_recipients_in(
+    conn: &mut sqlx::PgConnection,
+    status_id: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT account_id FROM timeline_entry WHERE status_id = $1")
+        .bind(status_id)
+        .fetch_all(&mut *conn)
+        .await
 }
 
 /// Marks a live status as sensitive.
@@ -1102,7 +1117,23 @@ pub async fn create_with_poll(
         refresh_reblogs_count(&mut tx, original_id).await?;
     }
     tx.commit().await?;
+    // Published after the commit, with the recipients `fan_out_home` wrote in the same
+    // transaction: a stream must never show a status the database does not have.
+    let home = home_recipients(pool, new.id).await;
+    crate::live::status_created(new.account_id, new.id, new.visibility, mention_ids, &home);
     Ok(row)
+}
+
+/// The accounts `fan_out_home` put this status in, for the live stream.
+///
+/// A read failure yields an empty list: a missed live event is a stale timeline until the
+/// next fetch, which is smaller than failing a status create after it already committed.
+async fn home_recipients(pool: &PgPool, status_id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT account_id FROM timeline_entry WHERE status_id = $1")
+        .bind(status_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
 }
 
 /// Copies a status into the booster's timeline.
@@ -1167,6 +1198,8 @@ pub async fn reblog_status(
     refresh_reblogs_count(&mut tx, original_id).await?;
     fan_out_home(&mut tx, account_id, &id, &visibility).await?;
     tx.commit().await?;
+    let home = home_recipients(pool, &id).await;
+    crate::live::status_created(account_id, &id, &visibility, &[], &home);
     Ok(Some((row, true)))
 }
 

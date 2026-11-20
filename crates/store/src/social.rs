@@ -359,15 +359,19 @@ pub async fn notify_with_note(
     if account_id == from_account_id {
         return Ok(());
     }
-    if kind == "poll" && status_id.is_some() {
-        sqlx::query(
+    // The id comes back from both shapes so the live stream can name the row it tells the
+    // recipient about. Publishing is fire-and-forget: a browser that stopped reading must
+    // not make a favourite wait.
+    let id: String = if kind == "poll" && status_id.is_some() {
+        sqlx::query_scalar(
             "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note) \
              VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (account_id, status_id) WHERE kind = 'poll' \
              DO UPDATE SET from_account_id = EXCLUDED.from_account_id, \
                            group_count = notification.group_count + 1, \
                            created_at = now(), \
-                           seen_at = NULL",
+                           seen_at = NULL \
+             RETURNING id",
         )
         .bind(Id::new().to_string())
         .bind(account_id)
@@ -375,22 +379,24 @@ pub async fn notify_with_note(
         .bind(from_account_id)
         .bind(status_id)
         .bind(note)
-        .execute(pool)
-        .await?;
-        return Ok(());
-    }
-    sqlx::query(
-        "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(Id::new().to_string())
-    .bind(account_id)
-    .bind(kind)
-    .bind(from_account_id)
-    .bind(status_id)
-    .bind(note)
-    .execute(pool)
-    .await?;
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             RETURNING id",
+        )
+        .bind(Id::new().to_string())
+        .bind(account_id)
+        .bind(kind)
+        .bind(from_account_id)
+        .bind(status_id)
+        .bind(note)
+        .fetch_one(pool)
+        .await?
+    };
+    crate::live::notification(account_id, &id);
     Ok(())
 }
 
@@ -444,6 +450,28 @@ pub async fn notifications(
     .bind(kinds)
     .bind(limit)
     .fetch_all(pool)
+    .await
+}
+
+/// One notification, for the live stream that names the row it just created.
+///
+/// Unlike [`notifications`] this does not re-check blocks and mutes: the row exists only
+/// because the write path made it, and a recipient whose filters changed mid-flight will
+/// see it drop on the next read rather than miss the event that was already sent.
+pub async fn notification_by_id(
+    pool: &PgPool,
+    account_id: &str,
+    id: &str,
+) -> Result<Option<NotificationRow>, sqlx::Error> {
+    sqlx::query_as::<_, NotificationRow>(
+        "SELECT id, kind, account_id, from_account_id, status_id, note, group_count, \
+                seen_at, created_at, moderation_action, moderation_reason, moderation_rule, \
+                moderation_expires_at \
+           FROM notification WHERE account_id = $1 AND id = $2",
+    )
+    .bind(account_id)
+    .bind(id)
+    .fetch_optional(pool)
     .await
 }
 
@@ -664,7 +692,9 @@ pub async fn block(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(
     .bind(target_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await
+    tx.commit().await?;
+    crate::live::filters_changed(account_id);
+    Ok(())
 }
 
 pub async fn unblock(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(), sqlx::Error> {
@@ -673,6 +703,7 @@ pub async fn unblock(pool: &PgPool, account_id: &str, target_id: &str) -> Result
         .bind(target_id)
         .execute(pool)
         .await?;
+    crate::live::filters_changed(account_id);
     Ok(())
 }
 
@@ -693,6 +724,7 @@ pub async fn mute(
     .bind(notifications)
     .execute(pool)
     .await?;
+    crate::live::filters_changed(account_id);
     Ok(())
 }
 
@@ -702,6 +734,7 @@ pub async fn unmute(pool: &PgPool, account_id: &str, target_id: &str) -> Result<
         .bind(target_id)
         .execute(pool)
         .await?;
+    crate::live::filters_changed(account_id);
     Ok(())
 }
 

@@ -137,6 +137,25 @@ pub async fn set_muted(
     Ok(())
 }
 
+/// The root of the direct-message thread `status_id` belongs to, for the live
+/// `conversation` event: the id Mastodon keys the conversation by.
+pub async fn root_of(pool: &PgPool, status_id: &str) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH RECURSIVE thread AS ( \
+             SELECT id, in_reply_to_id, 0 AS depth FROM status \
+              WHERE id = $1 AND deleted_at IS NULL \
+             UNION ALL \
+             SELECT s.id, s.in_reply_to_id, t.depth + 1 \
+               FROM thread t JOIN status s ON s.id = t.in_reply_to_id \
+              WHERE t.depth < 20 \
+         ) \
+         SELECT id FROM thread ORDER BY depth DESC LIMIT 1",
+    )
+    .bind(status_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// The muted roots among `roots`, so a page of conversations can be filtered in one query.
 pub async fn muted_roots(
     pool: &PgPool,

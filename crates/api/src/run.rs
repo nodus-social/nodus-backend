@@ -103,6 +103,17 @@ where
         domain = %config.instance.domain,
         "api listening"
     );
+    // The deploy's stop signal reaches the streams through a watch channel, so a
+    // restarted unit closes EventSource connections instead of leaving them hanging on a
+    // socket the new process does not own. The log line counts what was open at the
+    // moment the signal arrived.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    nodus_server_store::live::install_shutdown(stop_rx);
+    let shutdown = async move {
+        shutdown.await;
+        nodus_server_store::live::begin_shutdown();
+        let _ = stop_tx.send(true);
+    };
     nodus_server_transport::serve_http(
         &config.bind,
         router(&store, &config, federation, sink, home),

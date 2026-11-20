@@ -94,6 +94,22 @@ pub(crate) fn token_digest(token: &str) -> String {
     hex_lower(&Sha256::digest(token.as_bytes()))
 }
 
+/// Resolves one token to an account, for the handler that cannot use the [`Auth`]
+/// extractor: `GET /api/v1/streaming` reads `access_token` from the query string because
+/// `EventSource` cannot set an `Authorization` header.
+///
+/// The rules are exactly the extractor's, including refusing a restricted account and
+/// answering `401` for anything that does not resolve.
+pub(crate) async fn authenticate(state: &AppState, token: &str) -> Result<Authenticated, ApiError> {
+    if token.is_empty() {
+        return Err(ApiError::unauthorized("The access token is invalid"));
+    }
+    let digest = token_digest(token);
+    verify_token(state.store().pool(), &digest)
+        .await?
+        .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
