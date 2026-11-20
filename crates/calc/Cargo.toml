@@ -1,0 +1,24 @@
+[package]
+name = "nodus-server-calc"
+description = "The process around the recommendation engine's heavy half: crawling, recomputing and retention."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+nodus-cache = { path = "../../../recommender/crates/cache" }
+nodus-calculator = { path = "../../../recommender/crates/calculator" }
+nodus-server-proto = { path = "../proto" }
+nodus-server-runtime = { path = "../runtime" }
+nodus-store = { path = "../../../recommender/crates/store" }
+
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "nodus-server-prune"
+description = "The process around the periodic pruning passes: media, sessions, codes and stale rows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+nodus-server-proto = { path = "../proto" }
+nodus-server-runtime = { path = "../runtime" }
+nodus-server-store = { path = "../store" }
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

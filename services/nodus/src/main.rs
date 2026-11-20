@@ -2,17 +2,26 @@
 //!
 //! The deployed units keep their names and their behaviour: `nodus-api`, `nodus-media`,
 //! `nodus-feed`, `nodus-scan`, `nodus-prune` and `nodus-calc` are still what systemd
-//! starts. This binary is the additive entrypoint a host can use instead, and it starts
-//! the *same* run paths those units start — `nodus_server_api::run` and
-//! `nodus_server_media::run` — rather than a copy of them.
+//! starts. This binary is the additive entrypoint a host can use instead, and it starts the
+//! *same* run paths those units start rather than a copy of them: `nodus api` and
+//! `nodus-api` both execute `nodus_server_api::run`, and every other role has the same
+//! arrangement with its own crate.
 //!
-//! Three roles, no fourth:
+//! Seven roles, no eighth:
 //!
 //! | Role | What starts |
 //! | --- | --- |
 //! | `api` | the API process, on `NODUS_BIND` |
 //! | `media-worker` | the media process, on `NODUS_BIND` |
-//! | `aio` | both, API on `NODUS_BIND` and media on `NODUS_MEDIA_BIND` |
+//! | `feed` | the feed process, on `NODUS_BIND` |
+//! | `scan` | the scanner sweep, with a control listener when telemetry is configured |
+//! | `prune` | the pruning worker, with a control listener when telemetry is configured |
+//! | `calc` | the recommendation worker, with a control listener when telemetry is configured |
+//! | `aio` | api and media in one process: api on `NODUS_BIND`, media on `NODUS_MEDIA_BIND` |
+//!
+//! `aio` is api plus media only. The three workers are deliberately not in it: they are
+//! long-running loops rather than listeners, and folding them in would give one process the
+//! failure domain of four services.
 //!
 //! Launching a second copy of the same role against the same database is the operator's
 //! problem, not the parser's: every role here is the same process the unit starts.
@@ -34,50 +43,156 @@ const DEFAULT_MEDIA_BIND: &str = "0.0.0.0:3003";
 /// The stop path is a cancelled `axum::serve`, so anything longer means it is stuck.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// Set this, or pass `--dry-run`, to print what a role would start and where it would
+/// listen, then exit 0 without binding anything. It exists so a test can prove the dispatch
+/// without starting five more servers.
+const DRY_RUN_ENV: &str = "NODUS_ROLE_DRY_RUN";
+
 const HELP: &str = "\
 nodus — one binary, several roles
 
 Usage:
-  nodus <role>
+  nodus <role> [--dry-run]
 
 Roles:
   api           the Mastodon API, ActivityPub documents and auth pages
                 listens on NODUS_BIND (default 0.0.0.0:3000)
   media-worker  serves uploaded media and its variants
                 listens on NODUS_BIND (default 0.0.0.0:3000)
-  aio           api and media-worker in one process
+  feed          the recommendation, browse and sync surface the client reads
+                listens on NODUS_BIND (default 0.0.0.0:3000)
+  scan          the scanner sweep: asks the configured scanners, applies what they say
+                answers for a pass now on NODUS_TELEMETRY_SOCKET / NODUS_TELEMETRY_BIND
+  prune         the pruning worker: media, sessions, codes and stale rows on a clock
+                answers for a pass now on NODUS_TELEMETRY_SOCKET / NODUS_TELEMETRY_BIND
+  calc          the recommendation worker: crawling, recomputing and retention
+                answers for a maintenance tick on NODUS_TELEMETRY_SOCKET / NODUS_TELEMETRY_BIND
+  aio           api and media-worker in one process (nothing else: the three workers are
+                long-running loops, not listeners, so they stay separate roles)
                 api on NODUS_BIND, media on NODUS_MEDIA_BIND (default 0.0.0.0:3003)
 
 With no role, or with --help, this text is printed and nothing starts.
 
+--dry-run (or NODUS_ROLE_DRY_RUN=1) prints the role, the run path it calls and the address
+it would listen on, then exits 0 without binding.
+
 The deployed units are unchanged: nodus-api, nodus-media, nodus-feed, nodus-scan,
 nodus-prune and nodus-calc still start their own binaries. See docs/entrypoints.md.";
 
+/// One role's answer to "what would you start, and where would you listen?".
+///
+/// Returned by each crate's `plan`, so `--dry-run` prints the role's own reading of its
+/// environment rather than a copy of it kept here.
+type Plan = (&'static str, &'static str, String);
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let wanted_help = std::env::args()
-        .skip(1)
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let dry_run = std::env::var_os(DRY_RUN_ENV).is_some()
+        || arguments.iter().any(|argument| argument == "--dry-run");
+    let roles: Vec<&str> = arguments
+        .iter()
+        .map(String::as_str)
+        .filter(|argument| !argument.starts_with('-'))
+        .collect();
+    let wanted_help = arguments
+        .iter()
         .any(|argument| argument == "-h" || argument == "--help");
-    let role = args.next();
+    let role = roles.first().copied();
 
     if wanted_help || role.is_none() {
         println!("{HELP}");
         return ExitCode::SUCCESS;
     }
 
-    match role.as_deref().unwrap_or_default() {
-        "api" => finish(nodus_server_api::run().await),
-        "media-worker" => finish(nodus_server_media::run().await),
-        "aio" => finish(aio().await),
+    match role.unwrap_or_default() {
+        "api" => {
+            start(
+                nodus_server_api::run::plan,
+                nodus_server_api::run(),
+                dry_run,
+            )
+            .await
+        }
+        "media-worker" => {
+            start(
+                nodus_server_media::run::plan,
+                nodus_server_media::run(),
+                dry_run,
+            )
+            .await
+        }
+        "feed" => start(nodus_server_feed::plan, nodus_server_feed::run(), dry_run).await,
+        "scan" => {
+            start(
+                nodus_server_scan::run::plan,
+                nodus_server_scan::run(),
+                dry_run,
+            )
+            .await
+        }
+        "prune" => {
+            start(
+                nodus_server_prune::run::plan,
+                nodus_server_prune::run(),
+                dry_run,
+            )
+            .await
+        }
+        "calc" => {
+            start(
+                nodus_server_calc::run::plan,
+                nodus_server_calc::run(),
+                dry_run,
+            )
+            .await
+        }
+        "aio" => {
+            if dry_run {
+                let api = nodus_server_api::run::plan();
+                let media =
+                    nodus_server_media::run::plan_on("NODUS_MEDIA_BIND", DEFAULT_MEDIA_BIND);
+                return announce_aio(api, media);
+            }
+            finish(aio().await)
+        }
         other => {
             eprintln!(
-                "nodus: unknown role `{other}`; expected one of: api, media-worker, aio\n\
+                "nodus: unknown role `{other}`; expected one of: api, media-worker, feed, \
+                 scan, prune, calc, aio\n\
                  Run `nodus --help` for what each role does."
             );
             ExitCode::from(2)
         }
     }
+}
+
+/// Start one role's run path, or describe it when `--dry-run` asked for that.
+///
+/// The future is created either way but only polled on the real path: an `async fn` does
+/// nothing until it is first polled, so `--dry-run` opens no socket and reads no database.
+async fn start<F>(plan: fn() -> Plan, role_run: F, dry_run: bool) -> ExitCode
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    if dry_run {
+        return announce(plan());
+    }
+    finish(role_run.await)
+}
+
+/// Print what a role would start, in one line a test can match exactly.
+fn announce((role, path, listen): Plan) -> ExitCode {
+    println!("nodus {role} dry run: would start {path} on {listen}");
+    ExitCode::SUCCESS
+}
+
+fn announce_aio(api: Plan, media: Plan) -> ExitCode {
+    println!(
+        "nodus aio dry run: would start {} on {}, and {} on {}",
+        api.1, api.2, media.1, media.2
+    );
+    ExitCode::SUCCESS
 }
 
 fn finish(result: anyhow::Result<()>) -> ExitCode {

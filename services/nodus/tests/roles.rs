@@ -1,8 +1,13 @@
-//! The three roles, as an operator meets them: the help text, the refusal of a role that
-//! does not exist, and `aio` actually opening two listeners instead of claiming to.
+//! The seven roles, as an operator meets them: the help text, the refusal of a role that
+//! does not exist, and one dry-run per role proving it reaches its own run path.
 //!
-//! The `aio` test needs a database because both roles run migrations before they bind, so
-//! it is gated on `DATABASE_URL` and skips with a message otherwise. It proves the
+//! The dry-run tests are the dispatch proof: `nodus <role> --dry-run` prints the run path
+//! that role calls and the address that role would bind, both read from the role's own
+//! module, then exits 0. Nothing is bound — the tests take the ports they tell a role to
+//! use, so a role that ignored the flag would fail instead of passing quietly.
+//!
+//! The `aio` listener test needs a database because both roles run migrations before they
+//! bind, so it is gated on `DATABASE_URL` and skips with a message otherwise. It proves the
 //! listeners with a TCP connect: the process prints the two addresses it was given and
 //! stops itself after `NODUS_AIO_ANNOUNCE_SECS` seconds, so the test can dial both ports
 //! and then expect a clean exit without signalling the process itself.
@@ -14,13 +19,55 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 /// The binary under test.
-const ROLES: [&str; 3] = ["api", "media-worker", "aio"];
+const ROLES: [&str; 7] = [
+    "api",
+    "media-worker",
+    "feed",
+    "scan",
+    "prune",
+    "calc",
+    "aio",
+];
+
+/// Everything a dry run must not inherit, so a developer's shell cannot decide the answer.
+const AMBIENT: [&str; 4] = [
+    "NODUS_BIND",
+    "NODUS_MEDIA_BIND",
+    "NODUS_TELEMETRY_SOCKET",
+    "NODUS_TELEMETRY_BIND",
+];
 
 fn run(args: &[&str]) -> (bool, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_nodus"))
         .args(args)
+        .env_remove("NODUS_ROLE_DRY_RUN")
         .output()
         .expect("the nodus binary runs");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Run one role in dry-run mode with a known environment, and return what it printed.
+fn dry_run(role: &str, environment: &[(&str, &str)], flag: bool) -> (bool, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nodus"));
+    command.arg(role);
+    command.env_remove("NODUS_ROLE_DRY_RUN");
+    for variable in AMBIENT {
+        command.env_remove(variable);
+    }
+    if flag {
+        command.arg("--dry-run");
+    } else {
+        // The environment form, exercised on every role: the flag is only the nicer spelling.
+        command.env("NODUS_ROLE_DRY_RUN", "1");
+    }
+    for (variable, value) in environment {
+        command.env(variable, value);
+    }
+    let output = command.output().expect("the nodus binary runs");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -38,10 +85,18 @@ fn assert_names_every_role(where_: &str, text: &str) {
 }
 
 #[test]
-fn help_names_the_three_roles() {
+fn help_names_the_seven_roles() {
     let (ok, stdout, stderr) = run(&["--help"]);
     assert!(ok, "--help should exit 0, stderr:\n{stderr}");
     assert_names_every_role("--help", &stdout);
+    assert!(
+        stdout.contains("aio           api and media-worker in one process"),
+        "the help should say what aio is, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("not listeners"),
+        "the help should say why the three workers are not in aio, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -62,6 +117,109 @@ fn unknown_role_fails_and_names_the_accepted_ones() {
     assert!(
         stderr.contains("docker"),
         "the message should name what was rejected, got:\n{stderr}"
+    );
+}
+
+/// The listener that holds a port while a role is told to use it. A dry run that really
+/// bound would fail; one that never ran the read would print the wrong answer.
+fn held_port() -> (TcpListener, u16) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a free local port");
+    let port = listener.local_addr().expect("a local address").port();
+    (listener, port)
+}
+
+/// One listener role: it prints its own run path and the `NODUS_BIND` it was given.
+fn assert_listener_role(role: &str, path: &str, flag: bool) {
+    let (_held, port) = held_port();
+    let bind = format!("127.0.0.1:{port}");
+    let (ok, stdout, stderr) = dry_run(role, &[("NODUS_BIND", &bind)], flag);
+    assert!(
+        ok,
+        "`nodus {role} --dry-run` should exit 0, stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        format!("nodus {role} dry run: would start {path} on {bind}"),
+        "the dry run should name the role's own run path and address"
+    );
+}
+
+/// One worker role: it prints its own run path and the control address it would answer on.
+fn assert_worker_role(role: &str, path: &str, flag: bool) {
+    let (ok, stdout, stderr) = dry_run(role, &[("NODUS_TELEMETRY_SOCKET", "/tmp/held.sock")], flag);
+    assert!(
+        ok,
+        "`nodus {role} --dry-run` should exit 0, stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        format!("nodus {role} dry run: would start {path} on the control socket /tmp/held.sock"),
+        "the dry run should name the role's own run path and control socket"
+    );
+}
+
+#[test]
+fn api_dry_run_reaches_the_api_run_path() {
+    assert_listener_role("api", "nodus_server_api::run", true);
+}
+
+#[test]
+fn media_worker_dry_run_reaches_the_media_run_path() {
+    assert_listener_role("media-worker", "nodus_server_media::run", false);
+}
+
+#[test]
+fn feed_dry_run_reaches_the_feed_run_path() {
+    assert_listener_role("feed", "nodus_server_feed::run", true);
+}
+
+#[test]
+fn scan_dry_run_reaches_the_scan_run_path() {
+    assert_worker_role("scan", "nodus_server_scan::run", true);
+}
+
+#[test]
+fn prune_dry_run_reaches_the_prune_run_path() {
+    assert_worker_role("prune", "nodus_server_prune::run", false);
+}
+
+#[test]
+fn calc_dry_run_reaches_the_calc_run_path() {
+    assert_worker_role("calc", "nodus_server_calc::run", true);
+}
+
+#[test]
+fn aio_dry_run_reaches_both_listener_run_paths() {
+    let (_api_held, api_port) = held_port();
+    let (_media_held, media_port) = held_port();
+    let api = format!("127.0.0.1:{api_port}");
+    let media = format!("127.0.0.1:{media_port}");
+    let (ok, stdout, stderr) = dry_run(
+        "aio",
+        &[("NODUS_BIND", &api), ("NODUS_MEDIA_BIND", &media)],
+        false,
+    );
+    assert!(ok, "`nodus aio --dry-run` should exit 0, stderr:\n{stderr}");
+    assert_eq!(
+        stdout.trim(),
+        format!(
+            "nodus aio dry run: would start nodus_server_api::run on {api}, and \
+             nodus_server_media::run on {media}"
+        ),
+        "aio's dry run should name both run paths and both addresses"
+    );
+}
+
+#[test]
+fn a_worker_without_a_control_address_says_so() {
+    let (ok, stdout, stderr) = dry_run("scan", &[], true);
+    assert!(
+        ok,
+        "`nodus scan --dry-run` should exit 0, stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("on nothing (no NODUS_TELEMETRY_SOCKET or NODUS_TELEMETRY_BIND)"),
+        "a worker with no control address should say so, got:\n{stdout}"
     );
 }
 

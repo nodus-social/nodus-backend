@@ -1,6 +1,6 @@
 [package]
 name = "nodus-server-scan"
-description = "The contract for content scanners, and the client that speaks it."
+description = "The contract for content scanners, the client that speaks it, and the sweep that applies it."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,11 +8,18 @@ license.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
+nodus-server-proto = { path = "../proto" }
+nodus-server-runtime = { path = "../runtime" }
+nodus-server-store = { path = "../store" }
 reqwest = { version = "0.13", features = ["json", "rustls", "webpki-roots"] }
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

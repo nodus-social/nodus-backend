@@ -28,6 +28,17 @@
 //! and stored for the moderator, never interpreted.
 //!
 //! A scanner that cannot answer must answer with a non-2xx status, not an empty body.
+//!
+//! The crate also holds the process around that contract — [`run`], the sweep that applies
+//! scanner answers, and the control listener — so `nodus-scan` and `nodus scan` start the
+//! same service rather than two copies of it. The contract itself knows nothing about
+//! storage; the part that does lives beside it.
+
+mod sweep;
+
+pub mod run;
+
+pub use run::run;
 
 use std::time::Duration;
 

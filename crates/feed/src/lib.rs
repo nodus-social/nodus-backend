@@ -9,6 +9,13 @@ use std::future::Future;
 use anyhow::anyhow;
 use nodus_server_runtime::{self as runtime, Config};
 
+/// What `nodus feed` starts and where it listens, without binding.
+#[must_use]
+pub fn plan() -> (&'static str, &'static str, String) {
+    let bind = std::env::var("NODUS_BIND").unwrap_or_else(|_| runtime::DEFAULT_BIND.to_owned());
+    ("feed", "nodus_server_feed::run", bind)
+}
+
 /// Run the feed service as its own process, with its own logging, telemetry and stop
 /// signal.
 ///

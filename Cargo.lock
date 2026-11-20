@@ -2449,14 +2449,9 @@ dependencies = [
 name = "nodus-calc"
 version = "0.1.0"
 dependencies = [
- "nodus-cache",
- "nodus-calculator",
- "nodus-server-proto",
- "nodus-server-runtime",
- "nodus-store",
+ "anyhow",
+ "nodus-server-calc",
  "tokio",
- "tonic",
- "tracing",
 ]
 
 [[package]]
@@ -2586,8 +2581,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nodus-server-api",
+ "nodus-server-calc",
+ "nodus-server-feed",
  "nodus-server-media",
+ "nodus-server-prune",
  "nodus-server-runtime",
+ "nodus-server-scan",
  "nodus-server-transport",
  "tokio",
  "tracing",
@@ -2605,27 +2604,18 @@ dependencies = [
 name = "nodus-prune"
 version = "0.1.0"
 dependencies = [
- "nodus-server-proto",
- "nodus-server-runtime",
- "nodus-server-store",
+ "anyhow",
+ "nodus-server-prune",
  "tokio",
- "tonic",
- "tracing",
 ]
 
 [[package]]
 name = "nodus-scan"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "nodus-server-proto",
- "nodus-server-runtime",
+ "anyhow",
  "nodus-server-scan",
- "nodus-server-store",
- "sqlx",
  "tokio",
- "tonic",
- "tracing",
 ]
 
 [[package]]
@@ -2676,6 +2666,21 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "nodus-server-calc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nodus-cache",
+ "nodus-calculator",
+ "nodus-server-proto",
+ "nodus-server-runtime",
+ "nodus-store",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -2746,6 +2751,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus-server-prune"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nodus-server-proto",
+ "nodus-server-runtime",
+ "nodus-server-store",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "nodus-server-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2767,11 +2785,18 @@ dependencies = [
 name = "nodus-server-scan"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "nodus-server-proto",
+ "nodus-server-runtime",
+ "nodus-server-store",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.21",
  "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

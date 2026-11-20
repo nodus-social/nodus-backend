@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use nodus_server_scan::{Request, Severity, Signal, Transport};
+use crate::{Request, Severity, Signal, Transport};
 use nodus_server_store::scanners::{self, RuleRow, ScanRow, ScannerRow};
 use nodus_server_store::{statuses, Store};
 

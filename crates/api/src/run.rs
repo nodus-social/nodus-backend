@@ -18,6 +18,16 @@ use nodus_server_store::Store;
 
 use crate::{root_router, AppState, FederationKey};
 
+/// What `nodus api` starts and where it listens, without binding.
+///
+/// The address is read from the environment this run path reads, so `--dry-run` prints the
+/// API's own answer rather than a copy of it kept in the entrypoint.
+#[must_use]
+pub fn plan() -> (&'static str, &'static str, String) {
+    let bind = std::env::var("NODUS_BIND").unwrap_or_else(|_| runtime::DEFAULT_BIND.to_owned());
+    ("api", "nodus_server_api::run", bind)
+}
+
 /// Run the API as its own process, with its own logging, telemetry and stop signal.
 ///
 /// # Errors

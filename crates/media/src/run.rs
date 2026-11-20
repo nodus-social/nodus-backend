@@ -32,6 +32,20 @@ const REPAIR_FIRST: Duration = Duration::from_secs(60);
 /// to a failed upload is back long before the membership itself would expire.
 const REPAIR_EVERY: Duration = Duration::from_secs(600);
 
+/// What `nodus media-worker` starts and where it listens, without binding.
+#[must_use]
+pub fn plan() -> (&'static str, &'static str, String) {
+    plan_on("NODUS_BIND", runtime::DEFAULT_BIND)
+}
+
+/// The same, for a listener named by another variable: `aio` puts media on
+/// `NODUS_MEDIA_BIND` so the two roles in that process do not fight over one port.
+#[must_use]
+pub fn plan_on(variable: &str, default: &str) -> (&'static str, &'static str, String) {
+    let bind = std::env::var(variable).unwrap_or_else(|_| default.to_owned());
+    ("media-worker", "nodus_server_media::run", bind)
+}
+
 /// Run the media service as its own process, with its own logging, telemetry and stop
 /// signal.
 ///

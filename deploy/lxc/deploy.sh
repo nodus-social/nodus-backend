@@ -31,6 +31,10 @@ HEALTH_URL="${HEALTH_URL:-https://nodus.luxuride.eu/healthz}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 CACHE_VOLUME="${CACHE_VOLUME:-nodus-cargo}"
 SERVICES=(api media feed scan prune calc)
+# The single binary is built and installed alongside the six, but no unit starts it yet: the
+# units keep pointing at nodus-api and friends. `nodus <role>` runs the same run paths, so
+# it is shipped ready for the operator who switches a unit over.
+SINGLE=nodus
 BUILD_DIR="${ROOT}/nodus-backend/target-bookworm/release"
 
 # Units this run has touched (restart is the only stop we do now). Kept for the trap so
@@ -77,18 +81,21 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     -e CARGO_HOME=/cargo \
     rust:1-bookworm \
     cargo build --release --locked --target-dir /src/nodus-backend/target-bookworm \
-    --bin nodus-api --bin nodus-media --bin nodus-feed --bin nodus-scan --bin nodus-prune --bin nodus-calc
+    --bin nodus-api --bin nodus-media --bin nodus-feed --bin nodus-scan --bin nodus-prune --bin nodus-calc \
+    --bin nodus
 fi
 
 for service in "${SERVICES[@]}"; do
   [[ -x "${BUILD_DIR}/nodus-${service}" ]] || { echo "missing ${BUILD_DIR}/nodus-${service}" >&2; exit 1; }
 done
+[[ -x "${BUILD_DIR}/${SINGLE}" ]] || { echo "missing ${BUILD_DIR}/${SINGLE}" >&2; exit 1; }
 
 echo "==> staging binaries and units"
 for service in "${SERVICES[@]}"; do
   scp -q "${BUILD_DIR}/nodus-${service}" "${HOST}:/tmp/nodus-${service}-new"
   scp -q "${ROOT}/nodus-backend/deploy/systemd/nodus-${service}.service" "${HOST}:/tmp/nodus-${service}.service"
 done
+scp -q "${BUILD_DIR}/${SINGLE}" "${HOST}:/tmp/${SINGLE}-single-new"
 
 # The monolith is retired here rather than later: two processes must not claim the same
 # tables, and its socket directory is now the workers' neighbourhood.
@@ -100,6 +107,7 @@ for service in "${SERVICES[@]}"; do
   ssh "${HOST}" "pct push ${VMID} /tmp/nodus-${service}.service /etc/systemd/system/nodus-${service}.service --perms 0644"
   ssh "${HOST}" "pct push ${VMID} /tmp/nodus-${service}-new /usr/local/bin/nodus-${service}.new --perms 0755"
 done
+ssh "${HOST}" "pct push ${VMID} /tmp/${SINGLE}-single-new /usr/local/bin/${SINGLE}.new --perms 0755"
 ssh "${HOST}" "pct exec ${VMID} -- systemctl daemon-reload"
 for service in "${SERVICES[@]}"; do
   ssh "${HOST}" "pct exec ${VMID} -- systemctl enable nodus-${service}"
@@ -133,6 +141,13 @@ for service in "${SERVICES[@]}"; do
 done
 
 echo "==> verifying deployment"
+remote "mv -f /usr/local/bin/${SINGLE}.new /usr/local/bin/${SINGLE}"
+if remote "/usr/local/bin/${SINGLE} --help >/dev/null" 2>/dev/null; then
+  echo "==> /usr/local/bin/${SINGLE} installed (no unit starts it yet)"
+else
+  echo "!! /usr/local/bin/${SINGLE} does not run its help text" >&2
+  exit 1
+fi
 failures=()
 for service in "${SERVICES[@]}"; do
   state=$(remote "systemctl is-active nodus-${service}" 2>/dev/null | tr -d '[:space:]')

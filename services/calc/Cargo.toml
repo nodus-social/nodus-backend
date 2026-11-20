@@ -12,15 +12,9 @@ name = "nodus-calc"
 path = "src/main.rs"
 
 [dependencies]
-nodus-cache = { path = "../../../recommender/crates/cache" }
-nodus-calculator = { path = "../../../recommender/crates/calculator" }
-nodus-server-proto = { path = "../../crates/proto" }
-nodus-server-runtime = { path = "../../crates/runtime" }
-nodus-store = { path = "../../../recommender/crates/store" }
-
+anyhow.workspace = true
+nodus-server-calc = { path = "../../crates/calc" }
 tokio.workspace = true
-tonic.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

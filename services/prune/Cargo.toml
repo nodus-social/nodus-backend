@@ -12,13 +12,9 @@ name = "nodus-prune"
 path = "src/main.rs"
 
 [dependencies]
-nodus-server-proto = { path = "../../crates/proto" }
-nodus-server-runtime = { path = "../../crates/runtime" }
-nodus-server-store.workspace = true
-
+anyhow.workspace = true
+nodus-server-prune = { path = "../../crates/prune" }
 tokio.workspace = true
-tonic.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true
