@@ -73,3 +73,4 @@ cargo run -p nodus-server-worker   # job runner, one process per replica
 | `docs/09-deployment.md` | monolith default, split gRPC profile, media and federation workers |
 | `docs/10-auth.md` | Mastodon OAuth, optional OIDC/MAS-style identity provider |
 | `docs/11-service-boundaries.md` | service crates, gRPC contracts, monolith/strict/split modes |
+| `docs/media-cluster.md` | media placement and replication, range answers, the two-node proof |

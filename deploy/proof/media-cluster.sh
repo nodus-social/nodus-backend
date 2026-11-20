@@ -14,9 +14,11 @@
 #   2. Wait for A's replicate-on-write to reach B: HEAD 200 and identical bytes.
 #   3. Delete A's file; require A still answers, and require the file is back on disk —
 #      the read miss fetched it from B and wrote what it fetched.
-#   4. Delete both files; require 404. PUT to A again, wait for the replica, delete B's
+#   4. Read bytes 0-3 of the original through A's public route and require a 206 carrying
+#      `Content-Range` and exactly those four bytes — the API is not in this path.
+#   5. Delete both files; require 404. PUT to A again, wait for the replica, delete B's
 #      copy, and require the repair walk puts it back (nothing wrote to B this time).
-#   5. Kill A; require B still answers, and require a miss on B is a 404 that arrives
+#   6. Kill A; require B still answers, and require a miss on B is a 404 that arrives
 #      inside the peer budget instead of hanging on a dead peer.
 #
 # Each check prints `ok <name>` or `FAIL <name>`, and any failure exits non-zero, so the
@@ -291,7 +293,29 @@ else
 fi
 wait_until "a wrote the fetched bytes back to disk" 10 test -f "$STORE_A/$DIGEST"
 
-# ---------------------------------------------------------------- 3. repair pushes
+# ---------------------------------------------------------------- 3. the public range
+
+say "range on the public route"
+# A browser seeking in a video sends `Range`, and the answer comes from the media node, not
+# the API. A public route that ignored it would answer 200 with the whole body: the client
+# would still play the file, so the failure is silent. The check therefore asserts all
+# three parts of the answer — the status, the header that places the slice, and the bytes.
+head -c 4 "$BLOB" >"$WORK/first-four"
+code=$(curl -s -D "$WORK/range-headers" -o "$WORK/range-body" -w '%{http_code}' \
+    --max-time 10 -r 0-3 "http://127.0.0.1:$PORT_A/media/$MEDIA_ID")
+expect "a ranged public read is a 206" 206 "$code"
+if grep -qai '^content-range: bytes 0-3/' "$WORK/range-headers"; then
+    pass "the ranged answer says which bytes it carries"
+else
+    fail "the ranged answer says which bytes it carries"
+fi
+if cmp -s "$WORK/range-body" "$WORK/first-four"; then
+    pass "the ranged answer is exactly the first four bytes of the original"
+else
+    fail "the ranged answer is exactly the first four bytes of the original"
+fi
+
+# ---------------------------------------------------------------- 4. repair pushes
 
 say "repair push"
 rm -f "$STORE_A/$DIGEST" "$STORE_B/$DIGEST"
@@ -308,7 +332,7 @@ wait_until "b receives the re-put" 20 has_digest "$PORT_B"
 rm -f "$STORE_B/$DIGEST"
 wait_until "a repair pass puts b's lost replica back" 30 has_digest "$PORT_B"
 
-# ---------------------------------------------------------------- 4. a dead peer
+# ---------------------------------------------------------------- 5. a dead peer
 
 say "dead peer"
 kill "${pids[0]}" 2>/dev/null || true

@@ -7,8 +7,9 @@ to agree on the member list, for a node that owns bytes it has not received yet 
 to fetch them, and for a replica that quietly lost a file to be noticed and refilled.
 
 This document describes the placement rule, the membership contract, the routes nodes use
-to talk to each other, the read and write paths, the repair walk, the proof that runs two
-nodes on one host, and the two limits that no amount of code removes.
+to talk to each other, the read and write paths, the range rules both paths obey, the repair
+walk, the proof that runs two nodes on one host, and the two limits that no amount of code
+removes.
 
 Everything here is off until `NODUS_MEDIA_CLUSTER_TOKEN` is set. A single node with no
 token registers itself, serves from its own disk, and never calls a peer; the internal
@@ -127,6 +128,32 @@ nodes cannot bounce one delete back and forth.
 If all three are empty the answer is 404. A suspended or deleted account is a 404 before any
 of this, at every layer.
 
+## Range requests
+
+A client that seeks sends `Range: bytes=…`, and the media node answers it, because the bytes
+are what it holds. Both public routes and the internal read go through one helper for the
+slice, so the rules cannot drift between the API-facing and peer-facing answers:
+
+| route | no `Range` | one satisfiable range | a range naming no byte | anything else |
+| --- | --- | --- | --- | --- |
+| `GET /media/{id}` | 200, whole original | 206 + `Content-Range: bytes a-b/len` | 416 + `Content-Range: bytes */len` | 200, whole original |
+| `GET /media/{id}/{layer}` | 200, whole variant | 206 over the variant's bytes | 416 with the variant's length | 200, whole variant |
+| `GET /internal/media/{digest}` | 200, whole digest | 206 | 416 | 200 |
+
+`Accept-Ranges: bytes` is on every byte answer, and `Content-Length` is the length actually
+sent: a 206 declares the slice, not the object, and a 416 carries no body at all — its
+`Content-Range` is the only part a client can act on. `/media/{id}/{layer}` falls back to the
+original when the layer is absent, and the range is applied to whichever bytes the answer
+carries, so a client never receives a slice of one representation with the length of another.
+A variant is only ever served from local disk, so ranged variant reads never ask a peer.
+
+Multi-range requests (`bytes=0-1,5-6`) are not supported. RFC 9110 lets a server ignore a
+range it cannot serve, so they are treated as unparseable and answered with the whole
+representation: a 200 is an answer every client can use, while a 416 for a header the client
+meant as two slices is not. `/media/default-avatar.png` and `HEAD /internal/media/{digest}`
+take no range at all — the first is one small static picture, and the second reports
+presence, not length.
+
 ## Writes: replicate on write, and where variants live
 
 An upload is accepted by the API process, which computes the digest and hands the original
@@ -163,6 +190,30 @@ Deletes go the other way: `delete_original` asks the media service
 (`NODUS_MEDIA_INTERNAL_URL`, default `http://127.0.0.1:3003`) to delete the digest, which
 fans the delete out to every member and answers once its own peers were tried (15-second
 budget). If that call does not confirm, the API unlinks its local copy exactly as before.
+
+### When a node dies mid-upload
+
+A `PUT` is one request: the node receives the body, hashes it, writes it beside the target
+as `.{digest}.{ulid}.part`, and renames it to `{digest}` only once the whole body arrived and
+matched. A node that dies half-way never reaches the rename, so the digest is simply absent
+from that node. There is no half-written file under the digest's name for a reader to find,
+because reads open `{digest}` and nothing else. The abandoned `.part` is waste on disk, not
+damage: it sits outside the digest namespace, no read or peer fetch can pick it up, and a
+later upload of the same bytes writes its own temp file and renames over the target.
+
+What the client sees depends on how far the request got:
+
+- **The API never got a 2xx** — a reset connection, a timeout, a 5xx — so it falls back to
+  writing the bytes under its own `NODUS_MEDIA_DIR` and the upload still answers 201, with a
+  warning in the log. The client is never told that a node died.
+- **The upload was retried** and landed on a live node, so the bytes are stored normally and
+  the dead node's gap is not the client's problem.
+
+Meanwhile the media id has not been handed out yet, because the upload has not answered, so
+no reader can be asking for it. If one does — a retry racing the first attempt, or the id
+reached a reader some other way — the read is the ordinary miss: a peer that holds the digest
+answers, and when no peer holds it the answer is the 404 every missing digest gets. The
+half-written temp file is not visible in either answer.
 
 ## The repair pass
 
@@ -208,16 +259,18 @@ their own storage directories under a temporary root, on ports 3901 and 3902
 (`PORT_A`/`PORT_B`), with `NODUS_MEDIA_REPAIR_SECS=2` so a pass happens while the script
 waits. `KEEP=1` leaves the temporary root, both logs and both env files for a post-mortem.
 
-What it asserts, one `ok <name>` or `FAIL <name>` per check (16 in all, any failure exits
+What it asserts, one `ok <name>` or `FAIL <name>` per check (19 in all, any failure exits
 non-zero):
 
 1. `PUT` an original to node A is a 201.
 2. A's replicate-on-write reaches B: `HEAD` 200 and identical bytes.
 3. Delete A's file: A still answers 200 with the right bytes, and the file is back on disk —
    the miss was fetched from B and written down.
-4. Delete both, require 404, `PUT` to A again, wait for B, delete B's copy, and require the
+4. `curl -r 0-3` the public route on A: a 206, a `Content-Range: bytes 0-3/…` header, and
+   exactly the first four bytes of the original.
+5. Delete both, require 404, `PUT` to A again, wait for B, delete B's copy, and require the
    repair walk to put it back (nothing wrote to B this time).
-5. Kill A: B still serves, and a miss on B is a 404 inside the peer budget rather than a
+6. Kill A: B still serves, and a miss on B is a 404 inside the peer budget rather than a
    hang on a dead peer.
 
 If the workspace cannot even load — the development container mounts this repository

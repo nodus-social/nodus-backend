@@ -398,30 +398,51 @@ fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 /// `GET /media/{id}` — original bytes, cached by digest.
-pub async fn serve(State(serving): State<Arc<Serving>>, UrlPath(id): UrlPath<String>) -> Response {
-    let Some(row) = catalogue(&serving, &id).await else {
+///
+/// A `Range` header is answered here exactly as it is on the internal route: both go through
+/// [`slice`], so a client seeking in a large original gets one slice rather than the file.
+pub async fn serve(
+    State(serving): State<Arc<Serving>>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    original(&serving, &id, headers.get(header::RANGE)).await
+}
+
+/// The original for one id, shared by both public routes.
+///
+/// `serve_variant` falls back here when a layer is missing, so the range rules have to live
+/// in one place that two handlers can reach rather than in the handler that happened to be
+/// written first.
+async fn original(
+    serving: &Arc<Serving>,
+    id: &str,
+    range: Option<&HeaderValue>,
+) -> Response {
+    let Some(row) = catalogue(serving, id).await else {
         return not_found();
     };
-    if suspended(&serving, &row.account_id).await {
+    if suspended(serving, &row.account_id).await {
         return not_found();
     }
     if !row.original_pruned {
         let bytes = match tokio::fs::read(serving.root.join(&row.digest)).await {
             Ok(bytes) => Some(bytes),
             // A replica answers for bytes this node owns but has not written yet.
-            Err(_) => copy_from_placement(&serving, &row.digest).await,
+            Err(_) => copy_from_placement(serving, &row.digest).await,
         };
         if let Some(bytes) = bytes {
             return with_cache(
                 bytes,
                 &row.content_type,
                 "public, max-age=31536000, immutable",
+                range,
             );
         }
     }
     for layer in [Layer::Compressed, Layer::Preview] {
-        if let Some(variant) = variant(&serving, &id, layer.as_str()).await {
-            return variant_response(&serving, variant, layer).await;
+        if let Some(variant) = variant(serving, id, layer.as_str()).await {
+            return variant_response(serving, variant, layer, range).await;
         }
     }
     not_found()
@@ -430,6 +451,7 @@ pub async fn serve(State(serving): State<Arc<Serving>>, UrlPath(id): UrlPath<Str
 /// `GET /media/{id}/{layer}` — a generated preview/compressed/lossless variant.
 pub async fn serve_variant(
     State(serving): State<Arc<Serving>>,
+    headers: HeaderMap,
     UrlPath((id, layer)): UrlPath<(String, String)>,
 ) -> Response {
     let layer = match layer.as_str() {
@@ -446,9 +468,9 @@ pub async fn serve_variant(
         None => return not_found(),
     }
     if let Some(variant) = variant(&serving, &id, layer.as_str()).await {
-        return variant_response(&serving, variant, layer).await;
+        return variant_response(&serving, variant, layer, headers.get(header::RANGE)).await;
     }
-    serve(State(serving), UrlPath(id)).await
+    original(&serving, &id, headers.get(header::RANGE)).await
 }
 
 async fn catalogue(serving: &Serving, id: &str) -> Option<media::MediaRow> {
@@ -489,27 +511,39 @@ async fn variant(serving: &Serving, id: &str, layer: &str) -> Option<VariantRow>
     }
 }
 
-async fn variant_response(serving: &Serving, variant: VariantRow, layer: Layer) -> Response {
+async fn variant_response(
+    serving: &Serving,
+    variant: VariantRow,
+    layer: Layer,
+    range: Option<&HeaderValue>,
+) -> Response {
     let Ok(bytes) = tokio::fs::read(serving.variants.join(&variant.digest)).await else {
         return not_found();
     };
     let cache = CachePolicy::default().cache_control(layer);
-    with_cache(bytes, &variant.content_type, &cache)
+    with_cache(bytes, &variant.content_type, &cache, range)
 }
 
-fn with_cache(bytes: Vec<u8>, content_type: &str, cache: &str) -> Response {
+/// A public answer: cached by digest, with the content type the catalogue recorded, and the
+/// same slice rules the internal route follows.
+///
+/// The range is applied to whichever bytes this answer carries, so a client is never handed
+/// a slice of a variant with the length of the original.
+fn with_cache(
+    bytes: Vec<u8>,
+    content_type: &str,
+    cache: &str,
+    range: Option<&HeaderValue>,
+) -> Response {
     let content_type = HeaderValue::from_str(content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     let cache = HeaderValue::from_str(cache)
         .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600"));
-    (
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, cache),
-        ],
-        Body::from(bytes),
-    )
-        .into_response()
+    let mut response = sliced_response(slice(bytes, range));
+    let out = response.headers_mut();
+    out.insert(header::CONTENT_TYPE, content_type);
+    out.insert(header::CACHE_CONTROL, cache);
+    response
 }
 
 fn not_found() -> Response {
@@ -754,6 +788,89 @@ async fn internal_bytes(
     Some((fetched, true))
 }
 
+/// One `Range` header resolved against one body.
+struct Sliced {
+    status: StatusCode,
+    body: Vec<u8>,
+    /// The inclusive slice the body carries, when the answer is a 206.
+    span: Option<(u64, u64)>,
+    /// The length of the whole representation, which a 206 and a 416 both have to name.
+    total: u64,
+}
+
+/// Resolves at most one `bytes=` range against `bytes`.
+///
+/// A header nothing can parse is ignored, which is what RFC 9110 asks for: the client gets
+/// the whole representation rather than an error it cannot act on. Both the public and the
+/// internal answer go through this, so a seek follows the same rules on either route.
+fn slice(bytes: Vec<u8>, range_header: Option<&HeaderValue>) -> Sliced {
+    let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let parsed = range_header
+        .and_then(|value| value.to_str().ok())
+        .map(ByteRange::parse);
+    let unsatisfiable = Sliced {
+        status: StatusCode::RANGE_NOT_SATISFIABLE,
+        body: Vec::new(),
+        span: None,
+        total,
+    };
+    match parsed {
+        None | Some(Err(RangeError::Malformed)) => Sliced {
+            status: StatusCode::OK,
+            body: bytes,
+            span: None,
+            total,
+        },
+        Some(Err(RangeError::Unsatisfiable)) => unsatisfiable,
+        Some(Ok(range)) => match range.resolve(total) {
+            Ok((start, end)) => match bytes
+                .get(
+                    usize::try_from(start).unwrap_or(usize::MAX)
+                        ..=usize::try_from(end).unwrap_or(usize::MAX),
+                )
+                .map(<[u8]>::to_vec)
+            {
+                Some(kept) => Sliced {
+                    status: StatusCode::PARTIAL_CONTENT,
+                    body: kept,
+                    span: Some((start, end)),
+                    total,
+                },
+                None => unsatisfiable,
+            },
+            Err(_) => unsatisfiable,
+        },
+    }
+}
+
+/// The status and body of a sliced answer, with the headers a ranged client reads: the length
+/// actually sent, and the slice — or, for a 416, the length of the whole object, which is the
+/// only part of a refused answer a client can use.
+fn sliced_response(sliced: Sliced) -> Response {
+    let Sliced {
+        status,
+        body,
+        span,
+        total,
+    } = sliced;
+    let sent = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    let mut response = (status, Body::from(body)).into_response();
+    let out = response.headers_mut();
+    out.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(value) = HeaderValue::from_str(&sent.to_string()) {
+        out.insert(header::CONTENT_LENGTH, value);
+    }
+    let content_range = span
+        .map(|(start, end)| format!("bytes {start}-{end}/{total}"))
+        .or_else(|| {
+            (status == StatusCode::RANGE_NOT_SATISFIABLE).then(|| format!("bytes */{total}"))
+        });
+    if let Some(value) = content_range.and_then(|text| HeaderValue::from_str(&text).ok()) {
+        out.insert(header::CONTENT_RANGE, value);
+    }
+    response
+}
+
 /// The internal answer: octet-stream, an honest length, one range with its 206/416, and
 /// the forwarded marker when the bytes came from a peer.
 fn internal_response(
@@ -761,60 +878,15 @@ fn internal_response(
     range_header: Option<&HeaderValue>,
     forwarded: bool,
 ) -> Response {
-    let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let parsed = range_header
-        .and_then(|value| value.to_str().ok())
-        .map(ByteRange::parse);
-    let (status, body, span) = match parsed {
-        // A range we cannot parse is ignored, which is what RFC 9110 asks for: the client
-        // gets the whole representation rather than an error it cannot act on.
-        None | Some(Err(RangeError::Malformed)) => (StatusCode::OK, bytes, None),
-        Some(Err(RangeError::Unsatisfiable)) => return unsatisfiable(total),
-        Some(Ok(range)) => match range.resolve(total) {
-            Ok((start, end)) => {
-                let kept = bytes
-                    .get(
-                        usize::try_from(start).unwrap_or(usize::MAX)
-                            ..=usize::try_from(end).unwrap_or(usize::MAX),
-                    )
-                    .map(<[u8]>::to_vec);
-                match kept {
-                    Some(kept) => (StatusCode::PARTIAL_CONTENT, kept, Some((start, end))),
-                    None => return unsatisfiable(total),
-                }
-            }
-            Err(_) => return unsatisfiable(total),
-        },
-    };
-    let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
-    let mut response = (status, Body::from(body)).into_response();
-    let out = response.headers_mut();
-    out.insert(
+    let mut response = sliced_response(slice(bytes, range_header));
+    response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
-    out.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
-        out.insert(header::CONTENT_LENGTH, value);
-    }
-    if let Some((start, end)) = span {
-        if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
-            out.insert(header::CONTENT_RANGE, value);
-        }
-    }
     if forwarded {
-        out.insert(cluster::FORWARDED_HEADER, HeaderValue::from_static("1"));
-    }
-    response
-}
-
-/// `416` with the length, which is the only part of the answer a ranged client can use.
-fn unsatisfiable(len: u64) -> Response {
-    let mut response = (StatusCode::RANGE_NOT_SATISFIABLE, "").into_response();
-    let out = response.headers_mut();
-    out.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    if let Ok(value) = HeaderValue::from_str(&format!("bytes */{len}")) {
-        out.insert(header::CONTENT_RANGE, value);
+        response
+            .headers_mut()
+            .insert(cluster::FORWARDED_HEADER, HeaderValue::from_static("1"));
     }
     response
 }
@@ -1332,6 +1404,85 @@ mod tests {
             .body(Body::empty())
             .expect("request");
         let (status, _, bytes) = answer(&serving, rambling).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            bytes, body,
+            "an unreadable range must not truncate the answer"
+        );
+    }
+
+    /// The public answer for a body already in hand, which is what both `/media/{id}` and
+    /// `/media/{id}/{layer}` return once they have the bytes. The catalogue needs a database
+    /// this harness does not have, so the range rules are asserted on the response the route
+    /// builds rather than through a router that would answer 404 first.
+    async fn public_answer(
+        body: &[u8],
+        range: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let range = range.map(|value| {
+            axum::http::HeaderValue::from_str(value).expect("a test range is a valid header")
+        });
+        let response = super::with_cache(
+            body.to_vec(),
+            "image/png",
+            "public, max-age=31536000, immutable",
+            range.as_ref(),
+        );
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body")
+            .to_vec();
+        (status, headers, bytes)
+    }
+
+    /// A public read honours one `bytes=` range exactly as the internal route does: a slice
+    /// with its `Content-Range`, a 416 that still carries the length, and the whole body for
+    /// a header that is not one range — never an error a client cannot act on.
+    #[tokio::test]
+    async fn the_public_media_answer_honours_one_range() {
+        let body = b"0123456789abcdef";
+
+        let (status, headers, bytes) = public_answer(body, Some("bytes=0-3")).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(bytes, b"0123", "the range was not served as that slice");
+        assert_eq!(
+            headers.get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes 0-3/16")
+        );
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("image/png"),
+            "a partial answer kept its content type"
+        );
+        assert_eq!(
+            headers.get("accept-ranges").and_then(|v| v.to_str().ok()),
+            Some("bytes")
+        );
+
+        let (status, headers, bytes) = public_answer(body, Some("bytes=999999-")).await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            headers.get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes */16"),
+            "a 416 has to say how long the object is"
+        );
+        assert!(bytes.is_empty(), "a 416 carries no body");
+
+        let (status, headers, bytes) = public_answer(body, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, body, "an unranged read is the whole original");
+        assert_eq!(
+            headers.get("content-length").and_then(|v| v.to_str().ok()),
+            Some("16")
+        );
+        assert!(
+            headers.get("content-range").is_none(),
+            "a 200 has no range to describe"
+        );
+
+        let (status, _, bytes) = public_answer(body, Some("bytes=lots")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             bytes, body,
