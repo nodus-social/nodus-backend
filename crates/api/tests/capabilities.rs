@@ -321,7 +321,21 @@ const DRIVE_ROUTES: &[(&str, &str)] = &[
 /// The drive's source, read for its route calls.
 const DRIVE_SOURCE: &str = include_str!("../src/drive.rs");
 
+/// The state of a fully configured instance: every capability switch on.
+///
+/// The capability table below describes what this code can serve, so the baseline state
+/// must not silently be a degraded deployment — `drive_share` would drop out of the
+/// published list and the table would look wrong for a reason that has nothing to do with
+/// the routes. The unconfigured case is asserted separately, with its own state.
 fn state() -> AppState {
+    instance(true)
+}
+
+/// A state whose only variable is whether share links are configured.
+///
+/// Built rather than read from the environment: the test process has one environment and
+/// the two cases here need opposite answers at the same moment.
+fn instance(share_links: bool) -> AppState {
     // A lazy pool: this test asserts routing and status codes, never a row. A handler that
     // reaches the database stops at the connect attempt, which is still a rejection by the
     // grant in front of it, and still not a 404.
@@ -339,6 +353,7 @@ fn state() -> AppState {
             registrations_open: false,
         },
     )
+    .with_drive_share(share_links)
 }
 
 /// How long a probe waits for a handler that has no database to reach.
@@ -422,9 +437,14 @@ async fn status_and_type(path: &str) -> (StatusCode, Option<String>) {
     (status, content_type)
 }
 
-/// The body of a public JSON document.
+/// The body of a public JSON document from the default (fully configured) state.
 async fn document(path: &str) -> Value {
-    let response = router(state())
+    document_from(state(), path).await
+}
+
+/// The body of a public JSON document from the state given.
+async fn document_from(state: AppState, path: &str) -> Value {
+    let response = router(state)
         .oneshot(
             Request::builder()
                 .uri(path)
@@ -627,6 +647,45 @@ async fn the_handshake_and_the_protocol_screen_publish_one_vocabulary() {
         "/api/v1/nodus/capabilities publishes a different list from /api/v1/meta; \
          two vocabularies with one meaning is what makes a console's gate untrustworthy"
     );
+}
+
+#[tokio::test]
+async fn drive_share_is_published_only_when_share_links_are_configured() {
+    // The state is built both ways: the same process, two instances, one with the secret
+    // the route signs with and one without. Nothing here depends on the ambient environment.
+    let unconfigured = advertised(&document_from(instance(false), "/api/v1/meta").await);
+    let configured = advertised(&document_from(instance(true), "/api/v1/meta").await);
+
+    assert!(
+        !unconfigured.iter().any(|name| name == "drive_share"),
+        "`drive_share` is advertised by an instance whose share route would refuse for want \
+         of NODUS_DRIVE_SHARE_SECRET: {unconfigured:?}"
+    );
+    assert!(
+        configured.iter().any(|name| name == "drive_share"),
+        "`drive_share` is withheld although the secret is configured: {configured:?}"
+    );
+
+    // Exactly one name changes hands, and it is not the drive around it: the tree, the
+    // content route and the attach hand-off need no secret and stay advertised either way.
+    assert_eq!(
+        unconfigured.len(),
+        configured.len() - 1,
+        "more than `drive_share` moved: unconfigured {unconfigured:?} vs configured {configured:?}"
+    );
+    assert!(unconfigured.iter().any(|name| name == "drive"));
+
+    // The protocol screen is the same view of the same list, so it must not disagree with
+    // the handshake on either instance — the two are what a console gates on.
+    for (share_links, expected) in [(false, &unconfigured), (true, &configured)] {
+        let capabilities = document_from(instance(share_links), "/api/v1/nodus/capabilities").await;
+        assert_eq!(
+            &advertised(&capabilities),
+            expected,
+            "/api/v1/nodus/capabilities disagrees with /api/v1/meta when share links are \
+             {share_links}"
+        );
+    }
 }
 
 #[tokio::test]

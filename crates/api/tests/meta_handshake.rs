@@ -16,6 +16,9 @@ use nodus_server_store::Store;
 
 fn state() -> AppState {
     // A lazy pool: these tests assert routing and serialization, never a query.
+    // Every capability switch is on, so this state is the whole vocabulary: the conditional
+    // half (`drive_share` without NODUS_DRIVE_SHARE_SECRET) is asserted in
+    // `tests/capabilities.rs`, where both states are built side by side.
     let store = Store::connect_lazy("postgres://nodus:nodus@127.0.0.1:1/nodus", 1);
     AppState::new(
         store,
@@ -30,6 +33,7 @@ fn state() -> AppState {
             registrations_open: false,
         },
     )
+    .with_drive_share(true)
 }
 
 async fn get(path: &str) -> (StatusCode, Option<String>, Value) {

@@ -70,6 +70,7 @@ where
         sink.clone(),
     )
     .with_authorized_fetch(config.authorized_fetch)
+    .with_drive_share(crate::drive::share_links_configured())
     .with_account_delete_grace_days(config.account_delete_grace_days);
     tokio::spawn(crate::schedules::run(state.clone()));
     // The subscription sweep lives here rather than in the pruning worker: it is an
@@ -129,6 +130,7 @@ fn router(
             sink,
         )
         .with_authorized_fetch(config.authorized_fetch)
+        .with_drive_share(crate::drive::share_links_configured())
         .with_account_delete_grace_days(config.account_delete_grace_days),
     );
     let auth = nodus_auth::router(nodus_auth::AppState::new(

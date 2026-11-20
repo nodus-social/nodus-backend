@@ -600,7 +600,7 @@ pub async fn share_file(
     let Some(secret) = share_secret() else {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "share links are not configured",
+            "share links are not configured on this instance: NODUS_DRIVE_SHARE_SECRET is unset",
         ));
     };
     let id = parse_uuid(&id)?;
@@ -969,6 +969,15 @@ fn env_value(name: &str) -> Option<String> {
 /// The key share links are signed with, when the deployment has set one.
 fn share_secret() -> Option<Vec<u8>> {
     env_value("NODUS_DRIVE_SHARE_SECRET").map(String::into_bytes)
+}
+
+/// Whether this deployment can mint share links at all.
+///
+/// Read once, in the binary, and handed to the state: `/api/v1/meta` publishes
+/// `drive_share` only when this is true, so the console never draws a button whose route
+/// would answer [`share_file`]'s refusal.
+pub(crate) fn share_links_configured() -> bool {
+    share_secret().is_some()
 }
 
 /// Parses an optional id from a query string or form field. `None` is the root.

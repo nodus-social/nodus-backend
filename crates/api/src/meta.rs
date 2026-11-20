@@ -6,11 +6,14 @@
 //! opens onto a 404. One document, one list, one process: a client must not have to ask a
 //! second host what this one can do.
 
+use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use nodus_shared::{Meta, CONTRACT_VERSION, MIN_CONTRACT_VERSION};
+
+use crate::state::AppState;
 
 /// Capabilities this instance serves.
 ///
@@ -81,18 +84,32 @@ pub const FEATURES: [&str; 28] = [
     "drive_attach", // POST /api/v1/drive/files/{id}/attach; POST /api/v1/media {stored_object_id}
 ];
 
-/// The capability names as owned strings, for documents that serialize their own envelope.
-pub fn features() -> Vec<String> {
-    FEATURES.iter().map(|name| (*name).to_owned()).collect()
+/// The capability names this deployment can actually honour, as owned strings.
+///
+/// [`FEATURES`] is the vocabulary, not the answer: a name whose routes need a setting that
+/// is absent is a door that opens onto a refusal, so it is withheld rather than advertised.
+/// `drive_share` is the first such name — `POST /api/v1/drive/files/{id}/share` signs with
+/// `NODUS_DRIVE_SHARE_SECRET` and refuses without one (`crate::drive::share_file`), so an
+/// instance that has no secret must not tell a console to draw the button.
+///
+/// The switch is passed in rather than read here: the binary reads the environment once
+/// (`run.rs`) and tests construct the state they mean, so this function stays pure and the
+/// same call is made by `/api/v1/meta` and `/api/v1/nodus/capabilities`.
+pub fn features(share_links: bool) -> Vec<String> {
+    FEATURES
+        .iter()
+        .filter(|name| **name != "drive_share" || share_links)
+        .map(|name| (*name).to_owned())
+        .collect()
 }
 
 /// Report the contract version and every capability this instance serves.
-pub async fn meta() -> Response {
+pub async fn meta(State(state): State<AppState>) -> Response {
     let body = Meta {
         api: "1".to_owned(),
         contract: CONTRACT_VERSION.to_owned(),
         min_contract: MIN_CONTRACT_VERSION.to_owned(),
-        features: features(),
+        features: features(state.drive_share()),
     };
     // Safe to cache for a minute: the payload changes only on deploy, and a stale copy can
     // at worst delay a new feature flag by that minute.

@@ -48,6 +48,9 @@ struct Inner {
     /// `NODUS_AUTHORIZED_FETCH`, read once at startup. Off means ActivityPub reads
     /// answer anyone, exactly as they did before the switch existed.
     authorized_fetch: bool,
+    /// `NODUS_DRIVE_SHARE_SECRET`, read once at startup. Off means the drive's share
+    /// route refuses, so `drive_share` is withheld from the handshake.
+    drive_share: bool,
     /// Process-local, keyed by the `range` the console asked for.
     stats_cache: Mutex<HashMap<&'static str, (Instant, StatsDto)>>,
     /// Signing actor URL → (resolved at, PEM). Only successful lookups are inserted.
@@ -182,6 +185,7 @@ impl AppState {
                 instance,
                 federation: federation.map(Arc::new),
                 authorized_fetch: false,
+                drive_share: false,
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
@@ -203,6 +207,30 @@ impl AppState {
                 instance: self.inner.instance.clone(),
                 federation: self.inner.federation.clone(),
                 authorized_fetch: enabled,
+                drive_share: self.inner.drive_share,
+                stats_cache: Mutex::new(HashMap::new()),
+                actor_keys: Mutex::new(HashMap::new()),
+                key_fetches: Mutex::new(HashMap::new()),
+                account_delete_grace_days: self.inner.account_delete_grace_days,
+                writer: self.inner.writer.clone(),
+            }),
+        }
+    }
+
+    /// The same state with drive share links on or off.
+    ///
+    /// `NODUS_DRIVE_SHARE_SECRET` is read once, in the binary, for the same reason as the
+    /// secure-mode switch: a capability that changed between two requests would let the
+    /// handshake advertise a route that the next request refuses.
+    #[must_use]
+    pub fn with_drive_share(self, enabled: bool) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                store: self.inner.store.clone(),
+                instance: self.inner.instance.clone(),
+                federation: self.inner.federation.clone(),
+                authorized_fetch: self.inner.authorized_fetch,
+                drive_share: enabled,
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
@@ -221,6 +249,7 @@ impl AppState {
                 instance: self.inner.instance.clone(),
                 federation: self.inner.federation.clone(),
                 authorized_fetch: self.inner.authorized_fetch,
+                drive_share: self.inner.drive_share,
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
@@ -228,6 +257,12 @@ impl AppState {
                 writer: self.inner.writer.clone(),
             }),
         }
+    }
+
+    /// Whether drive share links are configured (`NODUS_DRIVE_SHARE_SECRET` is set).
+    #[must_use]
+    pub fn drive_share(&self) -> bool {
+        self.inner.drive_share
     }
 
     /// Days between a deletion request and the purge of the tombstone's fields.

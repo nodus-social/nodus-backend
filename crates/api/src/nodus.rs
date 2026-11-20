@@ -135,8 +135,9 @@ async fn events_stream(
 /// The capability vocabulary, as `GET /api/v1/meta` publishes it.
 ///
 /// This document is a view of that one list, not a second one: `features` here is
-/// [`crate::meta::FEATURES`] verbatim, so `/api/v1/nodus/capabilities` is a subset of the
-/// same set with the same meaning — in practice, equal to it. The earlier
+/// [`crate::meta::features`] called with the same switch as `/api/v1/meta`, so
+/// `/api/v1/nodus/capabilities` is a subset of the same set with the same meaning — in
+/// practice, equal to it. The earlier
 /// `["batch", "events", "state_sync"]` was a second vocabulary for the same idea:
 /// `state_sync` named nothing a client could call, and none of the three told a console
 /// anything `/api/v1/meta` did not. Only `contract` is this document's own; it says which
@@ -148,10 +149,10 @@ struct CapabilitiesDto {
     features: Vec<String>,
 }
 
-async fn capabilities() -> Json<CapabilitiesDto> {
+async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesDto> {
     Json(CapabilitiesDto {
         contract: CONTRACT.to_owned(),
-        features: crate::meta::features(),
+        features: crate::meta::features(state.drive_share()),
     })
 }
 
