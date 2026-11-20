@@ -477,7 +477,8 @@ pub async fn home_page(
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND a.deleted_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
-                            AND r.target_account_id = s.account_id AND r.kind = 'block') \
+                            AND r.target_account_id = s.account_id \
+                            AND r.kind IN ('block', 'mute')) \
             AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
                             AND (p.expires_at IS NULL OR p.expires_at > now())) \
             AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
@@ -498,7 +499,8 @@ pub async fn home_page(
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND a.deleted_at IS NULL \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
-                            AND r.target_account_id = s.account_id AND r.kind = 'block') \
+                            AND r.target_account_id = s.account_id \
+                            AND r.kind IN ('block', 'mute')) \
             AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
                             AND (p.expires_at IS NULL OR p.expires_at > now())) \
             AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
@@ -517,6 +519,95 @@ pub async fn home_page(
         .fetch_all(pool)
         .await?;
     Ok(finish(rows, size))
+}
+
+/// The accounts a status by `target_id` is materialised into, in keyset order.
+///
+/// The author is not included: the caller adds it, because the author's own entry exists
+/// even when their follower count takes them out of the materialised lane. `after` is the
+/// last account of the previous batch, so a 50 000-follower account streams instead of
+/// being collected into one vector.
+///
+/// `max_followers` mirrors the cut-off in [`fan_out_home`]: at or above it the read path
+/// merges the author's posts instead, nothing is materialised, and the caller pushes
+/// nothing into a cache.
+pub async fn home_fanout_accounts(
+    pool: &PgPool,
+    target_id: &str,
+    after: Option<&str>,
+    limit: i64,
+    max_followers: Option<i64>,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT f.account_id FROM follow f \
+           JOIN account a ON a.id = f.target_account_id \
+          WHERE f.target_account_id = $1 AND f.state = 'accepted' \
+            AND ($2::text IS NULL OR f.account_id > $2) \
+            AND ($4::bigint IS NULL OR a.followers_count < $4) \
+          ORDER BY f.account_id LIMIT $3",
+    )
+    .bind(target_id)
+    .bind(after)
+    .bind(limit)
+    .bind(max_followers)
+    .fetch_all(pool)
+    .await
+}
+
+/// Whether the reader follows an account whose posts are merged at read time.
+///
+/// A home cache only ever holds the materialised lane, so a reader who follows a big
+/// account cannot be served from it: those rows are merged by the SQL read.
+pub async fn follows_big_account(
+    pool: &PgPool,
+    account_id: &str,
+    threshold: i64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM follow f \
+           JOIN account a ON a.id = f.target_account_id \
+          WHERE f.account_id = $1 AND f.state = 'accepted' \
+            AND a.followers_count >= $2)",
+    )
+    .bind(account_id)
+    .bind(threshold)
+    .fetch_one(pool)
+    .await
+}
+
+/// The rows of `ids` that a home timeline may still show, in no particular order.
+///
+/// The predicates are the materialised lane of [`home_page`], spelled out rather than
+/// shared, because that query is a `UNION` with an alias per lane and this one is a plain
+/// lookup by primary key. A cached read drops whatever this returns nothing for: a status
+/// deleted or hidden since it was written to the cache.
+pub async fn home_rows(
+    pool: &PgPool,
+    account_id: &str,
+    ids: &[String],
+) -> Result<Vec<StatusRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM status s \
+           JOIN account a ON a.id = s.account_id \
+          WHERE s.id = ANY($2) AND s.deleted_at IS NULL \
+            AND s.quarantined_at IS NULL \
+            AND s.visibility <> 'direct' \
+            AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+            AND a.deleted_at IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
+                            AND r.target_account_id = s.account_id \
+                            AND r.kind IN ('block', 'mute')) \
+            AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
+                            AND (p.expires_at IS NULL OR p.expires_at > now())) \
+            AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
+                            AND m.action = 'suspend' \
+                            AND (m.expires_at IS NULL OR m.expires_at > now()))"
+    );
+    sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(account_id)
+        .bind(ids)
+        .fetch_all(pool)
+        .await
 }
 
 /// A status being written. `id` is minted by the caller so the same id can be used for

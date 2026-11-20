@@ -20,9 +20,11 @@
 //! {"channel":"nodus:invalidate","keys":[{"account_id":"…","kind":"folder","id":"…"}]}
 //! ```
 //!
-//! `kind` is one of `folder`, `object`, `parent_folder`, `attachment`, `account`. A
-//! `parent_folder` key names the folder whose *child listing* changed; its `id` is the
-//! parent's id, or the empty string when the listing that changed is the drive's root.
+//! `kind` is one of `folder`, `object`, `parent_folder`, `attachment`, `account`, `home`.
+//! A `parent_folder` key names the folder whose *child listing* changed; its `id` is the
+//! parent's id, or the empty string when the listing that changed is the drive's root. A
+//! `home` key names a status that must leave the timelines of the account that holds it
+//! (its `account_id` is the timeline's owner, not the status author).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -78,6 +80,9 @@ pub enum InvalidationKind {
     Attachment,
     /// Account-wide numbers, such as the used-bytes total.
     Account,
+    /// A status leaving one account's home timeline (deleted, hidden, or no longer
+    /// visible). The key's `account_id` is the timeline's owner.
+    Home,
 }
 
 impl InvalidationKind {
@@ -90,6 +95,7 @@ impl InvalidationKind {
             Self::ParentFolder => "parent_folder",
             Self::Attachment => "attachment",
             Self::Account => "account",
+            Self::Home => "home",
         }
     }
 }
