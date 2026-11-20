@@ -71,6 +71,8 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/api/v1/meta", get(meta::meta))
         .route("/api/v1/timelines/public", get(mastodon::public_timeline))
         .route("/api/v1/timelines/home", get(mastodon::home_timeline))
+        .route("/api/v1/timelines/list/{id}", get(mastodon::list_timeline))
+        .route("/api/v1/timelines/tag/{tag}", get(mastodon::tag_timeline))
         .route(
             "/api/v1/accounts/verify_credentials",
             get(mastodon::verify_credentials),

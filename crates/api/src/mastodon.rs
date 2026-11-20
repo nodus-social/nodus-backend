@@ -4,7 +4,7 @@
 //! rows into `dto`. Domain decisions (who may see what) live in `nodus-server-store` or
 //! `nodus-server-core`, so this file stays readable as a list of endpoints.
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -160,6 +160,64 @@ pub async fn home_timeline(
         page.next_max_id,
         params,
         "/api/v1/timelines/home",
+        Some(auth.0.account.id.as_str()),
+    )
+    .await
+}
+
+/// `GET /api/v1/timelines/list/{id}`
+///
+/// A list that is not the caller's answers `404 Record not found`, the same body as a
+/// list that does not exist: the id must not confirm that someone else's list is real.
+pub async fn list_timeline(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    Query(query): Query<PageQuery>,
+) -> ApiResult<Response> {
+    auth.require_scope("read")?;
+    let params = query.params()?;
+    let page = nodus_server_store::statuses::list_page(
+        state.store().pool(),
+        &auth.0.account.id,
+        &id,
+        params,
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    let path = format!("/api/v1/timelines/list/{id}");
+    timeline_response(
+        &state,
+        page.items,
+        page.next_max_id,
+        params,
+        &path,
+        Some(auth.0.account.id.as_str()),
+    )
+    .await
+}
+
+/// `GET /api/v1/timelines/tag/{tag}`
+///
+/// The path may carry the leading `#` a client copied from a post; the store's `citext`
+/// column makes the match case-insensitive.
+pub async fn tag_timeline(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(tag): Path<String>,
+    Query(query): Query<PageQuery>,
+) -> ApiResult<Response> {
+    auth.require_scope("read")?;
+    let tag = tag.trim().trim_start_matches('#');
+    let params = query.params()?;
+    let page = nodus_server_store::statuses::tag_page(state.store().pool(), tag, params).await?;
+    let path = format!("/api/v1/timelines/tag/{tag}");
+    timeline_response(
+        &state,
+        page.items,
+        page.next_max_id,
+        params,
+        &path,
         Some(auth.0.account.id.as_str()),
     )
     .await

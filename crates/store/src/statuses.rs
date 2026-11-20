@@ -602,6 +602,106 @@ pub async fn home_page(
     Ok(finish(rows, size))
 }
 
+/// `/api/v1/timelines/list/{id}`: the statuses of one list's members.
+///
+/// `None` when the list is not the caller's: an id that names someone else's list must
+/// answer like an id that names nothing, because a `403` would confirm the list exists.
+/// Direct posts never appear (a list is a reading surface, not a mailbox), and a
+/// followers-only post appears only when the reader actually follows its author — a list
+/// can name an account the reader does not follow, and membership is not a visibility
+/// grant.
+pub async fn list_page(
+    pool: &PgPool,
+    account_id: &str,
+    list_id: &str,
+    params: PageParams,
+) -> Result<Option<StatusPage>, sqlx::Error> {
+    if crate::lists::list(pool, account_id, list_id)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let size = PageSize::default_max(params.limit);
+    let (max_id, lower_id, order) = page_bounds(params);
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM status s \
+           JOIN account a ON a.id = s.account_id \
+           JOIN list_account l ON l.account_id = s.account_id AND l.list_id = $2 \
+         WHERE s.deleted_at IS NULL \
+           AND s.quarantined_at IS NULL \
+           AND s.visibility <> 'direct' \
+           AND (s.visibility IN ('public', 'unlisted') \
+                OR EXISTS (SELECT 1 FROM follow f WHERE f.account_id = $1 \
+                            AND f.target_account_id = s.account_id \
+                            AND f.state = 'accepted')) \
+           AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+           AND a.deleted_at IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
+                           AND r.target_account_id = s.account_id \
+                           AND r.kind IN ('block', 'mute')) \
+           AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
+                           AND (p.expires_at IS NULL OR p.expires_at > now())) \
+           AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
+                           AND m.action = 'suspend' \
+                           AND (m.expires_at IS NULL OR m.expires_at > now())) \
+           AND ($3::text IS NULL OR s.id < $3) \
+           AND ($4::text IS NULL OR s.id > $4) \
+         ORDER BY s.id {order} LIMIT $5"
+    );
+    let rows = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(account_id)
+        .bind(list_id)
+        .bind(max_id)
+        .bind(lower_id)
+        .bind(size.as_i64() + 1)
+        .fetch_all(pool)
+        .await?;
+    Ok(Some(finish(rows, size)))
+}
+
+/// `/api/v1/timelines/tag/{tag}`: public statuses carrying one hashtag.
+///
+/// The visibility predicate is [`public_page`]'s, because a tag page is a public
+/// document in every Mastodon client; `status_tag.tag` is `citext`, so the match is
+/// case-insensitive without lowering anything here.
+pub async fn tag_page(
+    pool: &PgPool,
+    tag: &str,
+    params: PageParams,
+) -> Result<StatusPage, sqlx::Error> {
+    let size = PageSize::default_max(params.limit);
+    let (max_id, lower_id, order) = page_bounds(params);
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM status s \
+           JOIN account a ON a.id = s.account_id \
+           JOIN status_tag t ON t.status_id = s.id \
+         WHERE t.tag = $1::citext AND s.deleted_at IS NULL \
+           AND s.visibility = 'public' \
+           AND s.quarantined_at IS NULL \
+           AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+           AND a.deleted_at IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM instance_block b WHERE b.domain = a.domain \
+                           AND b.severity IN ('suspend', 'silence')) \
+           AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
+                           AND (p.expires_at IS NULL OR p.expires_at > now())) \
+           AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
+                           AND m.action IN ('silence', 'suspend') \
+                           AND (m.expires_at IS NULL OR m.expires_at > now())) \
+           AND ($2::text IS NULL OR s.id < $2) \
+           AND ($3::text IS NULL OR s.id > $3) \
+         ORDER BY s.id {order} LIMIT $4"
+    );
+    let rows = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(tag)
+        .bind(max_id)
+        .bind(lower_id)
+        .bind(size.as_i64() + 1)
+        .fetch_all(pool)
+        .await?;
+    Ok(finish(rows, size))
+}
+
 /// The accounts a status by `target_id` is materialised into, in keyset order.
 ///
 /// The author is not included: the caller adds it, because the author's own entry exists
