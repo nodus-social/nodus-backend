@@ -56,14 +56,29 @@ pub struct Bootstrap {
 /// half-given bootstrap login — each of which is a deployment mistake that would
 /// otherwise show up much later as a wrong link or a forgotten password.
 pub fn read() -> Result<Config, Box<dyn Error>> {
+    let bind = nodus_server_transport::parse(
+        &env::var("NODUS_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
+    )?;
+    read_with_bind(bind)
+}
+
+/// Read the process-wide settings with an explicit listen address.
+///
+/// The `aio` role runs two listeners in one process, so the rest of the environment is
+/// read once per role but the address comes from `NODUS_BIND` for the API and
+/// `NODUS_MEDIA_BIND` for media. Everything else is the environment a standalone service
+/// reads.
+///
+/// # Errors
+///
+/// The same deployment mistakes [`read`] refuses: a number that is not a number, a
+/// half-given bootstrap login, or two telemetry addresses at once.
+pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
     let domain = env::var("NODUS_DOMAIN").unwrap_or_else(|_| "localhost".to_owned());
     let base_url = env::var("NODUS_BASE_URL")
         .unwrap_or_else(|_| format!("https://{domain}"))
         .trim_end_matches('/')
         .to_owned();
-    let bind = nodus_server_transport::parse(
-        &env::var("NODUS_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
-    )?;
     let database_connections = env::var("NODUS_DATABASE_CONNECTIONS")
         .ok()
         .map(|value| value.parse())

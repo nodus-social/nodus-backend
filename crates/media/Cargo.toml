@@ -7,8 +7,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
 axum = { workspace = true }
+nodus-server-runtime = { path = "../runtime" }
 nodus-server-store = { path = "../store" }
+nodus-server-transport = { path = "../transport" }
 nodus-storage = { path = "../storage" }
 reqwest = { workspace = true }
 serde.workspace = true

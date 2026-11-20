@@ -11,7 +11,7 @@ mod media;
 mod telemetry;
 
 pub use boot::{init, prepare, provision_bootstrap, shutdown};
-pub use config::{read, Bootstrap, Config, DEFAULT_BIND, DEFAULT_DATABASE_URL};
+pub use config::{read, read_with_bind, Bootstrap, Config, DEFAULT_BIND, DEFAULT_DATABASE_URL};
 pub use media::{media_dir, prune_media, prune_media_in, variants_dir};
 pub use telemetry::stop as stop_telemetry;
 pub use telemetry::{serve_telemetry, serve_worker, Telemetry};

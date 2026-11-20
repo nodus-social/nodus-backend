@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 ammonia = { workspace = true }
+anyhow = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
@@ -18,8 +19,10 @@ nodus-server-core = { workspace = true }
 nodus-server-federation = { workspace = true }
 nodus-server-media = { workspace = true }
 nodus-server-proto = { path = "../proto" }
+nodus-server-runtime = { path = "../runtime" }
 nodus-server-scan = { path = "../scan" }
 nodus-server-store = { workspace = true }
+nodus-server-transport = { path = "../transport" }
 nodus-storage = { path = "../storage" }
 nodus-shared = { path = "../../../sdk/crates/shared", version = "0.1.0" }
 nodus-auth = { workspace = true }

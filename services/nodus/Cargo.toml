@@ -1,0 +1,26 @@
+[package]
+name = "nodus-nodus"
+description = "One binary, several roles: the API, the media worker, or both in one process."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "nodus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+nodus-server-api.workspace = true
+nodus-server-media = { path = "../../crates/media" }
+nodus-server-runtime = { path = "../../crates/runtime" }
+nodus-server-transport = { path = "../../crates/transport" }
+
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

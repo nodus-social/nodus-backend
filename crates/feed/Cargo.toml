@@ -1,0 +1,21 @@
+[package]
+name = "nodus-server-feed"
+description = "The process around the recommendation and browse surface the client reads."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+nodus-feeds = { path = "../../../recommender/crates/feeds" }
+nodus-server-runtime = { path = "../runtime" }
+nodus-server-transport = { path = "../transport" }
+
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

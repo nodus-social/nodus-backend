@@ -44,10 +44,12 @@ pub mod preferences;
 pub mod reactions;
 pub mod remote;
 pub mod rulewatch;
+pub mod run;
 pub mod schedules;
 pub mod state;
 pub mod statuses;
 
+pub use run::run;
 pub use state::{AppState, FederationKey, InstanceConfig};
 
 use axum::routing::{get, patch, post, put};

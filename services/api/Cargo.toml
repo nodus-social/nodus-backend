@@ -12,15 +12,9 @@ name = "nodus-api"
 path = "src/main.rs"
 
 [dependencies]
-nodus-auth.workspace = true
+anyhow.workspace = true
 nodus-server-api.workspace = true
-nodus-server-runtime = { path = "../../crates/runtime" }
-nodus-server-store.workspace = true
-nodus-server-transport = { path = "../../crates/transport" }
-
-axum.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

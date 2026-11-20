@@ -15,7 +15,10 @@ pub mod cluster;
 pub mod hash;
 pub mod process;
 pub mod repair;
+pub mod run;
 pub mod serve;
+
+pub use run::run;
 
 #[cfg(test)]
 mod testpeer;

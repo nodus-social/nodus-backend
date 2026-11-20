@@ -11,12 +11,9 @@ name = "nodus-media"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 nodus-server-media = { path = "../../crates/media" }
-nodus-server-runtime = { path = "../../crates/runtime" }
-nodus-server-store = { path = "../../crates/store" }
-nodus-server-transport = { path = "../../crates/transport" }
 tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true

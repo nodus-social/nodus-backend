@@ -2405,14 +2405,9 @@ dependencies = [
 name = "nodus-api"
 version = "0.1.0"
 dependencies = [
- "axum 0.8.9",
- "nodus-auth",
+ "anyhow",
  "nodus-server-api",
- "nodus-server-runtime",
- "nodus-server-store",
- "nodus-server-transport",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2517,11 +2512,9 @@ dependencies = [
 name = "nodus-feed"
 version = "0.1.0"
 dependencies = [
- "nodus-feeds",
- "nodus-server-runtime",
- "nodus-server-transport",
+ "anyhow",
+ "nodus-server-feed",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2561,12 +2554,9 @@ dependencies = [
 name = "nodus-media"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "nodus-server-media",
- "nodus-server-runtime",
- "nodus-server-store",
- "nodus-server-transport",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2588,6 +2578,19 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "nodus-nodus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nodus-server-api",
+ "nodus-server-media",
+ "nodus-server-runtime",
+ "nodus-server-transport",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2630,6 +2633,7 @@ name = "nodus-server-api"
 version = "0.1.0"
 dependencies = [
  "ammonia",
+ "anyhow",
  "axum 0.8.9",
  "axum-extra",
  "base64 0.22.1",
@@ -2648,9 +2652,11 @@ dependencies = [
  "nodus-server-federation",
  "nodus-server-media",
  "nodus-server-proto",
+ "nodus-server-runtime",
  "nodus-server-scan",
  "nodus-server-sdk",
  "nodus-server-store",
+ "nodus-server-transport",
  "nodus-shared",
  "nodus-storage",
  "rand 0.9.5",
@@ -2694,13 +2700,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus-server-feed"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nodus-feeds",
+ "nodus-server-runtime",
+ "nodus-server-transport",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nodus-server-media"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum 0.8.9",
  "blurhash",
  "image",
+ "nodus-server-runtime",
  "nodus-server-store",
+ "nodus-server-transport",
  "nodus-storage",
  "reqwest",
  "serde",

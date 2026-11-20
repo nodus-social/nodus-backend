@@ -12,12 +12,9 @@ name = "nodus-feed"
 path = "src/main.rs"
 
 [dependencies]
-nodus-feeds = { path = "../../../recommender/crates/feeds" }
-nodus-server-runtime = { path = "../../crates/runtime" }
-nodus-server-transport = { path = "../../crates/transport" }
-
+anyhow.workspace = true
+nodus-server-feed.workspace = true
 tokio.workspace = true
-tracing.workspace = true
 
 [lints]
 workspace = true
