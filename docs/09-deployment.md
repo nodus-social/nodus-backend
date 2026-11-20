@@ -129,6 +129,28 @@ failure for every image on the instance. Co-locating media workers with the
 monolith is fine at small scale; scaling them out is just more replicas. A GPU
 transcode pool is a separate worker class if it is ever needed.
 
+### Drive share links
+
+`POST /api/v1/drive/files/{id}/share` mints a signed `/media/share/{token}` URL
+whose bytes anyone may read until it expires. The capability is signed with
+`NODUS_DRIVE_SHARE_SECRET` (32 random bytes, `openssl rand -hex 32`); without it
+the route answers `503` and `drive_share` is left out of `/api/v1/meta` and
+`/api/v1/nodus/capabilities`, so clients never offer a link that cannot be
+minted.
+
+The route is served by the API, not by the media service: it resolves a digest
+from the token rather than an object id. A split deployment must therefore send
+`/media/share/*` to the API before the `/media/*` catch-all:
+
+```caddyfile
+handle /media/share/* {
+	reverse_proxy 10.0.0.11:3001
+}
+handle /media/* {
+	reverse_proxy 10.0.0.11:3003
+}
+```
+
 ## Logging and abuse alerts
 
 Every request is logged by `tower_http::trace::TraceLayer` with method, path,
