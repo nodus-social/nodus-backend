@@ -15,7 +15,7 @@
 //!   counter, and a timestamp-ordered id keeps inserts appending to the index.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 /// A row of `drive_folder`.
@@ -141,6 +141,20 @@ pub async fn create_folder(
     parent: Option<Uuid>,
     name: &str,
 ) -> Result<DriveFolder, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    create_folder_tx(&mut connection, account, parent, name).await
+}
+
+/// [`create_folder`] on a connection the caller already holds.
+///
+/// The writer runs this inside its batch's transaction, so the statement must not begin
+/// one of its own; the pool wrapper above is the single-statement case.
+pub(crate) async fn create_folder_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    parent: Option<Uuid>,
+    name: &str,
+) -> Result<DriveFolder, sqlx::Error> {
     let sql = format!(
         "INSERT INTO drive_folder (account_id, id, parent_id, name) \
          VALUES ($1, $2, $3, $4) RETURNING {FOLDER_COLUMNS}"
@@ -150,7 +164,7 @@ pub async fn create_folder(
         .bind(Uuid::now_v7())
         .bind(parent)
         .bind(name)
-        .fetch_one(pool)
+        .fetch_one(&mut *connection)
         .await
 }
 
@@ -176,6 +190,16 @@ pub async fn rename_folder(
     id: Uuid,
     name: &str,
 ) -> Result<bool, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    rename_folder_tx(&mut connection, account, id, name).await
+}
+
+pub(crate) async fn rename_folder_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+    name: &str,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE drive_folder SET name = $3, updated_at = now() \
          WHERE account_id = $1 AND id = $2",
@@ -183,7 +207,7 @@ pub async fn rename_folder(
     .bind(account)
     .bind(id)
     .bind(name)
-    .execute(pool)
+    .execute(&mut *connection)
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -200,6 +224,21 @@ pub async fn move_folder(
     parent: Option<Uuid>,
 ) -> Result<(), MoveError> {
     let mut tx = pool.begin().await?;
+    move_folder_tx(&mut tx, account, id, parent).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The check-and-update, on a connection the caller already holds.
+///
+/// The caller owns the transaction: the writer's batch is one transaction for many
+/// statements, and a move must not open a second one inside it.
+pub(crate) async fn move_folder_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+    parent: Option<Uuid>,
+) -> Result<(), MoveError> {
     if let Some(parent) = parent {
         let cycle: bool = sqlx::query_scalar(
             "WITH RECURSIVE subtree AS ( \
@@ -214,7 +253,7 @@ pub async fn move_folder(
         .bind(account)
         .bind(id)
         .bind(parent)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
         if cycle {
             return Err(MoveError::Cycle);
@@ -227,7 +266,7 @@ pub async fn move_folder(
     .bind(account)
     .bind(id)
     .bind(parent)
-    .execute(&mut *tx)
+    .execute(&mut *connection)
     .await;
     match result {
         Ok(done) if done.rows_affected() == 1 => {}
@@ -237,7 +276,6 @@ pub async fn move_folder(
         Err(error) if is_foreign_key_violation(&error) => return Err(MoveError::NotFound),
         Err(error) => return Err(MoveError::Db(error)),
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -252,6 +290,17 @@ pub async fn delete_folder(
     id: Uuid,
 ) -> Result<Vec<String>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let digests = delete_folder_tx(&mut tx, account, id).await?;
+    tx.commit().await?;
+    Ok(digests)
+}
+
+/// Deletes the subtree on a connection the caller already holds, digests included.
+pub(crate) async fn delete_folder_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+) -> Result<Vec<String>, sqlx::Error> {
     let digests: Vec<String> = sqlx::query_scalar(
         "WITH RECURSIVE subtree AS ( \
              SELECT id FROM drive_folder WHERE account_id = $1 AND id = $2 \
@@ -266,14 +315,13 @@ pub async fn delete_folder(
     )
     .bind(account)
     .bind(id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *connection)
     .await?;
     sqlx::query("DELETE FROM drive_folder WHERE account_id = $1 AND id = $2")
         .bind(account)
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
-    tx.commit().await?;
     let mut digests = digests;
     digests.sort_unstable();
     digests.dedup();
@@ -286,6 +334,29 @@ pub async fn delete_folder(
 /// digest either names bytes the store already has or names nothing.
 pub async fn create_object(
     pool: &PgPool,
+    account: &str,
+    folder: Option<Uuid>,
+    filename: &str,
+    mime_type: &str,
+    sha256: &str,
+    byte_size: i64,
+) -> Result<DriveObject, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    create_object_tx(
+        &mut connection,
+        account,
+        folder,
+        filename,
+        mime_type,
+        sha256,
+        byte_size,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, reason = "one row, one column each")]
+pub(crate) async fn create_object_tx(
+    connection: &mut PgConnection,
     account: &str,
     folder: Option<Uuid>,
     filename: &str,
@@ -306,7 +377,7 @@ pub async fn create_object(
         .bind(mime_type)
         .bind(sha256)
         .bind(byte_size)
-        .fetch_one(pool)
+        .fetch_one(&mut *connection)
         .await
 }
 
@@ -354,12 +425,22 @@ pub async fn rename_object(
     id: Uuid,
     filename: &str,
 ) -> Result<bool, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    rename_object_tx(&mut connection, account, id, filename).await
+}
+
+pub(crate) async fn rename_object_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+    filename: &str,
+) -> Result<bool, sqlx::Error> {
     let result =
         sqlx::query("UPDATE drive_object SET filename = $3 WHERE account_id = $1 AND id = $2")
             .bind(account)
             .bind(id)
             .bind(filename)
-            .execute(pool)
+            .execute(&mut *connection)
             .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -373,12 +454,22 @@ pub async fn move_object(
     id: Uuid,
     folder: Option<Uuid>,
 ) -> Result<bool, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    move_object_tx(&mut connection, account, id, folder).await
+}
+
+pub(crate) async fn move_object_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+    folder: Option<Uuid>,
+) -> Result<bool, sqlx::Error> {
     let result =
         sqlx::query("UPDATE drive_object SET folder_id = $3 WHERE account_id = $1 AND id = $2")
             .bind(account)
             .bind(id)
             .bind(folder)
-            .execute(pool)
+            .execute(&mut *connection)
             .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -390,12 +481,22 @@ pub async fn set_visibility(
     id: Uuid,
     visibility: Visibility,
 ) -> Result<bool, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    set_visibility_tx(&mut connection, account, id, visibility).await
+}
+
+pub(crate) async fn set_visibility_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+    visibility: Visibility,
+) -> Result<bool, sqlx::Error> {
     let result =
         sqlx::query("UPDATE drive_object SET visibility = $3 WHERE account_id = $1 AND id = $2")
             .bind(account)
             .bind(id)
             .bind(visibility.as_str())
-            .execute(pool)
+            .execute(&mut *connection)
             .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -407,13 +508,23 @@ pub async fn set_state(
     id: Uuid,
     state: ProcessingState,
 ) -> Result<bool, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    set_state_tx(&mut connection, account, id, state).await
+}
+
+pub(crate) async fn set_state_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+    state: ProcessingState,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE drive_object SET processing_state = $3 WHERE account_id = $1 AND id = $2",
     )
     .bind(account)
     .bind(id)
     .bind(state.as_str())
-    .execute(pool)
+    .execute(&mut *connection)
     .await?;
     Ok(result.rows_affected() == 1)
 }
@@ -428,12 +539,21 @@ pub async fn delete_object(
     account: &str,
     id: Uuid,
 ) -> Result<Option<String>, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    delete_object_tx(&mut connection, account, id).await
+}
+
+pub(crate) async fn delete_object_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(
         "DELETE FROM drive_object WHERE account_id = $1 AND id = $2 RETURNING sha256",
     )
     .bind(account)
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await
 }
 
@@ -521,6 +641,29 @@ pub async fn attach_object(
     focus: Option<&str>,
     blurhash: Option<&str>,
 ) -> Result<Option<String>, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    attach_object_tx(
+        &mut connection,
+        account,
+        object_id,
+        status_id,
+        alt_text,
+        focus,
+        blurhash,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, reason = "one row, one column each")]
+pub(crate) async fn attach_object_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    object_id: Uuid,
+    status_id: Option<&str>,
+    alt_text: &str,
+    focus: Option<&str>,
+    blurhash: Option<&str>,
+) -> Result<Option<String>, sqlx::Error> {
     sqlx::query_scalar(
         "INSERT INTO media_attachment \
          (id, account_id, status_id, digest, content_type, size, blurhash, description, \
@@ -542,7 +685,7 @@ pub async fn attach_object(
     .bind(alt_text)
     .bind(blurhash)
     .bind(focus)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await
 }
 

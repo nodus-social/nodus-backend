@@ -82,6 +82,18 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
+/// A write that went to the single-writer actor failed: same answer as any other
+/// database failure, with the flattened SQLSTATE kept in the log.
+impl From<nodus_server_store::writer::StoreError> for ApiError {
+    fn from(error: nodus_server_store::writer::StoreError) -> Self {
+        tracing::error!(error = %error, "database write error");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong on our side",
+        )
+    }
+}
+
 impl From<std::io::Error> for ApiError {
     fn from(error: std::io::Error) -> Self {
         tracing::error!(error = %error, "media storage error");

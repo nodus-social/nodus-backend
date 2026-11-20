@@ -44,6 +44,7 @@ pub mod schedules;
 pub mod social;
 pub mod stats;
 pub mod statuses;
+pub mod writer;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -71,6 +72,18 @@ impl Store {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// The writer's own pool: one connection, built from this pool's connect options.
+    ///
+    /// `max_connections(1)` is not a tuning knob — it is the single writer. Copying the
+    /// connect options keeps whatever this pool was opened with, including the
+    /// `search_path` a test harness scopes a schema to.
+    #[must_use]
+    pub fn write_pool(&self) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with((*self.pool.connect_options()).clone())
     }
 
     /// A pool that connects on first use.

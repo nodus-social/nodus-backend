@@ -26,9 +26,8 @@ use uuid::Uuid;
 use nodus_server_core::limits::PAGE_MAX;
 use nodus_server_core::PageSize;
 use nodus_server_media::cluster;
-use nodus_server_store::drive::{
-    self, DriveFolder, DriveObject, MoveError, ProcessingState, Visibility,
-};
+use nodus_server_store::drive::{self, DriveFolder, DriveObject, ProcessingState, Visibility};
+use nodus_server_store::writer::StoreError;
 use nodus_storage::{BlobError, BlobStore, ByteRange, Capability, LocalDiskBlobStore, RangeError};
 
 use crate::auth::Auth;
@@ -208,12 +207,14 @@ pub async fn create_folder(
     auth.require_scope("write:drive")?;
     let name = required_name(&input.name)?;
     let parent = parse_id(input.parent_id.as_deref())?;
-    let row = drive::create_folder(state.store().pool(), &auth.0.account.id, parent, &name)
+    let row = state
+        .writer()
+        .create_folder(&auth.0.account.id, parent, &name)
         .await
         .map_err(|error| {
             // A parent that is not in this account trips the composite foreign key, and
             // a folder that is not in this account does not exist: both are a 404.
-            if is_foreign_key_violation(&error) {
+            if error.is_foreign_key_violation() {
                 ApiError::not_found("Record not found")
             } else {
                 ApiError::from(error)
@@ -240,21 +241,20 @@ pub async fn update_folder(
     // rejected move leaves the folder exactly as it was.
     if let Some(parent) = input.parent_id {
         let parent = parse_id(parent.as_deref())?;
-        match drive::move_folder(pool, account, id, parent).await {
-            Ok(()) => {}
-            Err(MoveError::Cycle) => {
+        match state.writer().move_folder(account, id, parent).await {
+            Ok(true) => {}
+            Ok(false) => return Err(ApiError::not_found("Record not found")),
+            Err(StoreError::Cycle) => {
                 return Err(ApiError::unprocessable(
                     "a folder cannot be moved inside itself",
                 ));
             }
-            Err(MoveError::NotFound | MoveError::Db(_)) => {
-                return Err(ApiError::not_found("Record not found"));
-            }
+            Err(error) => return Err(error.into()),
         }
     }
     if let Some(name) = input.name {
         let name = required_name(&name)?;
-        if !drive::rename_folder(pool, account, id, &name).await? {
+        if !state.writer().rename_folder(account, id, &name).await? {
             return Err(ApiError::not_found("Record not found"));
         }
     }
@@ -277,7 +277,7 @@ pub async fn delete_folder(
     if drive::folder(pool, account, id).await?.is_none() {
         return Err(ApiError::not_found("Record not found"));
     }
-    for digest in drive::delete_folder(pool, account, id).await? {
+    for digest in state.writer().delete_folder(account, id).await? {
         release_digest(&state, account, &digest).await?;
     }
     Ok(StatusCode::NO_CONTENT)
@@ -401,22 +401,28 @@ pub async fn upload_file(
         }
     };
 
-    let row = drive::create_object(
-        pool, account, folder, &filename, &mime_type, &digest, byte_size,
-    )
-    .await
-    .map_err(|error| {
-        if is_foreign_key_violation(&error) {
-            ApiError::not_found("Record not found")
-        } else {
-            ApiError::from(error)
-        }
-    })?;
-    drive::set_state(pool, account, row.id, processing).await?;
+    let row = state
+        .writer()
+        .create_object(account, folder, &filename, &mime_type, &digest, byte_size)
+        .await
+        .map_err(|error| {
+            if error.is_foreign_key_violation() {
+                ApiError::not_found("Record not found")
+            } else {
+                ApiError::from(error)
+            }
+        })?;
+    state
+        .writer()
+        .set_state(account, row.id, processing)
+        .await?;
     // `create_object` writes the closed default (`private`); anything wider is a second
     // statement, which is the safe order — a failure in between leaves the file private.
     if visibility != Visibility::Private {
-        drive::set_visibility(pool, account, row.id, visibility).await?;
+        state
+            .writer()
+            .set_visibility(account, row.id, visibility)
+            .await?;
     }
     let mut dto = ObjectDto::from(&row);
     dto.processing_state = processing.as_str().to_owned();
@@ -456,8 +462,10 @@ pub async fn attach_file(
     if description.chars().count() > crate::media::MAX_DESCRIPTION {
         return Err(ApiError::unprocessable("The description is too long"));
     }
-    let Some(attachment_id) =
-        drive::attach_object(pool, account, id, status_id, description, None, None).await?
+    let Some(attachment_id) = state
+        .writer()
+        .attach_object(account, id, status_id, description, None, None)
+        .await?
     else {
         return Err(ApiError::not_found("Record not found"));
     };
@@ -499,14 +507,16 @@ pub async fn update_file(
         if name.is_empty() {
             return Err(ApiError::unprocessable("filename cannot be empty"));
         }
-        drive::rename_object(pool, account, id, &name).await?;
+        state.writer().rename_object(account, id, &name).await?;
     }
     if let Some(folder) = input.folder_id {
         let folder = parse_id(folder.as_deref())?;
-        drive::move_object(pool, account, id, folder)
+        state
+            .writer()
+            .move_object(account, id, folder)
             .await
             .map_err(|error| {
-                if is_foreign_key_violation(&error) {
+                if error.is_foreign_key_violation() {
                     ApiError::not_found("Record not found")
                 } else {
                     ApiError::from(error)
@@ -517,7 +527,10 @@ pub async fn update_file(
         let visibility = Visibility::parse(visibility.trim()).ok_or_else(|| {
             ApiError::unprocessable("visibility must be private, unlisted_link or public_federated")
         })?;
-        drive::set_visibility(pool, account, id, visibility).await?;
+        state
+            .writer()
+            .set_visibility(account, id, visibility)
+            .await?;
     }
     let row = drive::object(pool, account, id)
         .await?
@@ -534,7 +547,7 @@ pub async fn delete_file(
     auth.require_scope("write:drive")?;
     let account = &auth.0.account.id;
     let id = parse_uuid(&id)?;
-    let Some(digest) = drive::delete_object(state.store().pool(), account, id).await? else {
+    let Some(digest) = state.writer().delete_object(account, id).await? else {
         return Err(ApiError::not_found("Record not found"));
     };
     release_digest(&state, account, &digest).await?;
@@ -1011,14 +1024,6 @@ fn content_disposition(filename: &str) -> String {
         safe
     };
     format!("attachment; filename=\"{safe}\"")
-}
-
-/// True for SQLSTATE 23503, the composite foreign key saying "not in this account".
-fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .and_then(sqlx::error::DatabaseError::code)
-        .is_some_and(|code| code == "23503")
 }
 
 /// The router fragment, mounted by `crate::router`.

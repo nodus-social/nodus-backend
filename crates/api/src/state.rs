@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nodus_activitypub_client::{ActivityPub, HttpSigner};
+use nodus_server_store::writer::{DbWriter, DbWriterHandle, WriterConfig};
 use nodus_server_store::Store;
 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
 
@@ -54,6 +55,8 @@ struct Inner {
     key_fetches: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Days between a deletion request and the erasure of the tombstone's fields.
     account_delete_grace_days: i64,
+    /// The single writer every drive mutation goes through.
+    writer: DbWriterHandle,
 }
 
 /// Cloned into every handler; `Store` is a pool handle and `InstanceConfig` is small.
@@ -149,6 +152,9 @@ impl AppState {
         instance: InstanceConfig,
         federation: Option<FederationKey>,
     ) -> Self {
+        // One writer per state, started before the store is moved into it. It runs on a
+        // thread of its own, so `new` stays callable outside a runtime.
+        let writer = DbWriter::start_detached(store.write_pool(), WriterConfig::default());
         Self {
             inner: Arc::new(Inner {
                 store,
@@ -159,6 +165,7 @@ impl AppState {
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
                 account_delete_grace_days: DEFAULT_ACCOUNT_DELETE_GRACE_DAYS,
+                writer,
             }),
         }
     }
@@ -179,6 +186,7 @@ impl AppState {
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
                 account_delete_grace_days: self.inner.account_delete_grace_days,
+                writer: self.inner.writer.clone(),
             }),
         }
     }
@@ -196,6 +204,7 @@ impl AppState {
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
                 account_delete_grace_days: days.max(0),
+                writer: self.inner.writer.clone(),
             }),
         }
     }
@@ -209,6 +218,12 @@ impl AppState {
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.inner.store
+    }
+
+    /// The single writer: drive mutations are posted here, never run on this pool.
+    #[must_use]
+    pub fn writer(&self) -> &DbWriterHandle {
+        &self.inner.writer
     }
 
     #[must_use]
