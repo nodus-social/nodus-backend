@@ -192,6 +192,9 @@ async fn resolve_named_account(
 }
 
 /// `GET /api/v1/search` — the same answer under the older path.
+///
+/// Kept on purpose: stock Mastodon clients and their older `v1` search callers still use it,
+/// so it is compatibility surface, not a stale alias. Do not retire it in a dead-route audit.
 pub async fn search_v1(
     state: State<AppState>,
     auth: MaybeAuth,
@@ -284,6 +287,7 @@ pub fn router() -> axum::Router<AppState> {
     use axum::routing::get;
     axum::Router::new()
         .route("/api/v2/search", get(search))
+        // Kept for Mastodon-client compatibility, not a leftover: v1 clients still call it.
         .route("/api/v1/search", get(search_v1))
         .route("/api/v1/trends/tags", get(trending_tags))
         .route("/api/v1/trends/statuses", get(trending_statuses))

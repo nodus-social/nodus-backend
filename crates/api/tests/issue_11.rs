@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{Request, StatusCode};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use chrono::Utc;
@@ -25,7 +25,7 @@ use nodus_server_core::Id;
 use nodus_server_store::accounts::{self, NewAccount, RemoteAccount};
 use nodus_server_store::moderation::{self, NewDomainBlock};
 use nodus_server_store::statuses::{self, NewRemoteStatus};
-use nodus_server_store::{apps, social, Store};
+use nodus_server_store::{social, Store};
 
 fn instance_config() -> InstanceConfig {
     InstanceConfig {
@@ -95,41 +95,6 @@ async fn create_account(pool: &PgPool, label: &str) -> (String, String) {
     .await
     .expect("insert account");
     (row.id, username)
-}
-
-async fn create_token(pool: &PgPool, account_id: &str, scopes: &[&str]) -> String {
-    let app_id = Id::new().to_string();
-    let client_id = format!("pgtest-client-{app_id}");
-    let owned_scopes: Vec<String> = scopes.iter().map(|s| (*s).to_owned()).collect();
-    apps::register(
-        pool,
-        &app_id,
-        &client_id,
-        "unused",
-        "pgtest",
-        None,
-        &["urn:ietf:wg:oauth:2.0:oob".to_owned()],
-        &owned_scopes,
-    )
-    .await
-    .expect("register app");
-
-    let token = format!("pgtest-token-{}", Id::new());
-    let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
-    sqlx::query(
-        "INSERT INTO oauth_token (id, app_id, account_id, token_hash, scopes) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(Id::new().to_string())
-    .bind(&app_id)
-    .bind(account_id)
-    .bind(&digest)
-    .bind(&owned_scopes)
-    .execute(pool)
-    .await
-    .expect("insert oauth token");
-
-    token
 }
 
 async fn seed_remote_actor(
@@ -945,120 +910,10 @@ async fn verify_signature_blocks_domain_and_ssrf_before_fetching() {
     .await;
 }
 
-#[tokio::test]
-async fn hydrate_endpoints_require_auth_and_block_ssrf_and_blocked_domains() {
-    run_db_test(|store, state| async move {
-        let pool = store.pool();
-        let (user_id, _) = create_account(pool, "hydrator").await;
-        let token = create_token(pool, &user_id, &["read"]).await;
-
-        // 1. Unauthenticated requests must be rejected with 401.
-        for uri in [
-            "/api/v1/hydrate/account?acct=alice@remote.test",
-            "/api/v1/hydrate/status?url=https://remote.test/notes/1",
-        ] {
-            let (status, resp) = send(
-                &state,
-                Request::builder()
-                    .method("GET")
-                    .uri(uri)
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::UNAUTHORIZED,
-                "unauthenticated {uri} must return 401: {resp}"
-            );
-        }
-
-        // 2. Blocked domain must be rejected with 403 before fetching.
-        moderation::create_block(
-            pool,
-            &NewDomainBlock {
-                domain: "blocked.test",
-                severity: "suspend",
-                reject_media: true,
-                reject_reports: true,
-                obfuscate: false,
-                public_comment: "blocked",
-            },
-        )
-        .await
-        .expect("block domain");
-
-        for uri in [
-            "/api/v1/hydrate/account?acct=alice@blocked.test",
-            "/api/v1/hydrate/status?url=https://blocked.test/notes/1",
-        ] {
-            let (status, resp) = send(
-                &state,
-                Request::builder()
-                    .method("GET")
-                    .uri(uri)
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::FORBIDDEN,
-                "blocked domain on {uri} must return 403: {resp}"
-            );
-        }
-
-        // 3. Private/loopback/link-local SSRF targets must be rejected before connecting.
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_bg = Arc::clone(&hits);
-        let server = tokio::spawn(async move {
-            while let Ok((_stream, _)) = listener.accept().await {
-                hits_bg.fetch_add(1, Ordering::SeqCst);
-            }
-        });
-
-        let bad_hydrate_uris = [
-            "/api/v1/hydrate/account?acct=alice@127.0.0.1",
-            "/api/v1/hydrate/account?acct=alice@169.254.169.254",
-            "/api/v1/hydrate/account?acct=alice@10.0.0.1",
-            "/api/v1/hydrate/account?acct=alice@localhost",
-            "/api/v1/hydrate/account?acct=alice@metadata.google.internal",
-            &format!("/api/v1/hydrate/status?url=https://127.0.0.1:{port}/note"),
-            &format!("/api/v1/hydrate/status?url=http://127.0.0.1:{port}/note"),
-            "/api/v1/hydrate/status?url=https://169.254.169.254/latest/meta-data",
-            "/api/v1/hydrate/status?url=https://10.0.0.1/note",
-            "/api/v1/hydrate/status?url=https://192.168.1.1/note",
-            "/api/v1/hydrate/status?url=https://[::1]/note",
-            "/api/v1/hydrate/status?url=https://localhost/note",
-            "/api/v1/hydrate/status?url=https://metadata.google.internal/computeMetadata/v1/",
-        ];
-        for uri in bad_hydrate_uris {
-            let (status, resp) = send(
-                &state,
-                Request::builder()
-                    .method("GET")
-                    .uri(uri)
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "SSRF target {uri} must return 422: {resp}"
-            );
-        }
-
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            0,
-            "hydrate endpoints must not connect to loopback listener"
-        );
-        server.abort();
-    })
-    .await;
-}
+// `hydrate_endpoints_require_auth_and_block_ssrf_and_blocked_domains` lived here and is gone
+// with the routes it tested: `/api/v1/hydrate/account` and `/api/v1/hydrate/status` were
+// retired as dead surface (`tests/retired_surface.rs` pins the 404). They were the only
+// entry points that fetched a URL a client named on demand, so the outbound SSRF assertions
+// went with them. The guard itself is unchanged and still exercised here by
+// `verify_signature_blocks_domain_and_ssrf_before_fetching`, which drives it through the
+// signed inbox.

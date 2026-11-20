@@ -95,6 +95,11 @@ also compile the extension crate out; the capability document is then absent.
 
 ## Event subscriptions
 
+**Retired.** `GET /api/v1/nodus/events` now answers `410 Gone` with
+`{"error":"this endpoint was replaced by /api/v1/streaming"}`. The live tail is
+`GET /api/v1/streaming`; nothing under `web/`, `sdk/` or `server-sdk/` ever used this one.
+The description below is kept as the record of what the path was.
+
 `GET /api/v1/nodus/events` with `Accept: text/event-stream` (or a WebSocket upgrade
 on the same path) opens a subscription scoped to the authenticated account.
 
@@ -206,6 +211,12 @@ A `diverged` response includes the current root so the caller can start a fresh
 backfill; it never silently returns a partial diff from an unrelated position.
 
 ### Backfill and snapshots
+
+**Retired.** The `snapshot` route is deleted, not answered: nothing replaced it under that
+name, and it assembled its own copy of a status page that would have drifted from the
+timeline the moment `StatusDto` changed. A client that needs a fresh start fetches the
+timeline and re-roots with `GET /api/v1/nodus/sync/root`. The description below is kept as
+the record of what the route was.
 
 `POST /api/v1/nodus/sync/snapshot` returns the current root plus the newest bounded
 window for a collection the caller may read. It is for the `diverged`/new-peer case,

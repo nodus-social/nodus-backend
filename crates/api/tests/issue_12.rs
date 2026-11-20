@@ -452,13 +452,10 @@ async fn nodus_endpoints_enforce_collection_authorization() {
         .expect("append victim event");
 
         let victim_col = format!("timeline:{victim_id}");
+        // `sync/snapshot` and `nodus/events` are retired; what they answered is asserted in
+        // `tests/retired_surface.rs`. The grant these rows cover still matters for the two
+        // sync routes that remain.
         for (method, uri, body, expected) in [
-            (
-                "GET",
-                format!("/api/v1/nodus/sync/snapshot?collection={victim_col}"),
-                None,
-                StatusCode::FORBIDDEN,
-            ),
             (
                 "GET",
                 format!("/api/v1/nodus/sync/root?collection={victim_col}"),
@@ -473,19 +470,7 @@ async fn nodus_endpoints_enforce_collection_authorization() {
             ),
             (
                 "GET",
-                format!("/api/v1/nodus/events?collection={victim_col}"),
-                None,
-                StatusCode::FORBIDDEN,
-            ),
-            (
-                "GET",
                 "/api/v1/nodus/sync/root?collection=secret:stuff".to_owned(),
-                None,
-                StatusCode::UNPROCESSABLE_ENTITY,
-            ),
-            (
-                "GET",
-                "/api/v1/nodus/events?collection=secret:stuff".to_owned(),
                 None,
                 StatusCode::UNPROCESSABLE_ENTITY,
             ),
@@ -497,13 +482,13 @@ async fn nodus_endpoints_enforce_collection_authorization() {
             ),
             (
                 "GET",
-                format!("/api/v1/nodus/sync/snapshot?collection=timeline:{attacker_id}"),
+                format!("/api/v1/nodus/sync/root?collection=timeline:{attacker_id}"),
                 None,
                 StatusCode::OK,
             ),
             (
                 "GET",
-                "/api/v1/nodus/sync/snapshot?collection=timeline:local".to_owned(),
+                "/api/v1/nodus/sync/root?collection=timeline:local".to_owned(),
                 None,
                 StatusCode::OK,
             ),

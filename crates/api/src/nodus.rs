@@ -3,11 +3,7 @@
 //! Everything here is additive. A Mastodon client never calls it; a client that
 //! negotiated `nodus-1` uses it to replace a timeline refresh with a diff.
 
-use std::convert::Infallible;
-use std::time::Duration;
-
 use axum::extract::State;
-use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -28,10 +24,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/nodus/capabilities", get(capabilities))
         .route("/api/v1/nodus/batch", post(batch))
-        .route("/api/v1/nodus/events", get(events_stream))
+        .route("/api/v1/nodus/events", get(events_gone))
         .route("/api/v1/nodus/sync/root", get(root))
         .route("/api/v1/nodus/sync/diff", post(diff))
-        .route("/api/v1/nodus/sync/snapshot", get(snapshot))
         .route("/api/v1/nodus/account/role", get(account_role))
         .merge(crate::client_metadata::router())
 }
@@ -57,20 +52,16 @@ async fn account_role(auth: Auth) -> Json<AccountRoleDto> {
     })
 }
 
-enum AuthorizedCollection<'a> {
-    Local,
-    Home(&'a str),
-}
-
-fn authorize_collection<'a>(
-    collection: &'a str,
-    viewer_id: &str,
-) -> ApiResult<AuthorizedCollection<'a>> {
+/// Rejects a collection the caller may not read, before any row is touched.
+///
+/// Authored for the sync routes, which used to branch on the answer; `snapshot` was the
+/// reader that needed the distinction and it is gone, so this now only authorises.
+fn authorize_collection(collection: &str, viewer_id: &str) -> ApiResult<()> {
     if collection.trim().is_empty() {
         return Err(ApiError::unprocessable("collection is required"));
     }
     if collection == "timeline:local" {
-        return Ok(AuthorizedCollection::Local);
+        return Ok(());
     }
     if let Some(actor) = collection.strip_prefix("timeline:") {
         if actor.is_empty() {
@@ -81,54 +72,22 @@ fn authorize_collection<'a>(
                 "cannot access another account's collection",
             ));
         }
-        return Ok(AuthorizedCollection::Home(actor));
+        return Ok(());
     }
     Err(ApiError::unprocessable("unknown collection"))
 }
 
-#[derive(Debug, Deserialize)]
-struct EventsQuery {
-    collection: String,
-    #[serde(default)]
-    last_event_id: Option<String>,
-}
-
-async fn events_stream(
-    State(state): State<AppState>,
-    auth: Auth,
-    axum::extract::Query(query): axum::extract::Query<EventsQuery>,
-) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<SseEvent, Infallible>>>> {
-    authorize_collection(&query.collection, &auth.0.account.id)?;
-    let pool = state.store().pool().clone();
-    let collection = query.collection;
-    let mut last = match query.last_event_id {
-        Some(value) => value,
-        None => events::root(&pool, &collection).await?.unwrap_or_default(),
-    };
-    let (sender, receiver) = tokio::sync::mpsc::channel(64);
-    tokio::spawn(async move {
-        loop {
-            match events::after(&pool, &collection, &last, 100).await {
-                Ok(rows) => {
-                    for row in rows {
-                        last.clone_from(&row.hash);
-                        let data = serde_json::to_string(&row.payload).unwrap_or_default();
-                        let event = SseEvent::default().id(row.hash).event(row.kind).data(data);
-                        if sender.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "nodus event poll failed");
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    });
-    Ok(
-        Sse::new(tokio_stream::wrappers::ReceiverStream::new(receiver))
-            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15))),
+/// `GET /api/v1/nodus/events` — retired, and answered rather than removed.
+///
+/// It was the nodus-1 SSE tail of the same `events` table `/api/v1/streaming` now tails,
+/// and nothing under `web/`, `sdk/` or `server-sdk/` ever subscribed to it. It is a `410`
+/// rather than a deleted route because an SSE client cannot tell a `404` from a dropped
+/// connection: it reconnects on both, forever. A `410` with the replacement in the body is
+/// the one answer that stops the loop and tells the next reader where the surface went.
+async fn events_gone() -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::GONE,
+        "this endpoint was replaced by /api/v1/streaming",
     )
 }
 
@@ -276,62 +235,6 @@ async fn root(
 }
 
 #[derive(Debug, Deserialize)]
-struct SnapshotQuery {
-    collection: String,
-    #[serde(default)]
-    max_id: Option<String>,
-    #[serde(default)]
-    limit: Option<u32>,
-}
-
-async fn snapshot(
-    State(state): State<AppState>,
-    auth: Auth,
-    axum::extract::Query(query): axum::extract::Query<SnapshotQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let collection = authorize_collection(&query.collection, &auth.0.account.id)?;
-    let root = events::root(state.store().pool(), &query.collection)
-        .await?
-        .unwrap_or_default();
-    let mut params = PageParams::new();
-    params.limit = query.limit;
-    if let Some(max_id) = query.max_id.as_deref() {
-        params.max_id = Some(
-            max_id
-                .parse::<Id>()
-                .map_err(|_| ApiError::unprocessable("max_id is not an id"))?,
-        );
-    }
-    let page = match collection {
-        AuthorizedCollection::Local => {
-            statuses::public_page(state.store().pool(), params, true).await?
-        }
-        AuthorizedCollection::Home(actor) => {
-            statuses::home_page(state.store().pool(), actor, params).await?
-        }
-    };
-    let mut items = Vec::with_capacity(page.items.len());
-    for row in &page.items {
-        if let Some(account) = accounts::by_id(state.store().pool(), &row.account_id).await? {
-            items.push(
-                serde_json::to_value(crate::dto::StatusDto::from_row(
-                    row,
-                    &account,
-                    state.instance(),
-                ))
-                .map_err(|error| serialise_error(&error))?,
-            );
-        }
-    }
-    Ok(Json(serde_json::json!({
-        "collection": query.collection,
-        "root": root,
-        "items": items,
-        "next": page.next_max_id,
-    })))
-}
-
-#[derive(Debug, Deserialize)]
 struct DiffBody {
     collection: String,
     since: String,
@@ -362,7 +265,7 @@ async fn diff(
     if !events::knows(state.store().pool(), &body.collection, &body.since).await? {
         return Err(ApiError::new(
             axum::http::StatusCode::CONFLICT,
-            "history diverged; reset from a snapshot",
+            "history diverged; fetch the timeline and re-root",
         ));
     }
     let limit = i64::from(body.limit.unwrap_or(500).clamp(1, 500));

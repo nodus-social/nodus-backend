@@ -29,7 +29,6 @@ pub mod guard;
 pub mod highlights;
 pub mod home;
 pub mod html;
-pub mod hydrate;
 pub mod lists;
 pub mod markers;
 pub mod mastodon;
@@ -165,7 +164,6 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(tags::router())
         .merge(suggestions::router())
         .merge(lists::router())
-        .merge(hydrate::router())
         .merge(highlights::router())
         .merge(schedules::router())
         .merge(notifications::router())

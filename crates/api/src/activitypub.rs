@@ -934,30 +934,6 @@ pub(crate) fn validate_remote_url(raw: &str) -> ApiResult<url::Url> {
     }
 }
 
-pub(crate) fn validate_remote_host(host: &str) -> ApiResult<()> {
-    if host.is_empty()
-        || host.contains(|c: char| {
-            matches!(c, '/' | '\\' | '?' | '#' | ':' | '@') || c.is_whitespace()
-        })
-    {
-        return Err(ApiError::unprocessable("domain must be a valid hostname"));
-    }
-    let parsed = url::Host::parse(host)
-        .map_err(|_| ApiError::unprocessable("domain must be a valid hostname"))?;
-    let allowed = match parsed {
-        url::Host::Domain(ref domain) => !is_disallowed_domain(domain),
-        url::Host::Ipv4(v4) => !is_disallowed_ipv4(v4),
-        url::Host::Ipv6(v6) => !is_disallowed_ipv6(v6),
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(ApiError::unprocessable(
-            "domain is not a publicly routable destination",
-        ))
-    }
-}
-
 pub(crate) fn same_origin(left: &str, right: &str) -> bool {
     let (Ok(a), Ok(b)) = (url::Url::parse(left), url::Url::parse(right)) else {
         return false;
