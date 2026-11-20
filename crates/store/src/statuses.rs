@@ -910,6 +910,12 @@ fn finish(mut rows: Vec<StatusRow>, size: PageSize) -> StatusPage {
     }
 }
 
+/// Inserts the status into the author's and accepted followers' home timelines.
+///
+/// `private` is materialised exactly like `public`, because "followers only" is precisely
+/// the audience `timeline_entry` holds. `direct` is skipped: [`home_page`] excludes it and
+/// the notification path is what carries it to the mentioned accounts, so a home row
+/// would be a row no reader is ever allowed to see.
 async fn fan_out_home(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &str,
