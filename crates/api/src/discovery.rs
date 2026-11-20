@@ -121,7 +121,7 @@ pub async fn search(
     }
     if want == "all" || want == "hashtags" {
         let rows = nodus_server_store::discovery::search_tags(pool, &term, limit).await?;
-        result.hashtags = rows.into_iter().map(|row| tag(&state, row)).collect();
+        result.hashtags = rows.into_iter().map(|row| tag(&state, row, false)).collect();
     }
     Ok(Json(result))
 }
@@ -207,7 +207,7 @@ pub async fn trending_tags(State(state): State<AppState>) -> ApiResult<Json<Vec<
         i64::from(nodus_server_core::limits::PAGE_DEFAULT),
     )
     .await?;
-    Ok(Json(rows.into_iter().map(|row| tag(&state, row)).collect()))
+    Ok(Json(rows.into_iter().map(|row| tag(&state, row, false)).collect()))
 }
 
 /// `GET /api/v1/trends/statuses`
@@ -261,7 +261,11 @@ pub async fn custom_emojis(State(state): State<AppState>) -> ApiResult<Json<Vec<
 }
 
 /// Turns a counted tag into the wire shape.
-fn tag(state: &AppState, row: nodus_server_store::discovery::TagCount) -> TagDto {
+pub(crate) fn tag(
+    state: &AppState,
+    row: nodus_server_store::discovery::TagCount,
+    following: bool,
+) -> TagDto {
     let instance = state.instance();
     TagDto {
         url: instance.url(&format!("/tags/{}", row.name)),
@@ -271,7 +275,7 @@ fn tag(state: &AppState, row: nodus_server_store::discovery::TagCount) -> TagDto
             accounts: row.accounts.to_string(),
         }],
         name: row.name,
-        following: false,
+        following,
     }
 }
 

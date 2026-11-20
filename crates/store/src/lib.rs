@@ -45,6 +45,7 @@ pub mod schedules;
 pub mod social;
 pub mod stats;
 pub mod statuses;
+pub mod tags;
 pub mod writer;
 
 use sqlx::postgres::PgPoolOptions;
