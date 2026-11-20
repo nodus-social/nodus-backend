@@ -2652,6 +2652,7 @@ dependencies = [
  "nodus-server-sdk",
  "nodus-server-store",
  "nodus-shared",
+ "nodus-storage",
  "rand 0.9.5",
  "reqwest",
  "rsa",
@@ -2668,6 +2669,7 @@ dependencies = [
  "tower-http 0.6.11",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

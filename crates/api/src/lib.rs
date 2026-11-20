@@ -20,6 +20,7 @@ pub mod client_metadata;
 pub mod collections;
 pub mod conversations;
 pub mod discovery;
+pub mod drive;
 pub mod dto;
 pub mod error;
 pub mod filters;
@@ -154,6 +155,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(discovery::router())
         .merge(preferences::router())
         .merge(markers::router())
+        .merge(drive::router())
         .merge(polls::router())
         .merge(follow_requests::router())
         .fallback(error::not_found_fallback)

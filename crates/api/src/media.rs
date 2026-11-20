@@ -43,7 +43,7 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Where originals are kept: the deployment decides, the default is for a checkout.
-fn storage_dir() -> PathBuf {
+pub(crate) fn storage_dir() -> PathBuf {
     std::env::var_os("NODUS_MEDIA_DIR").map_or_else(|| PathBuf::from("./media"), PathBuf::from)
 }
 
@@ -104,7 +104,7 @@ const CLUSTER_PUT_TIMEOUT: Duration = Duration::from_secs(10);
 /// a token without a URL names no node. With either one missing this instance is
 /// unclustered and the upload path is exactly what it was before the cluster existed.
 #[derive(Debug, Clone)]
-struct ClusterUpload {
+pub(crate) struct ClusterUpload {
     /// The node every original is written through. Caddy hashes the path onto one member,
     /// so this can be the same public name the website uses.
     base: String,
@@ -112,7 +112,7 @@ struct ClusterUpload {
 }
 
 impl ClusterUpload {
-    fn from_env() -> Option<Self> {
+    pub(crate) fn from_env() -> Option<Self> {
         let base = std::env::var("NODUS_MEDIA_CLUSTER_URL")
             .ok()
             .filter(|value| !value.is_empty())?;
@@ -129,7 +129,7 @@ impl ClusterUpload {
     ///
     /// The body is the original itself. A 2xx means a media node now owns the digest: it
     /// replicates it, repairs it, and serves it from then on.
-    async fn put(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
+    pub(crate) async fn put(&self, digest: &str, bytes: &[u8]) -> Result<(), String> {
         let url = format!("{}/internal/media/{digest}", self.base);
         let response = cluster_client()
             .put(&url)

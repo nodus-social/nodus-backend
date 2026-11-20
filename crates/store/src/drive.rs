@@ -446,6 +446,47 @@ pub async fn used_bytes(pool: &PgPool, account: &str) -> Result<i64, sqlx::Error
     sqlx::query_scalar(sql).bind(account).fetch_one(pool).await
 }
 
+/// Bytes the blob store actually holds for this account: each digest counted once.
+///
+/// [`used_bytes`] counts every row, which answers "what has the account put in its
+/// drive". This answers "what does the store hold", which is the number a quota and the
+/// drive's own summary need: an upload of bytes the account already has writes nothing,
+/// so it must not consume quota. A digest held by two rows contributes its size once.
+pub async fn stored_bytes(pool: &PgPool, account: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(byte_size), 0)::bigint FROM ( \
+             SELECT DISTINCT ON (sha256) sha256, byte_size FROM drive_object \
+              WHERE account_id = $1 ORDER BY sha256, byte_size DESC \
+         ) stored",
+    )
+    .bind(account)
+    .fetch_one(pool)
+    .await
+}
+
+/// How many files the account's drive holds, duplicates included.
+pub async fn object_count(pool: &PgPool, account: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*)::bigint FROM drive_object WHERE account_id = $1")
+        .bind(account)
+        .fetch_one(pool)
+        .await
+}
+
+/// One folder by id, `None` when this account has no such folder.
+pub async fn folder(
+    pool: &PgPool,
+    account: &str,
+    id: Uuid,
+) -> Result<Option<DriveFolder>, sqlx::Error> {
+    let sql =
+        format!("SELECT {FOLDER_COLUMNS} FROM drive_folder WHERE account_id = $1 AND id = $2");
+    sqlx::query_as::<_, DriveFolder>(&sql)
+        .bind(account)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// The account's oldest file with these exact bytes — the dedupe candidate for an upload.
 pub async fn object_by_sha(
     pool: &PgPool,
