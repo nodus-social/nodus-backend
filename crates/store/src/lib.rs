@@ -27,6 +27,7 @@ pub mod external_ids;
 pub mod filters;
 pub mod forwarded;
 pub mod highlights;
+pub mod invalidate;
 pub mod jobs;
 pub mod lists;
 pub mod markers;

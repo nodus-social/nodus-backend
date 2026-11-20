@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nodus_activitypub_client::{ActivityPub, HttpSigner};
+use nodus_server_store::invalidate::InvalidationSink;
 use nodus_server_store::writer::{DbWriter, DbWriterHandle, WriterConfig};
 use nodus_server_store::Store;
 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
@@ -152,9 +153,29 @@ impl AppState {
         instance: InstanceConfig,
         federation: Option<FederationKey>,
     ) -> Self {
+        Self::with_federation_and_sink(store, instance, federation, None)
+    }
+
+    /// The same, with the writer's post-commit invalidations going to `sink`.
+    ///
+    /// The sink is built by the binary (which is what reads the environment); tests and
+    /// every other caller keep the default, where a commit invalidates nothing.
+    #[must_use]
+    pub fn with_federation_and_sink(
+        store: Store,
+        instance: InstanceConfig,
+        federation: Option<FederationKey>,
+        sink: Option<Arc<dyn InvalidationSink>>,
+    ) -> Self {
         // One writer per state, started before the store is moved into it. It runs on a
         // thread of its own, so `new` stays callable outside a runtime.
-        let writer = DbWriter::start_detached(store.write_pool(), WriterConfig::default());
+        let writer = DbWriter::start_detached(
+            store.write_pool(),
+            WriterConfig {
+                sink,
+                ..WriterConfig::default()
+            },
+        );
         Self {
             inner: Arc::new(Inner {
                 store,

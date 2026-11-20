@@ -607,6 +607,38 @@ pub async fn folder(
         .await
 }
 
+/// The parent of one folder, for the keys a commit dirties.
+///
+/// `Some(None)` is a folder at the root; `None` is a folder this account does not have.
+pub(crate) async fn folder_parent_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+) -> Result<Option<Option<Uuid>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT parent_id FROM drive_folder WHERE account_id = $1 AND id = $2",
+    )
+    .bind(account)
+    .bind(id)
+    .fetch_optional(&mut *connection)
+    .await
+}
+
+/// The folder one file sits in; `None` when this account has no such file.
+pub(crate) async fn object_parent_tx(
+    connection: &mut PgConnection,
+    account: &str,
+    id: Uuid,
+) -> Result<Option<Option<Uuid>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT folder_id FROM drive_object WHERE account_id = $1 AND id = $2",
+    )
+    .bind(account)
+    .bind(id)
+    .fetch_optional(&mut *connection)
+    .await
+}
+
 /// The account's oldest file with these exact bytes — the dedupe candidate for an upload.
 pub async fn object_by_sha(
     pool: &PgPool,

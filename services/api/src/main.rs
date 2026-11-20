@@ -11,6 +11,7 @@ use axum::Router;
 use nodus_auth::store::PgAuthStore;
 use nodus_server_api::{root_router, AppState, FederationKey};
 use nodus_server_runtime::{self as runtime, Config};
+use nodus_server_store::invalidate::{InvalidationSink, ValkeyInvalidator, DEFAULT_CHANNEL};
 use nodus_server_store::Store;
 
 #[tokio::main]
@@ -23,6 +24,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|address| runtime::serve_telemetry(address, Arc::clone(&agent)));
 
     let store = runtime::prepare(&config).await?;
+    let sink = invalidation_sink();
     if config.migrate_only {
         tracing::info!("migrations applied");
         runtime::stop_telemetry(telemetry).await;
@@ -33,10 +35,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // serves requests: one pool, one set of signing keys, and no second deployable to
     // keep in step with this one.
     let federation = FederationKey::from_env(&config.instance);
-    let state =
-        AppState::with_federation(store.clone(), config.instance.clone(), federation.clone())
-            .with_authorized_fetch(config.authorized_fetch)
-            .with_account_delete_grace_days(config.account_delete_grace_days);
+    let state = AppState::with_federation_and_sink(
+        store.clone(),
+        config.instance.clone(),
+        federation.clone(),
+        sink.clone(),
+    )
+    .with_authorized_fetch(config.authorized_fetch)
+    .with_account_delete_grace_days(config.account_delete_grace_days);
     tokio::spawn(nodus_server_api::schedules::run(state.clone()));
     // The subscription sweep lives here rather than in the pruning worker: it is an
     // outbound fetch, and the outbound guard, the client and the import path all live in
@@ -51,7 +57,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     nodus_server_transport::serve_http(
         &config.bind,
-        router(&store, &config, federation),
+        router(&store, &config, federation, sink),
         runtime::shutdown(),
     )
     .await?;
@@ -59,12 +65,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The sink committed drive writes publish to, from the environment.
+///
+/// One variable decides it: `NODUS_VALKEY_URL` set means other replicas are told what
+/// changed; unset means there is no cache to tell and every write behaves exactly as it
+/// did before. The channel name is logged either way, because an operator debugging a
+/// stale cache needs to know which channel to subscribe to.
+fn invalidation_sink() -> Option<Arc<dyn InvalidationSink>> {
+    let url = match std::env::var("NODUS_VALKEY_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            tracing::info!("NODUS_VALKEY_URL is unset: invalidations are off");
+            return None;
+        }
+    };
+    let channel = std::env::var("NODUS_VALKEY_CHANNEL")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CHANNEL.to_owned());
+    tracing::info!(channel = %channel, "drive invalidations publish to valkey");
+    Some(Arc::new(ValkeyInvalidator::spawn(&url, &channel)))
+}
+
 /// Everything this service answers, in the order the router sees it.
-fn router(store: &Store, config: &Config, federation: Option<FederationKey>) -> Router {
+fn router(
+    store: &Store,
+    config: &Config,
+    federation: Option<FederationKey>,
+    sink: Option<Arc<dyn InvalidationSink>>,
+) -> Router {
     let api = root_router(
-        AppState::with_federation(store.clone(), config.instance.clone(), federation)
-            .with_authorized_fetch(config.authorized_fetch)
-            .with_account_delete_grace_days(config.account_delete_grace_days),
+        AppState::with_federation_and_sink(
+            store.clone(),
+            config.instance.clone(),
+            federation,
+            sink,
+        )
+        .with_authorized_fetch(config.authorized_fetch)
+        .with_account_delete_grace_days(config.account_delete_grace_days),
     );
     let auth = nodus_auth::router(nodus_auth::AppState::new(
         PgAuthStore::new(store.pool().clone()),

@@ -2769,6 +2769,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "nodus-server-core",
+ "redis",
  "regex",
  "regex-syntax",
  "serde",

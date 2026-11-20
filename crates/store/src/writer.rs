@@ -21,6 +21,7 @@
 //! write that is expected to fail (a stale id) is answered as `Ok(false)` by the command
 //! rather than as an error — see [`DbWriterHandle::rename_folder`].
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,9 +32,10 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::drive::{self, DriveFolder, DriveObject, MoveError, ProcessingState, Visibility};
+use crate::invalidate::{InvalidationKey, InvalidationKind, InvalidationSink};
 
 /// How much the actor may hold, and how it packs a batch.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct WriterConfig {
     /// Commands the high-priority queue may hold before senders wait.
     pub high_capacity: usize,
@@ -43,6 +45,22 @@ pub struct WriterConfig {
     pub batch_size: usize,
     /// How long to keep collecting before flushing a batch that is not yet full.
     pub flush_window: Duration,
+    /// Where a committed batch's invalidation keys go. `None` means nobody is told —
+    /// the default, so a deployment without a cache behaves exactly as before.
+    pub sink: Option<Arc<dyn InvalidationSink>>,
+}
+
+impl std::fmt::Debug for WriterConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WriterConfig")
+            .field("high_capacity", &self.high_capacity)
+            .field("bulk_capacity", &self.bulk_capacity)
+            .field("batch_size", &self.batch_size)
+            .field("flush_window", &self.flush_window)
+            .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
+            .finish()
+    }
 }
 
 impl Default for WriterConfig {
@@ -52,6 +70,7 @@ impl Default for WriterConfig {
             bulk_capacity: 512,
             batch_size: 50,
             flush_window: Duration::from_millis(25),
+            sink: None,
         }
     }
 }
@@ -1078,7 +1097,8 @@ impl DbWriter {
             }
         };
 
-        let mut pending: Vec<(Reply, Outcome)> = Vec::with_capacity(batch.len());
+        let mut pending: Vec<(Reply, Outcome, Vec<InvalidationKey>)> =
+            Vec::with_capacity(batch.len());
         let mut failure: Option<StoreError> = None;
         for (_, command) in batch {
             let (mutation, reply) = command.into_parts();
@@ -1089,7 +1109,7 @@ impl DbWriter {
                 continue;
             }
             match Self::execute(&mut transaction, mutation).await {
-                Ok(outcome) => pending.push((reply, outcome)),
+                Ok((outcome, keys)) => pending.push((reply, outcome, keys)),
                 Err(error) => {
                     reply.fail(error.clone());
                     failure = Some(error);
@@ -1100,7 +1120,7 @@ impl DbWriter {
         match failure {
             Some(error) => {
                 let _ = transaction.rollback().await;
-                for (reply, _) in pending {
+                for (reply, _, _) in pending {
                     reply.fail(error.clone());
                 }
                 self.metrics.failed_batches.fetch_add(1, Ordering::Relaxed);
@@ -1108,7 +1128,14 @@ impl DbWriter {
             }
             None => match transaction.commit().await {
                 Ok(()) => {
-                    for (reply, outcome) in pending {
+                    // One call per committed batch, after the commit: nothing below this
+                    // line may fail the batch, and a rolled-back batch invalidates nothing.
+                    let mut keys = Vec::new();
+                    for (_, _, dirty) in &pending {
+                        keys.extend(dirty.iter().cloned());
+                    }
+                    self.invalidate(&keys);
+                    for (reply, outcome, _) in pending {
                         reply.send(outcome);
                     }
                     self.metrics.batches.fetch_add(1, Ordering::Relaxed);
@@ -1127,7 +1154,7 @@ impl DbWriter {
                 }
                 Err(error) => {
                     let error = StoreError::from(error);
-                    for (reply, _) in pending {
+                    for (reply, _, _) in pending {
                         reply.fail(error.clone());
                     }
                     self.metrics.failed_batches.fetch_add(1, Ordering::Relaxed);
@@ -1137,44 +1164,114 @@ impl DbWriter {
         }
     }
 
+    /// Tells the cache what a committed batch dirtied, without letting it matter.
+    ///
+    /// The sink is synchronous by contract, and the contract is the opposite of a queue:
+    /// it must return quickly. A panic in it is caught and logged at error, because a bug
+    /// in a cache adapter must not stop the one writer the process has.
+    fn invalidate(&self, keys: &[InvalidationKey]) {
+        let Some(sink) = self.config.sink.as_ref() else {
+            return;
+        };
+        if keys.is_empty() {
+            return;
+        }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| sink.invalidate(keys))) {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            tracing::error!(
+                panic = %message,
+                keys = keys.len(),
+                "invalidation sink panicked; the write actor keeps running"
+            );
+        }
+    }
+
     /// Runs one statement on the batch's connection.
     ///
     /// Every statement is the same SQL the direct-pool function in [`crate::drive`] runs;
-    /// they share the `*_tx` helpers so the two paths cannot drift apart.
+    /// they share the `*_tx` helpers so the two paths cannot drift apart. The second half
+    /// of the answer is the keys this statement dirtied, held until the batch commits.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per command, each arm the whole statement and its keys"
+    )]
     async fn execute(
         transaction: &mut Transaction<'_, Postgres>,
         mutation: Mutation,
-    ) -> Result<Outcome, StoreError> {
+    ) -> Result<(Outcome, Vec<InvalidationKey>), StoreError> {
         let connection: &mut PgConnection = &mut *transaction;
         match mutation {
             Mutation::CreateFolder {
                 account,
                 parent,
                 name,
-            } => drive::create_folder_tx(connection, &account, parent, &name)
-                .await
-                .map(Outcome::Folder)
-                .map_err(StoreError::from),
-            Mutation::RenameFolder { account, id, name } => {
-                drive::rename_folder_tx(connection, &account, id, &name)
+            } => {
+                let folder = drive::create_folder_tx(connection, &account, parent, &name)
                     .await
-                    .map(Outcome::Flag)
-                    .map_err(StoreError::from)
+                    .map_err(StoreError::from)?;
+                let keys = vec![
+                    InvalidationKey::new(&account, InvalidationKind::Folder, folder.id.to_string()),
+                    InvalidationKey::parent_folder(&account, parent),
+                ];
+                Ok((Outcome::Folder(folder), keys))
+            }
+            Mutation::RenameFolder { account, id, name } => {
+                let parent = drive::folder_parent_tx(connection, &account, id).await?;
+                let renamed = drive::rename_folder_tx(connection, &account, id, &name)
+                    .await
+                    .map_err(StoreError::from)?;
+                // The parent listing carries the name, so a rename dirties both.
+                let keys = if renamed {
+                    vec![
+                        InvalidationKey::new(&account, InvalidationKind::Folder, id.to_string()),
+                        InvalidationKey::parent_folder(&account, parent.flatten()),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                Ok((Outcome::Flag(renamed), keys))
             }
             Mutation::MoveFolder {
                 account,
                 id,
                 parent,
-            } => match drive::move_folder_tx(connection, &account, id, parent).await {
-                Ok(()) => Ok(Outcome::Flag(true)),
-                Err(MoveError::NotFound) => Ok(Outcome::Flag(false)),
-                Err(error) => Err(StoreError::from(error)),
-            },
+            } => {
+                let from = drive::folder_parent_tx(connection, &account, id).await?;
+                match drive::move_folder_tx(connection, &account, id, parent).await {
+                    Ok(()) => {
+                        // Both listings changed: the folder left one and joined another.
+                        let keys = vec![
+                            InvalidationKey::new(
+                                &account,
+                                InvalidationKind::Folder,
+                                id.to_string(),
+                            ),
+                            InvalidationKey::parent_folder(&account, from.flatten()),
+                            InvalidationKey::parent_folder(&account, parent),
+                        ];
+                        Ok((Outcome::Flag(true), keys))
+                    }
+                    Err(MoveError::NotFound) => Ok((Outcome::Flag(false), Vec::new())),
+                    Err(error) => Err(StoreError::from(error)),
+                }
+            }
             Mutation::DeleteFolder { account, id } => {
-                drive::delete_folder_tx(connection, &account, id)
+                let parent = drive::folder_parent_tx(connection, &account, id).await?;
+                let digests = drive::delete_folder_tx(connection, &account, id)
                     .await
-                    .map(Outcome::Digests)
-                    .map_err(StoreError::from)
+                    .map_err(StoreError::from)?;
+                // `None` means the folder was not in this account: nothing was deleted.
+                let keys = parent.map_or_else(Vec::new, |parent| {
+                    vec![
+                        InvalidationKey::new(&account, InvalidationKind::Folder, id.to_string()),
+                        InvalidationKey::parent_folder(&account, parent),
+                    ]
+                });
+                Ok((Outcome::Digests(digests), keys))
             }
             Mutation::CreateObject {
                 account,
@@ -1183,47 +1280,89 @@ impl DbWriter {
                 mime_type,
                 sha256,
                 byte_size,
-            } => drive::create_object_tx(
-                connection, &account, folder, &filename, &mime_type, &sha256, byte_size,
-            )
-            .await
-            .map(Outcome::FolderObject)
-            .map_err(StoreError::from),
+            } => {
+                let object = drive::create_object_tx(
+                    connection, &account, folder, &filename, &mime_type, &sha256, byte_size,
+                )
+                .await
+                .map_err(StoreError::from)?;
+                let keys = vec![
+                    InvalidationKey::new(&account, InvalidationKind::Object, object.id.to_string()),
+                    InvalidationKey::parent_folder(&account, folder),
+                ];
+                Ok((Outcome::FolderObject(object), keys))
+            }
             Mutation::RenameObject {
                 account,
                 id,
                 filename,
-            } => drive::rename_object_tx(connection, &account, id, &filename)
-                .await
-                .map(Outcome::Flag)
-                .map_err(StoreError::from),
+            } => {
+                let renamed = drive::rename_object_tx(connection, &account, id, &filename)
+                    .await
+                    .map_err(StoreError::from)?;
+                let keys = if renamed {
+                    vec![InvalidationKey::new(
+                        &account,
+                        InvalidationKind::Object,
+                        id.to_string(),
+                    )]
+                } else {
+                    Vec::new()
+                };
+                Ok((Outcome::Flag(renamed), keys))
+            }
             Mutation::MoveObject {
                 account,
                 id,
                 folder,
-            } => drive::move_object_tx(connection, &account, id, folder)
-                .await
-                .map(Outcome::Flag)
-                .map_err(StoreError::from),
+            } => {
+                let from = drive::object_parent_tx(connection, &account, id).await?;
+                let moved = drive::move_object_tx(connection, &account, id, folder)
+                    .await
+                    .map_err(StoreError::from)?;
+                let keys = if moved {
+                    vec![
+                        InvalidationKey::new(&account, InvalidationKind::Object, id.to_string()),
+                        InvalidationKey::parent_folder(&account, from.flatten()),
+                        InvalidationKey::parent_folder(&account, folder),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                Ok((Outcome::Flag(moved), keys))
+            }
             Mutation::SetVisibility {
                 account,
                 id,
                 visibility,
-            } => drive::set_visibility_tx(connection, &account, id, visibility)
-                .await
-                .map(Outcome::Flag)
-                .map_err(StoreError::from),
-            Mutation::SetState { account, id, state } => {
-                drive::set_state_tx(connection, &account, id, state)
+            } => {
+                let set = drive::set_visibility_tx(connection, &account, id, visibility)
                     .await
-                    .map(Outcome::Flag)
-                    .map_err(StoreError::from)
+                    .map_err(StoreError::from)?;
+                let keys = object_key(&account, id, set);
+                Ok((Outcome::Flag(set), keys))
+            }
+            Mutation::SetState { account, id, state } => {
+                let set = drive::set_state_tx(connection, &account, id, state)
+                    .await
+                    .map_err(StoreError::from)?;
+                let keys = object_key(&account, id, set);
+                Ok((Outcome::Flag(set), keys))
             }
             Mutation::DeleteObject { account, id } => {
-                drive::delete_object_tx(connection, &account, id)
+                let digest = drive::delete_object_tx(connection, &account, id)
                     .await
-                    .map(Outcome::Digest)
-                    .map_err(StoreError::from)
+                    .map_err(StoreError::from)?;
+                // The account's used-bytes total changed with the row.
+                let keys = if digest.is_some() {
+                    vec![
+                        InvalidationKey::new(&account, InvalidationKind::Object, id.to_string()),
+                        InvalidationKey::new(&account, InvalidationKind::Account, account.clone()),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                Ok((Outcome::Digest(digest), keys))
             }
             Mutation::AttachObject {
                 account,
@@ -1232,19 +1371,48 @@ impl DbWriter {
                 alt_text,
                 focus,
                 blurhash,
-            } => drive::attach_object_tx(
-                connection,
-                &account,
-                object_id,
-                status_id.as_deref(),
-                &alt_text,
-                focus.as_deref(),
-                blurhash.as_deref(),
-            )
-            .await
-            .map(Outcome::Digest)
-            .map_err(StoreError::from),
+            } => {
+                let attachment = drive::attach_object_tx(
+                    connection,
+                    &account,
+                    object_id,
+                    status_id.as_deref(),
+                    &alt_text,
+                    focus.as_deref(),
+                    blurhash.as_deref(),
+                )
+                .await
+                .map_err(StoreError::from)?;
+                let keys = attachment.as_ref().map_or_else(Vec::new, |attachment| {
+                    vec![
+                        InvalidationKey::new(
+                            &account,
+                            InvalidationKind::Attachment,
+                            attachment.clone(),
+                        ),
+                        InvalidationKey::new(
+                            &account,
+                            InvalidationKind::Object,
+                            object_id.to_string(),
+                        ),
+                    ]
+                });
+                Ok((Outcome::Digest(attachment), keys))
+            }
         }
+    }
+}
+
+/// The key for a file whose row changed, or nothing when the statement wrote no row.
+fn object_key(account: &str, id: Uuid, wrote: bool) -> Vec<InvalidationKey> {
+    if wrote {
+        vec![InvalidationKey::new(
+            account,
+            InvalidationKind::Object,
+            id.to_string(),
+        )]
+    } else {
+        Vec::new()
     }
 }
 

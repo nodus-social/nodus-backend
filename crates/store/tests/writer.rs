@@ -6,12 +6,15 @@
 //! background queue. Each test seeds an account of its own and deletes it again, so the
 //! shared database is left as it was found.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use nodus_server_store::accounts::{self, NewAccount};
 use nodus_server_store::drive;
+use nodus_server_store::invalidate::{
+    InvalidationKey, InvalidationKind, InvalidationSink, ValkeyInvalidator,
+};
 use nodus_server_store::writer::{
     Channel, Command, DbWriter, DbWriterHandle, StoreError, WriterConfig,
 };
@@ -245,5 +248,304 @@ async fn a_closed_actor_refuses_instead_of_hanging() {
     let answer = writer.create_folder(&account, None, "alive").await;
     assert!(answer.is_ok());
     assert!(matches!(StoreError::Closed.code(), None));
+    cleanup(&pool, &account).await;
+}
+
+// ---------------------------------------------------------------------------
+// Invalidation: what a commit tells the cache, and what it must never tell it.
+// ---------------------------------------------------------------------------
+
+/// A sink that remembers every batch the writer handed it, and can panic on demand.
+#[derive(Default)]
+struct Recorder {
+    calls: std::sync::Mutex<Vec<Vec<InvalidationKey>>>,
+    panic_once: AtomicBool,
+}
+
+impl Recorder {
+    /// One entry per `invalidate` call, in order.
+    fn calls(&self) -> Vec<Vec<InvalidationKey>> {
+        self.calls.lock().expect("recorder lock").clone()
+    }
+
+    /// Every key, flattened across calls.
+    fn keys(&self) -> Vec<InvalidationKey> {
+        self.calls().concat()
+    }
+}
+
+impl InvalidationSink for Recorder {
+    fn invalidate(&self, keys: &[InvalidationKey]) {
+        if self.panic_once.swap(false, Ordering::SeqCst) {
+            panic!("recorder sink is broken on purpose");
+        }
+        self.calls
+            .lock()
+            .expect("recorder lock")
+            .push(keys.to_vec());
+    }
+}
+
+fn key(account: &str, kind: InvalidationKind, id: impl std::fmt::Display) -> InvalidationKey {
+    InvalidationKey::new(account, kind, id.to_string())
+}
+
+/// A committed batch hands the sink exactly the keys its statements dirtied.
+#[tokio::test]
+async fn a_committed_batch_reports_exactly_its_keys() {
+    let recorder = Arc::new(Recorder::default());
+    let Some((writer, pool, account)) = setup(WriterConfig {
+        sink: Some(recorder.clone()),
+        ..WriterConfig::default()
+    })
+    .await
+    else {
+        return;
+    };
+
+    let folder = writer
+        .create_folder(&account, None, "keys")
+        .await
+        .expect("create folder");
+    let sha = "0".repeat(64);
+    let object = writer
+        .create_object(&account, None, "keys.txt", "text/plain", &sha, 3)
+        .await
+        .expect("create object");
+    let attachment = writer
+        .attach_object(&account, object.id, None, "", None, None)
+        .await
+        .expect("attach")
+        .expect("attachment id");
+    writer
+        .delete_object(&account, object.id)
+        .await
+        .expect("delete object");
+
+    let expected = vec![
+        key(&account, InvalidationKind::Folder, folder.id),
+        InvalidationKey::parent_folder(&account, None),
+        key(&account, InvalidationKind::Object, object.id),
+        InvalidationKey::parent_folder(&account, None),
+        key(&account, InvalidationKind::Attachment, &attachment),
+        key(&account, InvalidationKind::Object, object.id),
+        key(&account, InvalidationKind::Object, object.id),
+        InvalidationKey::new(&account, InvalidationKind::Account, account.clone()),
+    ];
+    assert_eq!(recorder.keys(), expected, "the keys, and only those keys");
+    assert_eq!(
+        recorder.calls().len(),
+        writer.metrics().batches as usize,
+        "one call per committed batch"
+    );
+
+    cleanup(&pool, &account).await;
+}
+
+/// A batch that rolls back tells the cache nothing.
+#[tokio::test]
+async fn a_failed_batch_invalidates_nothing() {
+    let recorder = Arc::new(Recorder::default());
+    let config = WriterConfig {
+        batch_size: 10,
+        flush_window: Duration::from_millis(100),
+        sink: Some(recorder.clone()),
+        ..WriterConfig::default()
+    };
+    let Some((writer, pool, account)) = setup(config).await else {
+        return;
+    };
+
+    // `''` violates drive_folder's name check: the batch rolls back.
+    let (bad, bad_reply) = Command::create_folder(&account, None, "");
+    let (mate, mate_reply) = Command::create_folder(&account, None, "rolled back too");
+    writer.enqueue(Channel::High, bad).await.expect("enqueue");
+    writer.enqueue(Channel::High, mate).await.expect("enqueue");
+    assert!(bad_reply.await.expect("reply").is_err());
+    assert!(mate_reply.await.expect("reply").is_err());
+
+    assert!(
+        recorder.calls().is_empty(),
+        "a rolled-back batch must not invalidate anything"
+    );
+
+    // The actor still commits the next batch, and that one does report.
+    writer
+        .create_folder(&account, None, "committed")
+        .await
+        .expect("write after the failure");
+    assert_eq!(recorder.calls().len(), 1);
+
+    cleanup(&pool, &account).await;
+}
+
+/// Twenty creations in one flush arrive as one call carrying all twenty key sets.
+#[tokio::test]
+async fn twenty_creations_share_one_flush_and_one_key_set() {
+    let recorder = Arc::new(Recorder::default());
+    let config = WriterConfig {
+        batch_size: 50,
+        flush_window: Duration::from_millis(100),
+        sink: Some(recorder.clone()),
+        ..WriterConfig::default()
+    };
+    let Some((writer, pool, account)) = setup(config).await else {
+        return;
+    };
+
+    let mut tasks = Vec::with_capacity(20);
+    for index in 0..20 {
+        let writer = writer.clone();
+        let account = account.clone();
+        tasks.push(tokio::spawn(async move {
+            writer
+                .create_folder(&account, None, &format!("batch {index}"))
+                .await
+        }));
+    }
+    for task in tasks {
+        task.await.expect("task").expect("folder write");
+    }
+
+    assert_eq!(writer.metrics().batches, 1, "one flush for twenty writes");
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 1, "one invalidate call for the flush");
+    let keys = &calls[0];
+    assert_eq!(
+        keys.len(),
+        40,
+        "twenty folders, each with its parent listing"
+    );
+    assert_eq!(
+        keys.iter()
+            .filter(|key| key.kind == InvalidationKind::Folder)
+            .count(),
+        20
+    );
+    assert_eq!(
+        keys.iter()
+            .filter(|key| key.kind == InvalidationKind::ParentFolder && key.id.is_empty())
+            .count(),
+        20,
+        "each creation dirties the root listing"
+    );
+
+    cleanup(&pool, &account).await;
+}
+
+/// A panicking sink is caught and logged; the actor and the next write are unaffected.
+#[tokio::test]
+async fn a_panicking_sink_does_not_kill_the_actor() {
+    let recorder = Arc::new(Recorder::default());
+    recorder.panic_once.store(true, Ordering::SeqCst);
+    let Some((writer, pool, account)) = setup(WriterConfig {
+        sink: Some(recorder.clone()),
+        ..WriterConfig::default()
+    })
+    .await
+    else {
+        return;
+    };
+
+    let first = writer
+        .create_folder(&account, None, "before the panic")
+        .await
+        .expect("the write committed before the sink ran");
+    let second = writer
+        .create_folder(&account, None, "after the panic")
+        .await
+        .expect("the actor survived the sink's panic");
+
+    let rows = drive::folders(&pool, &account).await.expect("list folders");
+    let ids: Vec<_> = rows.iter().map(|folder| folder.id).collect();
+    assert!(ids.contains(&first.id));
+    assert!(ids.contains(&second.id));
+    assert_eq!(writer.metrics().batches, 2);
+    assert_eq!(
+        recorder.calls().len(),
+        1,
+        "only the batch after the panic was reported"
+    );
+
+    cleanup(&pool, &account).await;
+}
+
+/// The payload is the documented JSON line, built without a server.
+#[tokio::test]
+async fn valkey_payload_has_the_documented_shape() {
+    let keys = vec![
+        InvalidationKey::new("acc", InvalidationKind::Folder, "f"),
+        InvalidationKey::parent_folder("acc", None),
+        InvalidationKey::new("acc", InvalidationKind::Object, "o"),
+        InvalidationKey::new("acc", InvalidationKind::Attachment, "a"),
+        InvalidationKey::new("acc", InvalidationKind::Account, "acc"),
+    ];
+    let line = ValkeyInvalidator::payload(&keys);
+    assert!(!line.contains('\n'), "one JSON line per flush");
+
+    let json: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+    assert_eq!(json["channel"], "nodus:invalidate");
+    let encoded = json["keys"].as_array().expect("keys array");
+    assert_eq!(encoded.len(), 5);
+    let kinds: Vec<&str> = encoded
+        .iter()
+        .map(|key| key["kind"].as_str().expect("kind"))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["folder", "parent_folder", "object", "attachment", "account"]
+    );
+    assert_eq!(encoded[0]["account_id"], "acc");
+    assert_eq!(encoded[0]["id"], "f");
+    assert_eq!(encoded[1]["id"], "", "the root listing has an empty id");
+    // The same keys decode back, so both ends of the wire agree.
+    let decoded: Vec<InvalidationKey> =
+        serde_json::from_value(json["keys"].clone()).expect("keys decode");
+    assert_eq!(decoded, keys);
+}
+
+/// With no sink configured, writes land exactly as they did before.
+#[tokio::test]
+async fn no_sink_writes_the_same_rows() {
+    let Some((writer, pool, account)) = setup(WriterConfig::default()).await else {
+        return;
+    };
+
+    for index in 0..3 {
+        writer
+            .create_folder(&account, None, &format!("plain {index}"))
+            .await
+            .expect("folder write");
+    }
+    let sha = "1".repeat(64);
+    for index in 0..2 {
+        writer
+            .create_object(
+                &account,
+                None,
+                &format!("plain {index}.txt"),
+                "text/plain",
+                &sha,
+                7,
+            )
+            .await
+            .expect("object write");
+    }
+
+    assert_eq!(
+        drive::folders(&pool, &account)
+            .await
+            .expect("folders")
+            .len(),
+        3
+    );
+    assert_eq!(
+        drive::objects(&pool, &account, None, 50, 0)
+            .await
+            .expect("objects")
+            .len(),
+        2
+    );
+
     cleanup(&pool, &account).await;
 }
