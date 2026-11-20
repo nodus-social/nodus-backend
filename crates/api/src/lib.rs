@@ -49,6 +49,7 @@ pub mod run;
 pub mod schedules;
 pub mod state;
 pub mod statuses;
+pub mod suggestions;
 pub mod tags;
 
 pub use run::run;
@@ -159,6 +160,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(media::router())
         .merge(filters::router())
         .merge(tags::router())
+        .merge(suggestions::router())
         .merge(lists::router())
         .merge(hydrate::router())
         .merge(highlights::router())

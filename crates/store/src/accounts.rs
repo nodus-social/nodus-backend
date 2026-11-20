@@ -1004,3 +1004,39 @@ pub async fn client_metadata_clear(
     }
     Ok(())
 }
+
+/// Accounts worth following, for `GET /api/v2/suggestions`.
+///
+/// This is deliberately a simple query rather than a call into the recommender: a
+/// suggestion endpoint that 404s is worse than one that ranks recently active local
+/// accounts by follower count, and it stays correct when the recommender is down. The
+/// viewer is never suggested, and neither is anyone either side has blocked or muted,
+/// anyone already followed, or an account that moderation has suspended, silenced,
+/// deleted or left unapproved.
+pub async fn suggestions(
+    pool: &PgPool,
+    viewer_id: &str,
+    limit: i64,
+) -> Result<Vec<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {columns} FROM account a \
+          WHERE a.id <> $1 AND a.local AND a.approved AND a.discoverable \
+            AND a.suspended_at IS NULL AND a.silenced_at IS NULL AND a.deleted_at IS NULL \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM follow f \
+                 WHERE f.account_id = $1 AND f.target_account_id = a.id) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM account_relation r \
+                 WHERE r.kind IN ('block', 'mute') \
+                   AND ((r.account_id = $1 AND r.target_account_id = a.id) \
+                     OR (r.account_id = a.id AND r.target_account_id = $1))) \
+          ORDER BY a.last_status_at DESC NULLS LAST, a.followers_count DESC, a.username ASC \
+          LIMIT $2",
+        columns = ACCOUNT_COLUMNS_ALIASED,
+    );
+    sqlx::query_as(&sql)
+        .bind(viewer_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
