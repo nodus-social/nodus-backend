@@ -26,7 +26,7 @@ use nodus_shared::{Meta, CONTRACT_VERSION, MIN_CONTRACT_VERSION};
 /// this instance's `nodus-feed` process on the same origin. The rest are answered by this
 /// API. `tests/capabilities.rs` holds the feature-to-path table and fails when a name here
 /// stops answering or a route appears that no name covers.
-pub const FEATURES: [&str; 25] = [
+pub const FEATURES: [&str; 28] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -70,6 +70,15 @@ pub const FEATURES: [&str; 25] = [
     // signed Delete for every peer that knows the actor, and erases the profile after the
     // grace period unless the account comes back first.
     "account_deletion", // DELETE /api/v1/accounts/{id}; POST /api/v1/accounts/{id}/undelete
+    // The drive: a folder tree, the files in it and the bytes behind them. It was served
+    // from the first commit and named from none, so a console that draws only what the
+    // handshake advertises hid its door, its page and its composer button — three surfaces
+    // built, deployed and unreachable. Split by how a client reaches it: the tree and its
+    // content behind the actor's own grant, a minted link that needs no session at all, and
+    // the hand-off that turns stored bytes into an attachment.
+    "drive",        // GET /api/v1/drive, /drive/folders, /drive/files and the {id} forms
+    "drive_share",  // POST /api/v1/drive/files/{id}/share; GET /media/share/{token}
+    "drive_attach", // POST /api/v1/drive/files/{id}/attach; POST /api/v1/media {stored_object_id}
 ];
 
 /// The capability names as owned strings, for documents that serialize their own envelope.

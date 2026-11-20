@@ -195,6 +195,25 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/accounts/{id}/undelete",
         owner: Owner::Api,
     },
+    // The drive. `drive` is the folder tree and the content route; `drive_share` and
+    // `drive_attach` are probed on their POST-only worker routes, which answer 405 to this
+    // GET (see `polls`), because the readable halves are a minted link that is a genuine 404
+    // for any token we did not mint and a media upload the drive only feeds.
+    Capability {
+        name: "drive",
+        path: "/api/v1/drive",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "drive_share",
+        path: "/api/v1/drive/files/{id}/share",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "drive_attach",
+        path: "/api/v1/drive/files/{id}/attach",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -276,6 +295,32 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Which capability stands behind each route `src/drive.rs` registers.
+///
+/// The drive is the surface that taught this file its lesson: nine routes served, no name
+/// published, and a console that gates on `/api/v1/meta` hid every one of them. The table is
+/// asserted against the `.route(...)` calls themselves, so a route added to the drive without
+/// a row here fails rather than shipping unannounced.
+const DRIVE_ROUTES: &[(&str, &str)] = &[
+    ("/api/v1/drive", "drive"),
+    ("/api/v1/drive/folders", "drive"),
+    ("/api/v1/drive/folders/{id}", "drive"),
+    ("/api/v1/drive/files", "drive"),
+    ("/api/v1/drive/files/{id}", "drive"),
+    ("/api/v1/drive/files/{id}/content", "drive"),
+    ("/api/v1/drive/files/{id}/share", "drive_share"),
+    // Unauthenticated on purpose — the token is the credential — so it is a route of this
+    // API that `route_literals` above would still find, and a row that names it.
+    ("/media/share/{token}", "drive_share"),
+    ("/api/v1/drive/files/{id}/attach", "drive_attach"),
+    // The other half of attach: `POST /api/v1/media {stored_object_id}`. Registered in
+    // `src/media.rs`, which this table does not read, so it is listed here deliberately.
+    ("/api/v1/media", "drive_attach"),
+];
+
+/// The drive's source, read for its route calls.
+const DRIVE_SOURCE: &str = include_str!("../src/drive.rs");
+
 fn state() -> AppState {
     // A lazy pool: this test asserts routing and status codes, never a row. A handler that
     // reaches the database stops at the connect attempt, which is still a rejection by the
@@ -320,6 +365,41 @@ async fn answers(template: &str) -> bool {
         Some((status, _)) => status != StatusCode::NOT_FOUND && status != StatusCode::GONE,
         None => true,
     }
+}
+
+/// Whether a path reached a handler rather than the router's fallback.
+///
+/// [`answers`] cannot be used for the drive: a share token this instance never minted is a
+/// deliberate 404 from the handler, so "answers 404" is a healthy route there. The fallback
+/// and that refusal are one status apart only by their bodies — the fallback says
+/// `no route for GET /...`, a handler says what it looked for — so the body is what is read.
+async fn handled(path: &str) -> bool {
+    match tokio::time::timeout(PROBE_BUDGET, body_text(path)).await {
+        // Still running at the budget: a route, and no fallback answers slowly.
+        Err(_) => true,
+        Ok((status, body)) => status != StatusCode::GONE && !body.contains("no route for"),
+    }
+}
+
+/// Status and body of an unauthenticated `GET`.
+async fn body_text(path: &str) -> (StatusCode, String) {
+    let response = router(state())
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
 }
 
 /// Status and content type of an unauthenticated `GET`.
@@ -391,6 +471,32 @@ fn route_literals(source: &str) -> Vec<String> {
         rest = &rest[end..];
     }
     found
+}
+
+/// The route templates a file registers with `.route(...)`, read from those calls.
+///
+/// [`route_literals`] cannot be reused for the drive: `src/drive.rs` also builds URLs for the
+/// media service (`/media/{id}/compressed`) that are not routes of this API, and one of the
+/// drive's own routes *is* `/media/share/{token}` — so the literal has to be read from the
+/// line that registers it. The call and its literal are on separate lines in two places,
+/// which is why the literal is taken from the first quoted path after the call opens.
+fn registered_routes(source: &str) -> Vec<String> {
+    let mut routes = Vec::new();
+    let mut expecting = false;
+    for line in source.lines() {
+        if line.contains(".route(") {
+            expecting = true;
+        }
+        if !expecting {
+            continue;
+        }
+        let Some(at) = line.find("\"/") else { continue };
+        let rest = &line[at + 1..];
+        let Some(end) = rest.find('"') else { continue };
+        routes.push(rest[..end].to_owned());
+        expecting = false;
+    }
+    routes
 }
 
 /// The `mod` names a file declares, so the module list cannot be remembered wrongly.
@@ -562,6 +668,58 @@ async fn every_admin_module_names_at_least_one_feature() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn every_drive_route_is_announced() {
+    let registered = registered_routes(DRIVE_SOURCE);
+    assert!(
+        registered.len() >= 9,
+        "the drive's route calls were not parsed: {registered:?}"
+    );
+
+    let tabled: BTreeSet<&str> = DRIVE_ROUTES.iter().map(|(path, _)| *path).collect();
+    let unlisted: Vec<&String> = registered
+        .iter()
+        .filter(|path| !tabled.contains(path.as_str()))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "drive route(s) no capability names — the console hides a door it is never told about, \
+         which is how the drive shipped unreachable:\n  {unlisted:#?}"
+    );
+
+    let published: BTreeSet<String> = CAPABILITIES
+        .iter()
+        .map(|capability| capability.name.to_owned())
+        .collect();
+    for (path, feature) in DRIVE_ROUTES {
+        assert!(
+            published.contains(*feature),
+            "drive route `{path}` claims `{feature}`, which is not advertised"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_drive_route_still_answers() {
+    let failures = {
+        let mut failures = Vec::new();
+        for (template, _) in DRIVE_ROUTES {
+            let path = concrete(template);
+            if !handled(&path).await {
+                failures.push(format!(
+                    "the drive registers {template}, which no handler answers"
+                ));
+            }
+        }
+        failures
+    };
+    assert!(
+        failures.is_empty(),
+        "a drive route is registered but not served:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 #[tokio::test]
