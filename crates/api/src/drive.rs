@@ -11,11 +11,12 @@
 //! once: duplicate rows are free, both to the quota and to the disk.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, SystemTime};
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ use nodus_server_media::cluster;
 use nodus_server_store::drive::{
     self, DriveFolder, DriveObject, MoveError, ProcessingState, Visibility,
 };
-use nodus_storage::{BlobError, BlobStore, ByteRange, LocalDiskBlobStore, RangeError};
+use nodus_storage::{BlobError, BlobStore, ByteRange, Capability, LocalDiskBlobStore, RangeError};
 
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult};
@@ -43,6 +44,20 @@ const DEFAULT_QUOTA_BYTES: i64 = 1024 * 1024 * 1024;
 /// The bytes are held in memory in this phase (the same shape `POST /api/v1/media`
 /// uses), so this is the ceiling on one request body, not on the drive.
 const MAX_UPLOAD: usize = 1024 * 1024 * 1024;
+
+/// How long a share link lives when the caller does not say.
+///
+/// A week is long enough to paste into a chat and short enough that a leaked link stops
+/// working on its own; [`MAX_SHARE_SECONDS`] is the ceiling this instance will mint, so a
+/// caller cannot hand out something effectively permanent.
+const DEFAULT_SHARE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// The longest a share link may live: thirty days.
+const MAX_SHARE_SECONDS: u64 = 30 * 24 * 60 * 60;
+
+/// The only rendition a share link grants. `Capability` compares the variant, so a
+/// preview token cannot be spelled into an original one.
+const SHARE_VARIANT: &str = "original";
 
 /// A folder as the client reads it.
 #[derive(Debug, Serialize)]
@@ -470,6 +485,175 @@ pub async fn delete_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The body of `POST /api/v1/drive/files/{id}/share`. Everything is optional, so a
+/// caller that wants the default can post `{}` — or no body at all.
+#[derive(Debug, Deserialize)]
+pub struct ShareRequest {
+    #[serde(default)]
+    pub expires_in_seconds: Option<u64>,
+}
+
+/// A minted link, as the owner reads it.
+#[derive(Debug, Serialize)]
+pub struct ShareLink {
+    /// Absolute and unauthenticated: `{instance}/media/share/{token}`.
+    pub url: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// `POST /api/v1/drive/files/{id}/share` — a link a stranger can read.
+///
+/// The token is the whole grant: it names the digest, so reading it needs no account and
+/// no database. That is also why it may only be minted for a file whose visibility is not
+/// private — a private object has no audience outside its owner, and minting a link for it
+/// would quietly undo the choice.
+///
+/// Without `NODUS_DRIVE_SHARE_SECRET` this route refuses rather than signing with a
+/// default: a token nobody can verify is worse than a clear "not configured".
+pub async fn share_file(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    body: Option<Json<ShareRequest>>,
+) -> ApiResult<Json<ShareLink>> {
+    auth.require_scope("write:drive")?;
+    let Some(secret) = share_secret() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "share links are not configured",
+        ));
+    };
+    let id = parse_uuid(&id)?;
+    let row = drive::object(state.store().pool(), &auth.0.account.id, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    if row.visibility == Visibility::Private.as_str() {
+        return Err(ApiError::new(StatusCode::CONFLICT, "this file is private"));
+    }
+
+    let seconds = body
+        .and_then(|Json(body)| body.expires_in_seconds)
+        .unwrap_or(DEFAULT_SHARE_SECONDS);
+    if seconds == 0 || seconds > MAX_SHARE_SECONDS {
+        return Err(ApiError::unprocessable(
+            "expires_in_seconds must be between 1 and 2592000",
+        ));
+    }
+    let expires_at = SystemTime::now() + Duration::from_secs(seconds);
+    let token = Capability::mint(&secret, &row.sha256, SHARE_VARIANT, expires_at);
+    Ok(Json(ShareLink {
+        url: state.instance().url(&format!("/media/share/{token}")),
+        expires_at: DateTime::<Utc>::from(expires_at),
+    }))
+}
+
+/// `GET /media/share/{token}` — a minted link's bytes, for no one in particular.
+///
+/// There is deliberately no `State` extractor here: the token is verified in memory and
+/// the bytes come from the blob store, so serving a share link issues **zero database
+/// queries**. Two consequences follow, and both are on purpose:
+///
+/// - A token that is malformed, signed under another secret, naming another variant, or
+///   past its expiry is a `404`, never a `403`. To a stranger a link that never existed
+///   and one that ran out look the same, and neither answer confirms that a digest exists.
+/// - The type is `application/octet-stream`: the mime type lives in the catalogue, and
+///   reading it would be exactly the query this route exists without.
+///   TODO(3c): carry the type inside the capability so a share of a video plays inline
+///   instead of downloading.
+pub async fn shared_content(Path(token): Path<String>, headers: HeaderMap) -> Response {
+    let Some(secret) = share_secret() else {
+        // No secret was ever configured, so no token can be genuine here.
+        return ApiError::not_found("Record not found").into_response();
+    };
+    let now = SystemTime::now();
+    let claims = match Capability::verify(&secret, &token, now) {
+        Ok(claims) if claims.allows(SHARE_VARIANT) => claims,
+        _ => return ApiError::not_found("Record not found").into_response(),
+    };
+    // The link's remaining lifetime is the only thing this response may be cached for.
+    let remaining = claims
+        .expires_at
+        .duration_since(now)
+        .map_or(0, |left| left.as_secs());
+
+    let store = LocalDiskBlobStore::new(storage_dir());
+    // A range is resolved against the length, and only the local copy knows its length
+    // without being read. A cluster-only digest is fetched whole, and those bytes answer
+    // the next question rather than being fetched twice.
+    let mut whole: Option<Vec<u8>> = None;
+    let len = if let Some(len) = store.size(&claims.digest).await {
+        len
+    } else {
+        match read_blob(&claims.digest, None).await {
+            Ok(bytes) => {
+                let len = u64::try_from(bytes.len()).unwrap_or(0);
+                whole = Some(bytes);
+                len
+            }
+            // The token is genuine but the bytes are not here, which is still nothing a
+            // stranger may see.
+            Err(_) => return ApiError::not_found("Record not found").into_response(),
+        }
+    };
+
+    // Same policy as the owner's own content route: a header this store cannot read is
+    // ignored (the whole body), a header that parses but names no byte is a 416.
+    let requested = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(ByteRange::parse);
+    let ranged = match requested {
+        Some(Ok(range)) => match range.resolve(len) {
+            Ok((start, end)) => Some((range, start, end)),
+            Err(_) => return unsatisfiable(len),
+        },
+        Some(Err(RangeError::Unsatisfiable)) => return unsatisfiable(len),
+        Some(Err(RangeError::Malformed)) | None => None,
+    };
+
+    let body = match (whole, ranged) {
+        (Some(bytes), None) => bytes,
+        (Some(bytes), Some((_, start, end))) => {
+            bytes[usize::try_from(start).unwrap_or(0)..=usize::try_from(end).unwrap_or(0)].to_vec()
+        }
+        (None, None) => match read_blob(&claims.digest, None).await {
+            Ok(bytes) => bytes,
+            Err(_) => return ApiError::not_found("Record not found").into_response(),
+        },
+        (None, Some((range, _, _))) => match read_blob(&claims.digest, Some(range)).await {
+            Ok(bytes) => bytes,
+            Err(_) => return ApiError::not_found("Record not found").into_response(),
+        },
+    };
+
+    let status = if ranged.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let mut response = Response::builder().status(status);
+    response = response
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CACHE_CONTROL,
+            format!("private, max-age={remaining}"),
+        );
+    if let Some((_, start, end)) = ranged {
+        response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"));
+    }
+    response
+        .body(axum::body::Body::from(body))
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not build the response",
+            )
+        })
+        .unwrap_or_else(IntoResponse::into_response)
+}
+
 /// `GET /api/v1/drive/files/{id}/content` — the caller's own bytes, with ranges.
 pub async fn file_content(
     State(state): State<AppState>,
@@ -702,6 +886,11 @@ fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// The key share links are signed with, when the deployment has set one.
+fn share_secret() -> Option<Vec<u8>> {
+    env_value("NODUS_DRIVE_SHARE_SECRET").map(String::into_bytes)
+}
+
 /// Parses an optional id from a query string or form field. `None` is the root.
 fn parse_id(value: Option<&str>) -> ApiResult<Option<Uuid>> {
     match value.map(str::trim) {
@@ -780,6 +969,11 @@ pub fn router() -> Router<AppState> {
             patch(update_file).delete(delete_file),
         )
         .route("/api/v1/drive/files/{id}/content", get(file_content))
+        .route("/api/v1/drive/files/{id}/share", post(share_file))
+        // Unauthenticated on purpose: the token is the credential. It lives in this
+        // router rather than the media service's because verifying it needs no database,
+        // and the bytes may be on either host.
+        .route("/media/share/{token}", get(shared_content))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
 }
 
@@ -795,6 +989,23 @@ mod tests {
             name: name.to_owned(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    /// The 503 branch of `share_file` is only reachable this way, so the gate itself is
+    /// what the test pins: no secret, no signing.
+    #[test]
+    fn a_share_link_has_no_secret_to_sign_with_when_none_is_configured() {
+        let before = std::env::var_os("NODUS_DRIVE_SHARE_SECRET");
+        std::env::remove_var("NODUS_DRIVE_SHARE_SECRET");
+        assert_eq!(share_secret(), None);
+
+        std::env::set_var("NODUS_DRIVE_SHARE_SECRET", "a-key");
+        assert_eq!(share_secret().as_deref(), Some(b"a-key".as_slice()));
+
+        std::env::remove_var("NODUS_DRIVE_SHARE_SECRET");
+        if let Some(before) = before {
+            std::env::set_var("NODUS_DRIVE_SHARE_SECRET", before);
         }
     }
 

@@ -24,6 +24,9 @@ static DRIVE_ENV: Once = Once::new();
 /// bytes, and every other upload in this binary is well under it.
 const QUOTA: i64 = 4096;
 
+/// The key this binary signs share links with.
+const SHARE_SECRET: &str = "drive-share-test-secret";
+
 fn init_drive_env() {
     DRIVE_ENV.call_once(|| {
         let media = std::env::temp_dir().join(format!("nodus-drive-{}", Id::new()));
@@ -34,6 +37,9 @@ fn init_drive_env() {
         // below look at.
         std::env::remove_var("NODUS_MEDIA_CLUSTER_URL");
         std::env::remove_var("NODUS_MEDIA_CLUSTER_TOKEN");
+        // A known key, so an expired or foreign token can be minted here and handed to
+        // the unauthenticated route exactly as a stranger would send it.
+        std::env::set_var("NODUS_DRIVE_SHARE_SECRET", SHARE_SECRET);
     });
 }
 
@@ -166,6 +172,25 @@ async fn upload(
         status,
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
     )
+}
+
+/// The path half of a share url, which is what a stranger fetches.
+fn share_path(url: &str) -> String {
+    let at = url
+        .find("/media/share/")
+        .unwrap_or_else(|| panic!("not a share url: {url}"));
+    url[at..].to_owned()
+}
+
+/// A share token for `digest`, signed with this binary's key, expiring at `expires_at`.
+fn share_token(digest: &str, seconds_from_now: i64) -> String {
+    use std::time::{Duration, SystemTime};
+    let expires_at = if seconds_from_now >= 0 {
+        SystemTime::now() + Duration::from_secs(seconds_from_now.unsigned_abs())
+    } else {
+        SystemTime::now() - Duration::from_secs(seconds_from_now.unsigned_abs())
+    };
+    nodus_storage::Capability::mint(SHARE_SECRET.as_bytes(), digest, "original", expires_at)
 }
 
 fn s(value: &serde_json::Value, key: &str) -> String {
@@ -520,6 +545,192 @@ async fn a_deleted_file_frees_its_bytes_only_when_nothing_else_needs_them() {
             !media_dir().join(&other_digest).exists(),
             "an unreferenced blob is unlinked"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_minted_share_link_streams_the_bytes_without_an_account() {
+    init_drive_env();
+    run_db_test(|store, app| async move {
+        let account = create_account(store.pool(), "drive_share").await;
+        let token = create_token(store.pool(), &account, &["read:drive", "write:drive"]).await;
+        let payload = b"shared bytes".as_slice();
+        let (status, object) = upload(
+            &app,
+            &token,
+            "note.txt",
+            payload,
+            &[("visibility", "unlisted_link")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{object}");
+        let id = s(&object, "id");
+
+        let (status, link) = json(
+            &app,
+            "POST",
+            &format!("/api/v1/drive/files/{id}/share"),
+            &token,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{link}");
+        assert!(link.get("expires_at").is_some(), "{link}");
+        let uri = share_path(&s(&link, "url"));
+
+        // No Authorization header at all: the token in the path is the credential.
+        let (status, headers, body) = raw(&app, "GET", &uri, None, &[], Body::empty()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), payload);
+        assert_eq!(
+            headers[header::CONTENT_LENGTH].to_str().expect("length"),
+            payload.len().to_string()
+        );
+        assert_eq!(headers[header::ACCEPT_RANGES], "bytes");
+        let cache = headers[header::CACHE_CONTROL]
+            .to_str()
+            .expect("cache header")
+            .to_owned();
+        assert!(
+            cache.starts_with("private, max-age="),
+            "a share response was cached the wrong way: {cache}"
+        );
+
+        let (status, headers, body) = raw(
+            &app,
+            "GET",
+            &uri,
+            None,
+            &[("range", "bytes=0-5")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body.as_ref(), b"shared");
+        assert_eq!(
+            headers[header::CONTENT_RANGE],
+            format!("bytes 0-5/{}", payload.len())
+        );
+
+        let (status, ..) = raw(
+            &app,
+            "GET",
+            &uri,
+            None,
+            &[("range", "bytes=99-")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_share_link_one_second_past_its_expiry_is_404() {
+    init_drive_env();
+    run_db_test(|store, app| async move {
+        let account = create_account(store.pool(), "drive_share_expiry").await;
+        let token = create_token(store.pool(), &account, &["read:drive", "write:drive"]).await;
+        let payload = b"expires".as_slice();
+        let (status, object) = upload(
+            &app,
+            &token,
+            "soon.txt",
+            payload,
+            &[("visibility", "public_federated")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{object}");
+        let digest = hex(payload);
+
+        // One second past the expiry is dead: `verify` is strict to the second.
+        let expired = share_token(&digest, -1);
+        let (status, _, _) = raw(
+            &app,
+            "GET",
+            &format!("/media/share/{expired}"),
+            None,
+            &[],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "an expired link was served");
+
+        // The same construction a minute out is served, so the 404 above is the expiry
+        // and not the way the token was built.
+        let live = share_token(&digest, 60);
+        let (status, _, body) = raw(
+            &app,
+            "GET",
+            &format!("/media/share/{live}"),
+            None,
+            &[],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), payload);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_token_naming_bytes_nobody_stored_is_404() {
+    init_drive_env();
+    run_db_test(|store, app| async move {
+        let _account = create_account(store.pool(), "drive_share_foreign").await;
+        // A genuine signature over a digest with no blob: the token is the address, so a
+        // token "for a different file" can only name bytes that do not exist.
+        let digest = hex(b"bytes this instance has never seen");
+        let forged = share_token(&digest, 60);
+        let (status, _, _) = raw(
+            &app,
+            "GET",
+            &format!("/media/share/{forged}"),
+            None,
+            &[],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A token whose signature does not match its payload is the same 404, never a 403.
+        let tampered = format!("{forged}x");
+        let (status, _, _) = raw(
+            &app,
+            "GET",
+            &format!("/media/share/{tampered}"),
+            None,
+            &[],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_private_file_cannot_mint_a_share_link() {
+    init_drive_env();
+    run_db_test(|store, app| async move {
+        let account = create_account(store.pool(), "drive_share_private").await;
+        let token = create_token(store.pool(), &account, &["read:drive", "write:drive"]).await;
+        let (status, object) =
+            upload(&app, &token, "mine.txt", b"for me only".as_slice(), &[]).await;
+        assert_eq!(status, StatusCode::CREATED, "{object}");
+        let (status, body) = json(
+            &app,
+            "POST",
+            &format!("/api/v1/drive/files/{}/share", s(&object, "id")),
+            &token,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(s(&body, "error"), "this file is private");
     })
     .await;
 }
