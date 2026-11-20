@@ -2816,6 +2816,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus-storage"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hmac",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "nodus-store"
 version = "0.1.0"
 dependencies = [
