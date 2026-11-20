@@ -17,6 +17,8 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub token: String,
+    /// Whether the caller marked this as a read it was already passed on.
+    pub forwarded: bool,
     pub body: Vec<u8>,
 }
 
@@ -51,7 +53,7 @@ impl Peer {
                     let Some((head, body)) = read_request(&mut stream).await else {
                         return;
                     };
-                    let (method, path, token) = parse_head(&head);
+                    let (method, path, token, forwarded) = parse_head(&head);
                     let digest = path.rsplit('/').next().unwrap_or_default().to_owned();
                     let (status, payload) = {
                         let mut state = shared.lock().expect("peer state");
@@ -59,6 +61,7 @@ impl Peer {
                             method: method.clone(),
                             path: path.clone(),
                             token,
+                            forwarded,
                             body: body.clone(),
                         });
                         match method.as_str() {
@@ -148,13 +151,16 @@ impl Peer {
     }
 }
 
-fn parse_head(head: &str) -> (String, String, String) {
+/// The request line and the two headers a test asserts on: the cluster token, and the
+/// mark that says this read was already passed on once.
+fn parse_head(head: &str) -> (String, String, String, bool) {
     let mut lines = head.lines();
     let request_line = lines.next().unwrap_or_default();
     let mut parts = request_line.split(' ');
     let method = parts.next().unwrap_or_default().to_owned();
     let path = parts.next().unwrap_or_default().to_owned();
     let token = lines
+        .clone()
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
             name.trim()
@@ -162,7 +168,11 @@ fn parse_head(head: &str) -> (String, String, String) {
                 .then(|| value.trim().to_owned())
         })
         .unwrap_or_default();
-    (method, path, token)
+    let forwarded = lines.any(|line| {
+        line.split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("x-internal-forwarded"))
+    });
+    (method, path, token, forwarded)
 }
 
 /// Reads one request: the head up to the blank line, then `content-length` bytes.

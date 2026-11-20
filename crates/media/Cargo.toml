@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 axum = { workspace = true }
 nodus-server-store = { path = "../store" }
+nodus-storage = { path = "../storage" }
 reqwest = { workspace = true }
 serde.workspace = true
 sha2.workspace = true

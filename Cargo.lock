@@ -2701,6 +2701,7 @@ dependencies = [
  "blurhash",
  "image",
  "nodus-server-store",
+ "nodus-storage",
  "reqwest",
  "serde",
  "sha2",

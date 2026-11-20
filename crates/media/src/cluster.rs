@@ -26,6 +26,11 @@ pub const TOKEN_HEADER: &str = "x-nodus-cluster";
 /// does not fan it out again — otherwise two nodes would bounce the same delete forever.
 pub const NO_FANOUT_HEADER: &str = "x-nodus-no-fanout";
 
+/// Marks a read whose bytes a peer served on someone else's behalf. A request that
+/// already carries it is answered from local bytes or not at all: two nodes that each
+/// believe the other holds a digest would otherwise bounce it until the deadline.
+pub const FORWARDED_HEADER: &str = "x-internal-forwarded";
+
 /// How long one peer gets to answer before it counts as absent.
 pub const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -62,11 +67,18 @@ fn media_url(endpoint: &str, digest: &str) -> String {
 /// A peer that answers with a 404, with bytes that do not hash to the digest, or not at
 /// all is `None`: a miss on a replica is not an error the client should see, it is the
 /// next step of the search.
+///
+/// The request always carries [`FORWARDED_HEADER`], because that is what it is: this node
+/// is asking on a caller's behalf. The peer therefore answers from its own disk or not at
+/// all, which is what makes a two-node loop impossible — without the mark, two nodes that
+/// each believe the other holds a digest would hand the same read back and forth until
+/// both budgets ran out.
 #[must_use]
 pub async fn fetch(endpoint: &str, token: &str, digest: &str) -> Option<Vec<u8>> {
     let request = client()
         .get(media_url(endpoint, digest))
         .header(TOKEN_HEADER, token)
+        .header(FORWARDED_HEADER, "1")
         .send();
     let attempt = async {
         let response = request.await.ok()?;

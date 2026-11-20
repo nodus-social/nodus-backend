@@ -24,6 +24,7 @@ use tokio::sync::{Mutex, Notify};
 
 use nodus_server_store::media::{self, VariantRow};
 use nodus_server_store::media_nodes;
+use nodus_storage::{ByteRange, RangeError};
 
 use crate::cluster::{self, placement, Member};
 use crate::hash::hex;
@@ -42,6 +43,11 @@ pub struct Serving {
     /// peers once; every other request waits for that copy and re-reads the file, rather
     /// than each fetching and writing the same file.
     inflight: Mutex<HashMap<String, Arc<Notify>>>,
+    /// Peers a unit test names directly. The placement needs a database and these tests
+    /// have none, so the one route that reads membership takes its peer list from here
+    /// when it is set. Never populated outside `cfg(test)`.
+    #[cfg(test)]
+    peers: Mutex<Option<Vec<Member>>>,
 }
 
 impl Serving {
@@ -61,6 +67,8 @@ impl Serving {
             node,
             cluster_token,
             inflight: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            peers: Mutex::new(None),
         }
     }
 
@@ -508,6 +516,14 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Record not found").into_response()
 }
 
+/// The answer to a read that has already been passed between nodes once.
+///
+/// A distinct body from the ordinary miss, because an operator reading logs has to be able
+/// to tell "nobody has this" from "this was refused so two nodes could not bounce it".
+fn forwarded_too_far() -> Response {
+    (StatusCode::NOT_FOUND, "forwarded too far").into_response()
+}
+
 /// The largest body an internal replica write will buffer. Originals are capped well
 /// below this at upload; the limit here is defence against a peer that sends more.
 const MAX_INTERNAL_UPLOAD: usize = 64 * 1024 * 1024;
@@ -682,24 +698,125 @@ async fn internal_put(
 }
 
 /// `GET /internal/media/{digest}` — raw bytes, with no catalogue check.
+///
+/// A peer may hold what this node does not: the miss is answered by fetching the digest
+/// from its placement, and the answer says so with `X-Internal-Forwarded`. A request that
+/// already carries that header is never forwarded again — two nodes that each believe the
+/// other holds the digest would otherwise hand it back and forth until the budget ran out.
 async fn internal_get(
     State(serving): State<Arc<Serving>>,
     UrlPath(digest): UrlPath<String>,
+    headers: HeaderMap,
 ) -> Response {
     if !is_digest(&digest) {
         return not_found();
     }
-    match tokio::fs::read(serving.root.join(&digest)).await {
-        Ok(bytes) => (
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/octet-stream"),
-            )],
-            Body::from(bytes),
-        )
-            .into_response(),
-        Err(_) => not_found(),
+    let (bytes, forwarded) = if headers.contains_key(cluster::FORWARDED_HEADER) {
+        // This request has already been passed on once: answer from here or not at all.
+        // Passing it on again is exactly how two nodes would keep bouncing it.
+        match tokio::fs::read(serving.root.join(&digest)).await {
+            Ok(bytes) => (bytes, false),
+            Err(_) => return forwarded_too_far(),
+        }
+    } else {
+        // Membership lives in a database these unit tests do not have, so a test names
+        // the peers it wants asked. In production this is `None` and the placement
+        // decides, which is the only path a real node ever takes.
+        #[cfg(test)]
+        let peers = serving.peers.lock().await.clone();
+        #[cfg(not(test))]
+        let peers: Option<Vec<Member>> = None;
+        match internal_bytes(&serving, &digest, peers.as_deref()).await {
+            Some(found) => found,
+            None => return not_found(),
+        }
+    };
+    internal_response(bytes, headers.get(header::RANGE), forwarded)
+}
+
+/// The bytes for an internal read: local when they are here, otherwise one fetch from a
+/// peer. The bool is whether a peer served them.
+///
+/// `peers` is `None` in production, where the placement decides. A test names the peers
+/// instead, because reading membership needs a database and these tests have none.
+async fn internal_bytes(
+    serving: &Serving,
+    digest: &str,
+    peers: Option<&[Member]>,
+) -> Option<(Vec<u8>, bool)> {
+    if let Ok(bytes) = tokio::fs::read(serving.root.join(digest)).await {
+        return Some((bytes, false));
     }
+    let fetched = match peers {
+        Some(peers) => serving.copy_from_peers(digest, peers).await,
+        None => copy_from_placement(serving, digest).await,
+    }?;
+    Some((fetched, true))
+}
+
+/// The internal answer: octet-stream, an honest length, one range with its 206/416, and
+/// the forwarded marker when the bytes came from a peer.
+fn internal_response(
+    bytes: Vec<u8>,
+    range_header: Option<&HeaderValue>,
+    forwarded: bool,
+) -> Response {
+    let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let parsed = range_header
+        .and_then(|value| value.to_str().ok())
+        .map(ByteRange::parse);
+    let (status, body, span) = match parsed {
+        // A range we cannot parse is ignored, which is what RFC 9110 asks for: the client
+        // gets the whole representation rather than an error it cannot act on.
+        None | Some(Err(RangeError::Malformed)) => (StatusCode::OK, bytes, None),
+        Some(Err(RangeError::Unsatisfiable)) => return unsatisfiable(total),
+        Some(Ok(range)) => match range.resolve(total) {
+            Ok((start, end)) => {
+                let kept = bytes
+                    .get(
+                        usize::try_from(start).unwrap_or(usize::MAX)
+                            ..=usize::try_from(end).unwrap_or(usize::MAX),
+                    )
+                    .map(<[u8]>::to_vec);
+                match kept {
+                    Some(kept) => (StatusCode::PARTIAL_CONTENT, kept, Some((start, end))),
+                    None => return unsatisfiable(total),
+                }
+            }
+            Err(_) => return unsatisfiable(total),
+        },
+    };
+    let len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    let mut response = (status, Body::from(body)).into_response();
+    let out = response.headers_mut();
+    out.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    out.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(value) = HeaderValue::from_str(&len.to_string()) {
+        out.insert(header::CONTENT_LENGTH, value);
+    }
+    if let Some((start, end)) = span {
+        if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+            out.insert(header::CONTENT_RANGE, value);
+        }
+    }
+    if forwarded {
+        out.insert(cluster::FORWARDED_HEADER, HeaderValue::from_static("1"));
+    }
+    response
+}
+
+/// `416` with the length, which is the only part of the answer a ranged client can use.
+fn unsatisfiable(len: u64) -> Response {
+    let mut response = (StatusCode::RANGE_NOT_SATISFIABLE, "").into_response();
+    let out = response.headers_mut();
+    out.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes */{len}")) {
+        out.insert(header::CONTENT_RANGE, value);
+    }
+    response
 }
 
 /// `HEAD /internal/media/{digest}` — presence without reading the file.
@@ -1140,6 +1257,142 @@ mod tests {
         tokio::fs::write(root.join(digest), bytes)
             .await
             .expect("seed a local copy");
+    }
+
+    /// One request through the internal router, with the status, headers and body kept so a
+    /// test can assert on all three rather than on the status alone.
+    async fn answer(
+        serving: &Arc<Serving>,
+        request: HttpRequest<Body>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        use axum::http::header::HeaderMap;
+        let response = serving
+            .router()
+            .oneshot(request)
+            .await
+            .expect("router response");
+        let status = response.status();
+        let headers: HeaderMap = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body")
+            .to_vec();
+        (status, headers, body)
+    }
+
+    /// A single `bytes=` range gives exactly that slice and the header a ranged client uses
+    /// to place it; an impossible range is a 416 that still carries the length; a header
+    /// nothing can parse is ignored, because RFC 9110 says a whole body beats an error.
+    #[tokio::test]
+    async fn an_internal_read_answers_one_range_exactly() {
+        let body = b"0123456789abcdef".to_vec();
+        let digest = digest_of(&body);
+        let root = temp_root();
+        seed_local(&root, &digest, &body).await;
+        let serving = serving_in(&root, "test-node", Some("token"));
+        let uri = format!("/internal/media/{digest}");
+
+        let ranged = HttpRequest::builder()
+            .uri(&uri)
+            .header("x-nodus-cluster", "token")
+            .header("range", "bytes=4-7")
+            .body(Body::empty())
+            .expect("request");
+        let (status, headers, bytes) = answer(&serving, ranged).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(bytes, b"4567", "the range was not served as that slice");
+        assert_eq!(
+            headers.get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes 4-7/16")
+        );
+        assert_eq!(
+            headers.get("content-length").and_then(|v| v.to_str().ok()),
+            Some("4"),
+            "the partial body did not declare its own length"
+        );
+
+        let beyond = HttpRequest::builder()
+            .uri(&uri)
+            .header("x-nodus-cluster", "token")
+            .header("range", "bytes=99-")
+            .body(Body::empty())
+            .expect("request");
+        let (status, headers, _) = answer(&serving, beyond).await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            headers.get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes */16"),
+            "a 416 has to say how long the object is"
+        );
+
+        let rambling = HttpRequest::builder()
+            .uri(&uri)
+            .header("x-nodus-cluster", "token")
+            .header("range", "bytes=lots")
+            .body(Body::empty())
+            .expect("request");
+        let (status, _, bytes) = answer(&serving, rambling).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            bytes, body,
+            "an unreadable range must not truncate the answer"
+        );
+    }
+
+    /// Bytes a peer served are marked, and a read that already carries the mark is refused
+    /// where it lands: passing it on again is exactly how two nodes would bounce a digest
+    /// neither of them holds, so the second hop must stop rather than forward.
+    #[tokio::test]
+    async fn a_peer_served_read_is_marked_and_a_marked_one_is_not_forwarded() {
+        let body = b"only on beta".to_vec();
+        let digest = digest_of(&body);
+        let peer = crate::testpeer::Peer::spawn("beta").await;
+        peer.seed(&digest, body.clone());
+
+        let root = temp_root();
+        let serving = serving_in(&root, "test-node", Some("token"));
+        *serving.peers.lock().await = Some(vec![peer.member()]);
+        let uri = format!("/internal/media/{digest}");
+
+        let first = HttpRequest::builder()
+            .uri(&uri)
+            .header("x-nodus-cluster", "token")
+            .body(Body::empty())
+            .expect("request");
+        let (status, headers, bytes) = answer(&serving, first).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bytes, body, "the peer's bytes did not reach the caller");
+        assert_eq!(
+            headers
+                .get("x-internal-forwarded")
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a peer-served answer must say a peer served it"
+        );
+        assert_eq!(peer.gets(), 1);
+        assert!(
+            peer.seen().iter().all(|request| request.forwarded),
+            "the outbound read must arrive marked, or the peer would forward it on again"
+        );
+
+        // A node that does not hold the digest, asked with the mark already set, answers
+        // from itself or not at all — never with another hop to the peer that has it.
+        let second = serving_in(&temp_root(), "test-node", Some("token"));
+        *second.peers.lock().await = Some(vec![peer.member()]);
+        let marked = HttpRequest::builder()
+            .uri(&uri)
+            .header("x-nodus-cluster", "token")
+            .header("x-internal-forwarded", "1")
+            .body(Body::empty())
+            .expect("request");
+        let (status, _, bytes) = answer(&second, marked).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "forwarded too far",
+            "a refused forward must say what it refused"
+        );
+        assert_eq!(peer.gets(), 1, "the marked request was forwarded onward");
     }
 
     /// The upload's answer does not include the replication: the second member is asked,
