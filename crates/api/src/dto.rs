@@ -74,7 +74,7 @@ fn moved_account(uri: &str) -> serde_json::Value {
     })
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AccountDto {
     pub id: String,
     pub username: String,

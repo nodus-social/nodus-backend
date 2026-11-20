@@ -53,6 +53,15 @@ pub struct StatusPage {
     pub next_max_id: Option<String>,
 }
 
+/// One revision of a status, as `GET /api/v1/statuses/{id}/history` reports it.
+#[derive(Debug, Clone, FromRow)]
+pub struct StatusEditRow {
+    pub content: String,
+    pub spoiler_text: String,
+    pub sensitive: bool,
+    pub created_at: DateTime<Utc>,
+}
+
 /// One status by id, tombstoned rows excluded.
 pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<StatusRow>, sqlx::Error> {
     let sql =
@@ -211,6 +220,13 @@ pub async fn upsert_remote(
     new: &NewRemoteStatus<'_>,
 ) -> Result<StatusRow, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // The previous version is read before the upsert so the history can tell a real
+    // change from a peer repeating itself.
+    let previous: Option<(String, String, bool)> =
+        sqlx::query_as("SELECT content, spoiler_text, sensitive FROM status WHERE uri = $1")
+            .bind(new.uri)
+            .fetch_optional(&mut *tx)
+            .await?;
     let sql = format!(
         "INSERT INTO status (id, account_id, uri, content, content_html, spoiler_text, \
              visibility, sensitive, in_reply_to_id, in_reply_to_account_id, local, created_at) \
@@ -234,6 +250,21 @@ pub async fn upsert_remote(
         .bind(new.created_at)
         .fetch_one(&mut *tx)
         .await?;
+    if let Some((old_content, old_spoiler, old_sensitive)) = previous {
+        if old_content != new.content
+            || old_spoiler != new.spoiler_text
+            || old_sensitive != new.sensitive
+        {
+            record_edit(
+                &mut tx,
+                &row.id,
+                new.content,
+                new.spoiler_text,
+                new.sensitive,
+            )
+            .await?;
+        }
+    }
     if let Some(parent_id) = new.in_reply_to_id {
         refresh_replies_count(&mut tx, parent_id).await?;
     }
@@ -251,21 +282,71 @@ pub async fn update_remote_content(
     spoiler_text: &str,
     sensitive: bool,
 ) -> Result<Option<StatusRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // The row's own text decides whether this is a revision: an Update that says what we
+    // already have is not one.
+    let previous: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT content, spoiler_text, sensitive FROM status \
+          WHERE uri = $1 AND account_id = $2 AND NOT local AND deleted_at IS NULL",
+    )
+    .bind(uri)
+    .bind(account_id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let sql = format!(
         "UPDATE status SET content = $3, content_html = $4, spoiler_text = $5, \
              sensitive = $6, edited_at = now() \
           WHERE uri = $1 AND account_id = $2 AND NOT local AND deleted_at IS NULL \
           RETURNING {STATUS_COLUMNS_SIMPLE}"
     );
-    sqlx::query_as::<_, StatusRow>(&sql)
+    let row = sqlx::query_as::<_, StatusRow>(&sql)
         .bind(uri)
         .bind(account_id)
         .bind(content)
         .bind(content_html)
         .bind(spoiler_text)
         .bind(sensitive)
-        .fetch_optional(pool)
-        .await
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let (Some((old_content, old_spoiler, old_sensitive)), Some(row)) = (previous, &row) {
+        if old_content != content || old_spoiler != spoiler_text || old_sensitive != sensitive {
+            record_edit(&mut tx, &row.id, content, spoiler_text, sensitive).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Appends one revision. The caller has already compared it with the previous text.
+async fn record_edit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    status_id: &str,
+    content: &str,
+    spoiler_text: &str,
+    sensitive: bool,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO status_edit (status_id, content, spoiler_text, sensitive) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(status_id)
+    .bind(content)
+    .bind(spoiler_text)
+    .bind(sensitive)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The revisions of a status, newest first. An unedited post has none.
+pub async fn edits(pool: &PgPool, status_id: &str) -> Result<Vec<StatusEditRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT content, spoiler_text, sensitive, created_at FROM status_edit \
+          WHERE status_id = $1 ORDER BY created_at DESC, id DESC",
+    )
+    .bind(status_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Soft-deletes a remote status by URI, scoped to its owning account.

@@ -133,6 +133,7 @@ pub fn router(state: AppState) -> axum::Router {
             post(statuses::reblog).delete(statuses::unreblog),
         )
         .route("/api/v1/statuses/{id}/context", get(statuses::context))
+        .route("/api/v1/statuses/{id}/history", get(statuses::history))
         .route(
             "/api/v1/accounts/{id}/statuses",
             get(statuses::account_statuses),

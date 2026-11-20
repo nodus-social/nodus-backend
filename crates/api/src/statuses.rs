@@ -18,7 +18,7 @@ use nodus_server_store::social::ViewerFlags;
 use nodus_server_store::statuses::{NewStatus, StatusRow};
 
 use crate::auth::{Auth, MaybeAuth};
-use crate::dto::{account_url, StatusDto};
+use crate::dto::{account_url, AccountDto, StatusDto};
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
 use crate::state::AppState;
@@ -432,6 +432,46 @@ pub async fn show(
 ) -> ApiResult<Json<StatusDto>> {
     let row = visible_status(&state, auth.as_ref(), &id).await?;
     Ok(Json(dto(&state, &row, auth.as_ref()).await?))
+}
+
+/// One revision in a status's edit history.
+#[derive(Debug, Serialize)]
+pub struct HistoryEntryDto {
+    pub content: String,
+    pub spoiler_text: String,
+    pub sensitive: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub account: AccountDto,
+}
+
+/// `GET /api/v1/statuses/{id}/history`
+///
+/// The revisions a viewer may see, newest first. A post the viewer cannot see is a 404,
+/// exactly like the post itself: an empty history would confirm that the id exists.
+pub async fn history(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<HistoryEntryDto>>> {
+    auth.require_scope("read:statuses")?;
+    let row = visible_status(&state, Some(&auth), &id).await?;
+    let author = nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    let account = AccountDto::from_row(&author, state.instance());
+    let edits = nodus_server_store::statuses::edits(state.store().pool(), &row.id).await?;
+    Ok(Json(
+        edits
+            .into_iter()
+            .map(|edit| HistoryEntryDto {
+                content: edit.content,
+                spoiler_text: edit.spoiler_text,
+                sensitive: edit.sensitive,
+                created_at: edit.created_at,
+                account: account.clone(),
+            })
+            .collect(),
+    ))
 }
 
 pub async fn destroy(
