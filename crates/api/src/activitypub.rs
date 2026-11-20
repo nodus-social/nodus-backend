@@ -1292,7 +1292,7 @@ async fn store_note_extras(
     };
     if paused {
         tracing::debug!(status = %row.id, domain = ?remote.domain, "not fetching media from a paused domain");
-    } else if let Err(error) = crate::guard::screen_status(pool, &row.id, &remote.id).await {
+    } else if let Err(error) = crate::guard::screen_status_with(state, &row.id, &remote.id).await {
         tracing::warn!(status = %row.id, %error, "inbound media check could not run");
     }
     // Now the instance's rules read the post. Inbound scope: the author is somebody

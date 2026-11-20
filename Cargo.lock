@@ -2650,6 +2650,7 @@ dependencies = [
  "nodus-shared",
  "nodus-storage",
  "rand 0.9.5",
+ "redis",
  "reqwest",
  "rsa",
  "serde",

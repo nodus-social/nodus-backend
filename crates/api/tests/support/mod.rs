@@ -18,6 +18,9 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tower::ServiceExt;
 
+use std::sync::Arc;
+
+use nodus_server_api::home::{HomeCache, HomeShards};
 use nodus_server_api::{root_router, AppState, InstanceConfig};
 use nodus_server_core::Id;
 use nodus_server_store::accounts::{self, NewAccount};
@@ -43,21 +46,9 @@ where
     F: FnOnce(Store, Router) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    let Some(url) = std::env::var("DATABASE_URL").ok() else {
+    let Some((admin, schema, store)) = isolated_store().await else {
         return;
     };
-    let admin = Store::connect(&url, 1).await.expect("connect to postgres");
-    let schema = format!("pgtest_{}", Id::new()).to_lowercase();
-    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-        .execute(admin.pool())
-        .await
-        .expect("create isolated test schema");
-    let sep = if url.contains('?') { '&' } else { '?' };
-    let schema_url = format!("{url}{sep}options=-csearch_path%3D{schema}%2Cpublic");
-    let store = Store::connect(&schema_url, 5)
-        .await
-        .expect("connect isolated store");
-    store.migrate().await.expect("run migrations");
     // The auth pages live in their own router, the way the server mounts them.
     let api = root_router(AppState::new(store.clone(), instance_config()));
     let auth = nodus_auth::router(nodus_auth::AppState::new(
@@ -78,6 +69,50 @@ where
     if let Err(err) = outcome {
         std::panic::resume_unwind(err.into_panic());
     }
+}
+
+/// The same isolated schema, but the state handed to `body` has home timelines configured
+/// with `caches` — and so does the router built over it. The caches are handed back to the
+/// test because the interesting assertions are about what the server wrote into them.
+pub async fn run_home_db_test<F, Fut>(caches: Vec<Arc<dyn HomeCache>>, body: F)
+where
+    F: FnOnce(Store, AppState, Arc<HomeShards>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Some((admin, schema, store)) = isolated_store().await else {
+        return;
+    };
+    let home = Arc::new(HomeShards::new(caches, nodus_server_api::home::DEFAULT_CAP));
+    let state = AppState::new(store.clone(), instance_config()).with_home(Some(home.clone()));
+
+    let outcome = tokio::spawn(async move { body(store, state, home).await }).await;
+    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(admin.pool())
+        .await;
+    if let Err(err) = outcome {
+        std::panic::resume_unwind(err.into_panic());
+    }
+}
+
+/// A schema that belongs to one test, with the migrations already applied.
+///
+/// `None` when `DATABASE_URL` is unset: every contract test is skipped rather than failed,
+/// so `cargo test` works on a machine with no database.
+async fn isolated_store() -> Option<(Store, String, Store)> {
+    let url = std::env::var("DATABASE_URL").ok()?;
+    let admin = Store::connect(&url, 1).await.expect("connect to postgres");
+    let schema = format!("pgtest_{}", Id::new()).to_lowercase();
+    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(admin.pool())
+        .await
+        .expect("create isolated test schema");
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let schema_url = format!("{url}{sep}options=-csearch_path%3D{schema}%2Cpublic");
+    let store = Store::connect(&schema_url, 5)
+        .await
+        .expect("connect isolated store");
+    store.migrate().await.expect("run migrations");
+    Some((admin, schema, store))
 }
 
 pub async fn create_account(pool: &PgPool, label: &str) -> String {

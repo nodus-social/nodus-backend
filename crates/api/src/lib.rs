@@ -27,6 +27,7 @@ pub mod filters;
 pub mod follow_requests;
 pub mod guard;
 pub mod highlights;
+pub mod home;
 pub mod html;
 pub mod hydrate;
 pub mod lists;

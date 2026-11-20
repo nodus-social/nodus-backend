@@ -18,6 +18,8 @@ use std::time::Duration;
 use serde_json::json;
 use sqlx::PgPool;
 
+use crate::state::AppState;
+
 use nodus_server_media::hash::Hashes;
 use nodus_server_store::media::{self, MediaRow};
 use nodus_server_store::moderation::{self, NewReport};
@@ -175,6 +177,31 @@ pub async fn screen_status(
     status_id: &str,
     account_id: &str,
 ) -> Result<usize, sqlx::Error> {
+    Ok(screen(pool, status_id, account_id).await?.0)
+}
+
+/// The same check, with the one thing a pool alone cannot do: when a post is hidden, its
+/// id leaves every follower's cached home timeline too, and the removal is published to
+/// the other replicas through the invalidation sink.
+pub async fn screen_status_with(
+    state: &AppState,
+    status_id: &str,
+    account_id: &str,
+) -> Result<usize, sqlx::Error> {
+    let pool = state.store().pool();
+    let (matched, hidden) = screen(pool, status_id, account_id).await?;
+    if hidden {
+        crate::home::hide(state, account_id, status_id).await;
+    }
+    Ok(matched)
+}
+
+/// The check itself: `(attachments matched, post newly hidden)`.
+async fn screen(
+    pool: &PgPool,
+    status_id: &str,
+    account_id: &str,
+) -> Result<(usize, bool), sqlx::Error> {
     let rows = media::by_status(pool, status_id).await?;
     let pending: Vec<MediaRow> = rows
         .into_iter()
@@ -183,18 +210,19 @@ pub async fn screen_status(
         .filter(|row| row.remote && row.quarantine_state == "none" && row.remote_url.is_some())
         .collect();
     if pending.is_empty() {
-        return Ok(0);
+        return Ok((0, false));
     }
 
     let sets = Sets::load(pool).await?;
     if sets.is_empty() {
         // No set to compare against: the check is a read and a no-op, which is why an
         // instance that never uploaded one pays nothing for this path.
-        return Ok(0);
+        return Ok((0, false));
     }
 
     let outcome = tokio::time::timeout(SCREEN_BUDGET, async {
         let mut matched = 0;
+        let mut hidden = false;
         for row in pending {
             let hashes = match hash_row(pool, &row).await {
                 Ok(Some(hashes)) => hashes,
@@ -207,10 +235,10 @@ pub async fn screen_status(
             let Some(hit) = sets.matches(&hashes) else {
                 continue;
             };
-            quarantine(pool, &row, account_id, &hit).await?;
+            hidden |= quarantine(pool, &row, account_id, &hit).await?;
             matched += 1;
         }
-        Ok::<usize, sqlx::Error>(matched)
+        Ok::<(usize, bool), sqlx::Error>((matched, hidden))
     })
     .await;
 
@@ -218,7 +246,7 @@ pub async fn screen_status(
         result
     } else {
         tracing::warn!(status = %status_id, "media check ran out of its time budget");
-        Ok(0)
+        Ok((0, false))
     }
 }
 
@@ -250,19 +278,22 @@ async fn hash_row(pool: &PgPool, row: &MediaRow) -> Result<Option<Hashes>, sqlx:
 }
 
 /// Hides the attachment and its post, and puts the match in the queue with a name on it.
+///
+/// Returns whether this call is what hid the post: the caller invalidates the cached
+/// timelines only when something changed.
 async fn quarantine(
     pool: &PgPool,
     row: &MediaRow,
     account_id: &str,
     hit: &Hit,
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     if !media::quarantine(pool, &row.id, &hit.set).await? {
-        return Ok(());
+        return Ok(false);
     }
     let Some(status_id) = row.status_id.as_deref() else {
-        return Ok(());
+        return Ok(false);
     };
-    statuses::quarantine(pool, status_id).await?;
+    let hidden = statuses::quarantine(pool, status_id).await?;
 
     // The report is the queue entry: it names the set, so a moderator sees why the post is
     // gone from the timeline instead of a hole they have to guess about.
@@ -312,5 +343,5 @@ async fn quarantine(
         set = %hit.set,
         "quarantined inbound media"
     );
-    Ok(())
+    Ok(hidden)
 }

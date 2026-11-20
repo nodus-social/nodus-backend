@@ -15,6 +15,7 @@ use nodus_server_store::Store;
 use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
 
 use crate::admin::stats::StatsDto;
+use crate::home::HomeShards;
 
 pub use nodus_server_core::instance::InstanceConfig;
 
@@ -40,6 +41,17 @@ pub(crate) const ACTOR_KEY_TTL: Duration = Duration::from_secs(300);
 /// limit by inventing key ids. Well above the number of peers one instance talks to.
 const ACTOR_KEY_CACHE_MAX: usize = 1024;
 
+/// A `dyn InvalidationSink` that can be printed: the state's `Debug` is for diagnostics,
+/// and a trait object has nothing readable inside it.
+#[derive(Clone)]
+struct DebugSink(Arc<dyn InvalidationSink>);
+
+impl std::fmt::Debug for DebugSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InvalidationSink")
+    }
+}
+
 #[derive(Debug)]
 struct Inner {
     store: Store,
@@ -61,6 +73,12 @@ struct Inner {
     account_delete_grace_days: i64,
     /// The single writer every drive mutation goes through.
     writer: DbWriterHandle,
+    /// The home timelines' fan-out cache, when `NODUS_VALKEY_URL` named one. `None` is the
+    /// deployment this instance has always run: every read is SQL.
+    home: Option<Arc<HomeShards>>,
+    /// The sink committed home removals are published to. Kept here as well as in the
+    /// writer, because the delete path publishes long after the writer's commit.
+    sink: Option<DebugSink>,
 }
 
 /// Cloned into every handler; `Store` is a pool handle and `InstanceConfig` is small.
@@ -175,7 +193,7 @@ impl AppState {
         let writer = DbWriter::start_detached(
             store.write_pool(),
             WriterConfig {
-                sink,
+                sink: sink.clone(),
                 ..WriterConfig::default()
             },
         );
@@ -191,6 +209,32 @@ impl AppState {
                 key_fetches: Mutex::new(HashMap::new()),
                 account_delete_grace_days: DEFAULT_ACCOUNT_DELETE_GRACE_DAYS,
                 writer,
+                home: None,
+                sink: sink.map(DebugSink),
+            }),
+        }
+    }
+
+    /// The same state with the home timelines' fan-out cache, when one is configured.
+    ///
+    /// `None` keeps the deployment this instance has always run: `timeline_entry` is the
+    /// only home timeline, read by one SQL query per page.
+    #[must_use]
+    pub fn with_home(self, home: Option<Arc<HomeShards>>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                store: self.inner.store.clone(),
+                instance: self.inner.instance.clone(),
+                federation: self.inner.federation.clone(),
+                authorized_fetch: self.inner.authorized_fetch,
+                drive_share: self.inner.drive_share,
+                stats_cache: Mutex::new(HashMap::new()),
+                actor_keys: Mutex::new(HashMap::new()),
+                key_fetches: Mutex::new(HashMap::new()),
+                account_delete_grace_days: self.inner.account_delete_grace_days,
+                writer: self.inner.writer.clone(),
+                home,
+                sink: self.inner.sink.clone(),
             }),
         }
     }
@@ -213,6 +257,8 @@ impl AppState {
                 key_fetches: Mutex::new(HashMap::new()),
                 account_delete_grace_days: self.inner.account_delete_grace_days,
                 writer: self.inner.writer.clone(),
+                home: self.inner.home.clone(),
+                sink: self.inner.sink.clone(),
             }),
         }
     }
@@ -236,6 +282,8 @@ impl AppState {
                 key_fetches: Mutex::new(HashMap::new()),
                 account_delete_grace_days: self.inner.account_delete_grace_days,
                 writer: self.inner.writer.clone(),
+                home: self.inner.home.clone(),
+                sink: self.inner.sink.clone(),
             }),
         }
     }
@@ -255,6 +303,8 @@ impl AppState {
                 key_fetches: Mutex::new(HashMap::new()),
                 account_delete_grace_days: days.max(0),
                 writer: self.inner.writer.clone(),
+                home: self.inner.home.clone(),
+                sink: self.inner.sink.clone(),
             }),
         }
     }
@@ -274,6 +324,18 @@ impl AppState {
     #[must_use]
     pub fn store(&self) -> &Store {
         &self.inner.store
+    }
+
+    /// The home timelines' fan-out cache, when this process was configured with one.
+    #[must_use]
+    pub fn home(&self) -> Option<&Arc<HomeShards>> {
+        self.inner.home.as_ref()
+    }
+
+    /// The sink invalidations are published to, when one was configured.
+    #[must_use]
+    pub fn invalidation_sink(&self) -> Option<&Arc<dyn InvalidationSink>> {
+        self.inner.sink.as_ref().map(|sink| &sink.0)
     }
 
     /// The single writer: drive mutations are posted here, never run on this pool.

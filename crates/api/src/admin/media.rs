@@ -137,6 +137,14 @@ async fn decide(
         // one cleared picture does not make a post with another quarantined one visible.
         if media::quarantined_count(pool, status_id).await? == 0 {
             statuses::release_quarantine(pool, status_id).await?;
+            // The post is visible again, so it goes back into the cached timelines it was
+            // removed from when it was hidden. A no-op when no cache is configured.
+            if let Some(hidden) = statuses::by_id(pool, status_id).await? {
+                crate::home::fan_out(&state, &hidden).await;
+            }
+        } else if let Some(hidden) = statuses::by_id(pool, status_id).await? {
+            // Still hidden: the id must not linger in a follower's cached page.
+            crate::home::hide(&state, &hidden.account_id, status_id).await;
         }
         // Releasing means the post was fine, so the report is dismissed; deleting means it
         // was not, so the report keeps `action_taken`. Either way one report, one decision.

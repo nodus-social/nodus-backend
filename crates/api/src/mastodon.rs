@@ -9,6 +9,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
+use std::sync::Arc;
 
 use nodus_server_core::id::Id;
 use nodus_server_core::{PageParams, PageSize};
@@ -144,9 +145,15 @@ pub async fn home_timeline(
 ) -> ApiResult<Response> {
     auth.require_scope("read")?;
     let params = query.params()?;
-    let page =
-        nodus_server_store::statuses::home_page(state.store().pool(), &auth.0.account.id, params)
-            .await?;
+    // The cache when it can answer, `statuses::home_page` when it cannot: one read path,
+    // one query, and no second implementation to keep in step. See `crate::home`.
+    let page = crate::home::page(
+        state.store().pool(),
+        state.home().map(Arc::as_ref),
+        &auth.0.account.id,
+        params,
+    )
+    .await?;
     timeline_response(
         &state,
         page.items,

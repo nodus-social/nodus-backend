@@ -30,6 +30,7 @@ axum-extra = { workspace = true }
 leptos = { workspace = true }
 nodus-server-sdk = { workspace = true, features = ["nodus", "misskey", "native"] }
 rand = { workspace = true }
+redis = { workspace = true }
 reqwest = { workspace = true }
 rsa = { workspace = true }
 url = { workspace = true }

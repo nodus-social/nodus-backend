@@ -739,6 +739,8 @@ async fn create_note(
         &tags,
     )
     .await?;
+    // A note is a local status with followers like any other: it fans out the same way.
+    crate::home::fan_out(&state, &row).await;
     // A note is a local status: the same rules that read a Mastodon post read this one.
     crate::rulewatch::screen(
         state.store().pool(),
@@ -799,8 +801,14 @@ async fn delete_note(
     let local = external_ids::resolve(state.store().pool(), "status", &body.note_id)
         .await?
         .unwrap_or_else(|| body.note_id.clone());
+    let author = statuses::by_id(state.store().pool(), &local)
+        .await?
+        .map(|row| row.account_id);
     if !statuses::delete_owned(state.store().pool(), &local, &auth.account.id).await? {
         return Err(ApiError::not_found("No such note"));
+    }
+    if let Some(author) = author {
+        crate::home::hide(&state, &author, &local).await;
     }
     events::append(
         state.store().pool(),

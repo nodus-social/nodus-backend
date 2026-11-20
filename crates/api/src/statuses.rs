@@ -309,6 +309,10 @@ pub(crate) async fn publish(
         &row.content,
     )
     .await;
+    // The author and every accepted follower get the id in their home timeline, mirroring
+    // the `timeline_entry` rows the store just wrote. Best effort: the row is committed, so
+    // a cache that does not answer costs a warning and the SQL read still finds the post.
+    crate::home::fan_out(state, &row).await;
     notify_mentions(
         state.store().pool(),
         account_id,
@@ -448,6 +452,9 @@ pub async fn destroy(
     let json = Json(dto(&state, &row, Some(&auth)).await?);
     nodus_server_store::statuses::delete_owned(state.store().pool(), &id, &auth.0.account.id)
         .await?;
+    // Gone here means gone from every follower's cache: the row outlives the post, so
+    // hydration could not tell a deleted id from a live one on its own.
+    crate::home::hide(&state, &row.account_id, &id).await;
     Ok(json.into_response())
 }
 
@@ -523,6 +530,9 @@ pub async fn reblog(
             .await?
             .ok_or_else(|| ApiError::unprocessable("This status cannot be boosted"))?;
     if created {
+        // The boost is a status of its own, so it fans out like one; `fan_out` scans the
+        // original's author to skip a self-boost, which adds nothing to a timeline.
+        crate::home::fan_out(&state, &row).await;
         crate::outbox::deliver_reaction(
             &state,
             &auth.0.account.id,

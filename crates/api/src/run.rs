@@ -64,6 +64,9 @@ where
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let sink = invalidation_sink();
+    // One variable turns the home timelines' fan-out on: with no `NODUS_VALKEY_URL` this is
+    // `None`, and every home read is the SQL query it has always been.
+    let home = crate::home::HomeShards::from_env();
     if config.migrate_only {
         tracing::info!("migrations applied");
         return Ok(());
@@ -81,7 +84,13 @@ where
     )
     .with_authorized_fetch(config.authorized_fetch)
     .with_drive_share(crate::drive::share_links_configured())
-    .with_account_delete_grace_days(config.account_delete_grace_days);
+    .with_account_delete_grace_days(config.account_delete_grace_days)
+    .with_home(home.clone());
+    if let Some(home) = home.as_ref() {
+        // Removals another replica published are applied here; a single-process deployment
+        // hears its own echo and finds nothing left to remove.
+        crate::home::spawn_subscriber(home);
+    }
     tokio::spawn(crate::schedules::run(state.clone()));
     // The subscription sweep lives here rather than in the pruning worker: it is an
     // outbound fetch, and the outbound guard, the client and the import path all live in
@@ -96,32 +105,31 @@ where
     );
     nodus_server_transport::serve_http(
         &config.bind,
-        router(&store, &config, federation, sink),
+        router(&store, &config, federation, sink, home),
         shutdown,
     )
     .await?;
     Ok(())
 }
 
-/// The sink committed drive writes publish to, from the environment.
+/// The sink committed writes publish to, from the environment.
 ///
 /// One variable decides it: `NODUS_VALKEY_URL` set means other replicas are told what
 /// changed; unset means there is no cache to tell and every write behaves exactly as it
 /// did before. The channel name is logged either way, because an operator debugging a
-/// stale cache needs to know which channel to subscribe to.
+/// stale cache needs to know which channel to subscribe to. The unset case is logged by
+/// [`crate::home::HomeShards::from_env`], which is what names the read path this deployment
+/// takes.
 fn invalidation_sink() -> Option<Arc<dyn InvalidationSink>> {
     let url = match std::env::var("NODUS_VALKEY_URL") {
         Ok(url) if !url.trim().is_empty() => url,
-        _ => {
-            tracing::info!("NODUS_VALKEY_URL is unset: invalidations are off");
-            return None;
-        }
+        _ => return None,
     };
     let channel = std::env::var("NODUS_VALKEY_CHANNEL")
         .ok()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_CHANNEL.to_owned());
-    tracing::info!(channel = %channel, "drive invalidations publish to valkey");
+    tracing::info!(channel = %channel, "invalidations publish to valkey");
     Some(Arc::new(ValkeyInvalidator::spawn(&url, &channel)))
 }
 
@@ -131,6 +139,7 @@ fn router(
     config: &Config,
     federation: Option<FederationKey>,
     sink: Option<Arc<dyn InvalidationSink>>,
+    home: Option<Arc<crate::home::HomeShards>>,
 ) -> Router {
     let api = root_router(
         AppState::with_federation_and_sink(
@@ -141,7 +150,8 @@ fn router(
         )
         .with_authorized_fetch(config.authorized_fetch)
         .with_drive_share(crate::drive::share_links_configured())
-        .with_account_delete_grace_days(config.account_delete_grace_days),
+        .with_account_delete_grace_days(config.account_delete_grace_days)
+        .with_home(home),
     );
     let auth = nodus_auth::router(nodus_auth::AppState::new(
         PgAuthStore::new(store.pool().clone()),
