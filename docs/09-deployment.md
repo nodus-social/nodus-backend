@@ -151,6 +151,21 @@ handle /media/* {
 }
 ```
 
+Rotating the secret retires every link minted with the old one: a token is a
+signature over the digest, and verification uses only the current value, so
+outstanding `/media/share/{token}` URLs start answering `404` the moment the
+service restarts with the new secret. Deleting the line instead of replacing it
+turns share links off entirely — the route goes back to `503` and `drive_share`
+leaves `/api/v1/meta`. Plan a rotation for a quiet window, or accept that links
+in the wild break.
+
+The secret lives in the deployment's environment file (on this host
+`/etc/nodus-backend.env`, mode `0640 root:nodus`) and nowhere else: it must never
+be committed, copied into `docs/`, baked into an image, or pasted into a command
+line that a shell records. Read it through the service environment, and generate
+a replacement on the host with `openssl rand -hex 32` so the 32 random bytes
+never travel over the wire.
+
 ## Logging and abuse alerts
 
 Every request is logged by `tower_http::trace::TraceLayer` with method, path,
