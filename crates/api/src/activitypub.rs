@@ -1158,6 +1158,29 @@ pub(crate) async fn ingest_note(
         .as_deref()
         .ok_or_else(|| ApiError::unprocessable("remote actor has no URI"))?;
     ensure_note_from_actor(state, remote, &note, actor_uri).await?;
+    if let Some(uri) = note.in_reply_to.as_deref() {
+        match crate::poll_votes::consume_reply(state, remote, uri).await? {
+            crate::poll_votes::VoteReply::NotAVote => {}
+            crate::poll_votes::VoteReply::Counted { counted } => {
+                tracing::debug!(
+                    note = %note.id,
+                    actor = %remote.id,
+                    counted,
+                    "received a federated poll vote"
+                );
+                return Ok(());
+            }
+            crate::poll_votes::VoteReply::Refused(refusal) => {
+                tracing::info!(
+                    note = %note.id,
+                    actor = %remote.id,
+                    reason = refusal.reason(),
+                    "refused a federated poll vote"
+                );
+                return Ok(());
+            }
+        }
+    }
     let parent = match &note.in_reply_to {
         Some(uri) => statuses::by_uri(state.store().pool(), uri).await?,
         None => None,
@@ -1542,6 +1565,9 @@ async fn status_object(
         return Ok((value, note));
     };
     map.insert("type".to_owned(), Value::String("Question".to_owned()));
+    // An option needs its own id: a peer votes by replying to it, and the index in the
+    // `oneOf`/`anyOf` order is the only name both sides already agree on.
+    let object_id = note.id.clone();
     let options: Vec<Value> = poll
         .options
         .0
@@ -1549,6 +1575,7 @@ async fn status_object(
         .enumerate()
         .map(|(index, name)| {
             json!({
+                "id": format!("{object_id}#option-{index}"),
                 "type": "Note",
                 "name": name,
                 "replies": {
@@ -2952,6 +2979,7 @@ mod tests {
             assert_eq!(
                 object["oneOf"][0],
                 json!({
+                    "id": format!("{}#option-0", status_url(&state, &row)),
                     "type": "Note",
                     "name": "tea",
                     "replies": {"type": "Collection", "totalItems": 0},
@@ -3050,6 +3078,309 @@ mod tests {
                 .expect("read status")
                 .expect("status remains");
             assert_eq!(status.content, "which one");
+        })
+        .await;
+    }
+
+    fn vote_note(note_id: &str, option_uri: &str, actor: &str) -> Value {
+        json!({
+            "id": note_id,
+            "type": "Note",
+            "attributedTo": actor,
+            "content": "",
+            "published": "2026-01-01T00:00:00Z",
+            "inReplyTo": option_uri,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_an_option_counts_as_a_vote_and_updates_the_tally() {
+        with_isolated_state(|store, state| async move {
+            let (account, row, poll) =
+                seed_local_poll(&store, &["tea", "coffee"], false, false).await;
+            let remote = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let note_id = "https://remote.test/notes/vote-1";
+            let option = format!("{}#option-1", status_url(&state, &row));
+
+            ingest_note(
+                &state,
+                &remote,
+                &vote_note(note_id, &option, "https://remote.test/users/mallory"),
+            )
+            .await
+            .expect("ingest vote");
+
+            let counts = polls::option_counts(store.pool(), &poll)
+                .await
+                .expect("read option counts");
+            assert_eq!(counts.len(), 1);
+            assert_eq!(counts[0].option_index, 1);
+            assert_eq!(counts[0].votes, 1);
+            assert_eq!(
+                polls::voters_count(store.pool(), &poll)
+                    .await
+                    .expect("read voters"),
+                1
+            );
+
+            let update = status_update(&state, &row, &account)
+                .await
+                .expect("build update");
+            let object = &update.to_json()["object"];
+            assert_eq!(object["oneOf"][1]["replies"]["totalItems"], 1);
+            assert_eq!(object["oneOf"][0]["replies"]["totalItems"], 0);
+            assert_eq!(object["votersCount"], 1);
+
+            assert!(
+                statuses::by_uri(store.pool(), note_id)
+                    .await
+                    .expect("look up vote note")
+                    .is_none(),
+                "a vote reply must not be stored as a visible reply"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_same_actor_voting_twice_is_counted_once() {
+        with_isolated_state(|store, state| async move {
+            let (_account, row, poll) =
+                seed_local_poll(&store, &["tea", "coffee"], false, false).await;
+            let remote = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let option = format!("{}#option-1", status_url(&state, &row));
+
+            for note_id in [
+                "https://remote.test/notes/vote-1",
+                "https://remote.test/notes/vote-2",
+            ] {
+                ingest_note(
+                    &state,
+                    &remote,
+                    &vote_note(note_id, &option, "https://remote.test/users/mallory"),
+                )
+                .await
+                .expect("ingest vote");
+            }
+
+            let counts = polls::option_counts(store.pool(), &poll)
+                .await
+                .expect("read option counts");
+            assert_eq!(counts.len(), 1);
+            assert_eq!(counts[0].votes, 1, "the second reply must not add a vote");
+            assert_eq!(
+                polls::voters_count(store.pool(), &poll)
+                    .await
+                    .expect("read voters"),
+                1
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_vote_after_end_time_is_refused() {
+        with_isolated_state(|store, state| async move {
+            let (_account, row, poll) =
+                seed_local_poll(&store, &["tea", "coffee"], false, false).await;
+            sqlx::query("UPDATE poll SET expires_at = $1 WHERE id = $2")
+                .bind(chrono::Utc::now() - chrono::Duration::hours(1))
+                .bind(&poll)
+                .execute(store.pool())
+                .await
+                .expect("expire poll");
+            let remote = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let note_id = "https://remote.test/notes/late";
+            let option = format!("{}#option-1", status_url(&state, &row));
+
+            ingest_note(
+                &state,
+                &remote,
+                &vote_note(note_id, &option, "https://remote.test/users/mallory"),
+            )
+            .await
+            .expect("ingest a late vote without failing the delivery");
+
+            assert!(
+                polls::option_counts(store.pool(), &poll)
+                    .await
+                    .expect("read option counts")
+                    .is_empty(),
+                "an expired poll must not take the vote"
+            );
+            assert!(
+                statuses::by_uri(store.pool(), note_id)
+                    .await
+                    .expect("look up vote note")
+                    .is_none(),
+                "a refused vote reply is still not a visible reply"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_vote_for_an_out_of_range_option_is_refused() {
+        with_isolated_state(|store, state| async move {
+            let (_account, row, poll) =
+                seed_local_poll(&store, &["tea", "coffee"], true, false).await;
+            let remote = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let note_id = "https://remote.test/notes/range";
+            let option = format!("{}#option-9", status_url(&state, &row));
+
+            ingest_note(
+                &state,
+                &remote,
+                &vote_note(note_id, &option, "https://remote.test/users/mallory"),
+            )
+            .await
+            .expect("ingest an out-of-range vote without failing the delivery");
+
+            assert!(
+                polls::option_counts(store.pool(), &poll)
+                    .await
+                    .expect("read option counts")
+                    .is_empty(),
+                "there is no ninth option to count"
+            );
+            assert!(
+                statuses::by_uri(store.pool(), note_id)
+                    .await
+                    .expect("look up vote note")
+                    .is_none(),
+                "a refused vote reply is still not a visible reply"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_vote_on_a_remote_poll_object_is_refused() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/alice").await;
+            let parent = statuses::upsert_remote(
+                store.pool(),
+                &statuses::NewRemoteStatus {
+                    id: &Id::new().to_string(),
+                    account_id: &author.id,
+                    uri: "https://remote.test/notes/poll",
+                    content: "which one",
+                    content_html: "<p>which one</p>",
+                    spoiler_text: "",
+                    sensitive: false,
+                    visibility: "public",
+                    in_reply_to_id: None,
+                    in_reply_to_account_id: None,
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .expect("seed remote poll status");
+            let options = vec!["tea".to_owned(), "coffee".to_owned()];
+            polls::upsert_remote(
+                store.pool(),
+                &polls::NewRemotePoll {
+                    status_id: &parent.id,
+                    options: &options,
+                    multiple: false,
+                    expires_at: None,
+                    voters_count: 5,
+                    tallies: &[3, 2],
+                },
+            )
+            .await
+            .expect("seed remote poll");
+            let voter = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let note_id = "https://remote.test/notes/remote-vote";
+
+            ingest_note(
+                &state,
+                &voter,
+                &vote_note(
+                    note_id,
+                    "https://remote.test/notes/poll#option-1",
+                    "https://remote.test/users/mallory",
+                ),
+            )
+            .await
+            .expect("ingest a vote for another instance without failing the delivery");
+
+            let poll = polls::by_status(store.pool(), &parent.id)
+                .await
+                .expect("read remote poll")
+                .expect("remote poll remains");
+            assert!(!poll.local);
+            assert_eq!(
+                polls::tally_counts(store.pool(), &poll.id)
+                    .await
+                    .expect("read remote tallies")
+                    .into_iter()
+                    .map(|count| (count.option_index, count.votes))
+                    .collect::<Vec<_>>(),
+                vec![(0, 3), (1, 2)],
+                "only the poll's own instance may count votes"
+            );
+            assert_eq!(
+                polls::voters_count(store.pool(), &poll.id)
+                    .await
+                    .expect("read remote voters"),
+                0,
+                "a federated poll counts no local votes"
+            );
+            assert!(
+                statuses::by_uri(store.pool(), note_id)
+                    .await
+                    .expect("look up vote note")
+                    .is_none(),
+                "a refused vote reply is still not a visible reply"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_reply_is_still_stored_as_a_reply() {
+        with_isolated_state(|store, state| async move {
+            let author = seed_remote(&store, "https://remote.test/users/alice").await;
+            let parent = statuses::upsert_remote(
+                store.pool(),
+                &statuses::NewRemoteStatus {
+                    id: &Id::new().to_string(),
+                    account_id: &author.id,
+                    uri: "https://remote.test/notes/parent",
+                    content: "hello",
+                    content_html: "<p>hello</p>",
+                    spoiler_text: "",
+                    sensitive: false,
+                    visibility: "public",
+                    in_reply_to_id: None,
+                    in_reply_to_account_id: None,
+                    created_at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .expect("seed parent status");
+            let remote = seed_remote(&store, "https://remote.test/users/mallory").await;
+            let note_id = "https://remote.test/notes/reply";
+            let reply = json!({
+                "id": note_id,
+                "type": "Note",
+                "attributedTo": "https://remote.test/users/mallory",
+                "content": "<p>hi</p>",
+                "published": "2026-01-01T00:00:00Z",
+                "inReplyTo": "https://remote.test/notes/parent",
+            });
+
+            ingest_note(&state, &remote, &reply)
+                .await
+                .expect("ingest ordinary reply");
+
+            let stored = statuses::by_uri(store.pool(), note_id)
+                .await
+                .expect("look up reply")
+                .expect("reply is stored");
+            assert_eq!(stored.in_reply_to_id.as_deref(), Some(parent.id.as_str()));
+            assert_eq!(stored.in_reply_to_account_id.as_deref(), Some(author.id.as_str()));
         })
         .await;
     }

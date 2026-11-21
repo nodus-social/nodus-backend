@@ -291,3 +291,50 @@ pub async fn vote(
     tx.commit().await?;
     Ok(true)
 }
+
+/// Records one option of a vote that arrived as its own request.
+///
+/// Federation names one option at a time, so unlike [`vote`] a multiple-choice poll may
+/// collect several rows for the same account: each reply is a separate choice. A
+/// single-choice poll still keeps the first answer, because a peer that retries with a
+/// different option should not change a vote already counted. Returns `true` only when a
+/// new row was inserted.
+pub async fn vote_option(
+    pool: &PgPool,
+    poll_id: &str,
+    account_id: &str,
+    option_index: i32,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let multiple: bool = sqlx::query_scalar(
+        "SELECT multiple FROM poll WHERE id = $1 FOR UPDATE",
+    )
+    .bind(poll_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !multiple {
+        let already: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM poll_vote WHERE poll_id = $1 AND account_id = $2)",
+        )
+        .bind(poll_id)
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if already {
+            tx.commit().await?;
+            return Ok(false);
+        }
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO poll_vote (poll_id, account_id, option_index) VALUES ($1, $2, $3) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(poll_id)
+    .bind(account_id)
+    .bind(option_index)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(inserted == 1)
+}

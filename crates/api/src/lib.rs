@@ -39,6 +39,7 @@ pub mod misskey;
 pub mod nodus;
 pub mod notifications;
 pub mod outbox;
+pub mod poll_votes;
 pub mod polls;
 pub mod preferences;
 pub mod reactions;
