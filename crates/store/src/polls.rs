@@ -36,7 +36,7 @@ pub struct NewPoll<'a> {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-const COLUMNS: &str = "p.id, p.status_id, p.options, p.multiple, p.hide_totals, \
+pub(crate) const COLUMNS: &str = "p.id, p.status_id, p.options, p.multiple, p.hide_totals, \
      p.expires_at, p.voters_count, s.local";
 
 /// Inserts the poll attached to an existing status.

@@ -9,9 +9,10 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use nodus_server_store::hydrate::PollFacts;
 use nodus_server_store::polls::{self, PollRow};
 
 use crate::auth::{Auth, MaybeAuth};
@@ -26,33 +27,45 @@ pub(crate) async fn document(
     row: &PollRow,
     viewer: Option<&str>,
 ) -> ApiResult<PollDto> {
-    let pool = state.store().pool();
-    let (counts, voter_count) = counts(state, row).await?;
-    let total_votes: i64 = counts.iter().sum();
-    let expired = row.expires_at.is_some_and(|at| at <= Utc::now());
-    let (voted, own_votes) = match viewer {
-        Some(account_id) => (
-            Some(polls::has_voted(pool, &row.id, account_id).await?),
-            Some(
-                polls::own_votes(pool, &row.id, account_id)
-                    .await?
-                    .into_iter()
-                    .map(|index| usize::try_from(index).unwrap_or(0))
-                    .collect(),
-            ),
-        ),
-        None => (None, None),
+    let (counts, voters_count) = counts(state, row).await?;
+    let chosen = match viewer {
+        Some(account_id) => polls::own_votes(state.store().pool(), &row.id, account_id).await?,
+        None => Vec::new(),
     };
+    let facts = PollFacts {
+        // A vote is a row, so the viewer voted exactly when they chose an option.
+        voted: viewer.map(|_| !chosen.is_empty()),
+        own_votes: viewer.map(|_| chosen),
+        poll: row.clone(),
+        counts,
+        voters_count,
+    };
+    Ok(page_document(&facts, Utc::now()))
+}
+
+/// The document for poll facts a page read in one batch: pure shaping, no statement.
+pub(crate) fn page_document(facts: &PollFacts, now: DateTime<Utc>) -> PollDto {
+    let row = &facts.poll;
+    let counts = &facts.counts;
+    let total_votes: i64 = counts.iter().sum();
+    let expired = row.expires_at.is_some_and(|at| at <= now);
+    let voted = facts.voted;
+    let own_votes = facts.own_votes.clone().map(|indexes| {
+        indexes
+            .into_iter()
+            .map(|index| usize::try_from(index).unwrap_or(0))
+            .collect()
+    });
     // `hide_totals` is not decoration: until the poll closes, only someone who has
     // already voted may see the running tally. Signed-out readers never have.
     let hidden = row.hide_totals && !expired && !voted.unwrap_or(false);
-    Ok(PollDto {
+    PollDto {
         id: row.id.clone(),
         expires_at: row.expires_at,
         expired,
         multiple: row.multiple,
         votes_count: (!hidden).then_some(total_votes),
-        voters_count: (!hidden).then_some(voter_count),
+        voters_count: (!hidden).then_some(facts.voters_count),
         voted,
         own_votes,
         options: row
@@ -65,7 +78,7 @@ pub(crate) async fn document(
                 votes_count: (!hidden).then_some(counts.get(index).copied().unwrap_or(0)),
             })
             .collect(),
-    })
+    }
 }
 
 /// The stored tally in option order, plus the voter count.

@@ -2,7 +2,7 @@
 //!
 //! A feed handler knows what a page needs — authors, attachments, reaction chips, the viewer's relationship to each author — and asks for them one row at a time today, because the free functions take one id. One [`Batch`] expresses the whole page, so the query count is a property of the page, not of its length.
 //!
-//! A page assembled from separate snapshots can show a status whose author row is already gone: the media query sees the attachments, the account query misses the author, and the handler renders a row with attachments and no author (or drops it silently, advancing the client's cursor past a row it never saw). One `REPEATABLE READ READ ONLY` transaction fixes the page to a single point in time, so "one snapshot" means "one transaction, opened at repeatable read" — and `tests/hydrate.rs` proves it by asking Postgres inside the transaction what isolation it is in, not by counting the seam's own bookkeeping. Read-only also means a mistake such as an `UPDATE` inside a batch fails loudly instead of polluting the snapshot.
+//! A feed handler knows what a page needs — authors, attachments, reaction chips, polls, the viewer's relationship to each author — and asks for them one row at a time today, because the free functions take one id. One [`Batch`] expresses the whole page, so the query count is a property of the page, not of its length.
 //!
 //! Inside a transaction one failed statement aborts the whole transaction, so an op cannot be "allowed to fail" there. Optional ops therefore run after the essential transaction commits, as their own implicit transactions: a reaction aggregate that errors is reported in [`BatchOutcome::reactions`], and the page still renders without reaction chips. Reads do not fsync, so the extra statement is cheaper than a page that 500s over a decoration.
 //!
@@ -10,11 +10,13 @@
 
 mod decorations;
 mod external_ids;
+mod polls;
 mod probe;
 mod relationships;
 
 pub use decorations::{MentionRow, StatusDecorations};
 pub use external_ids::ExternalIds;
+pub use polls::PollFacts;
 #[doc(hidden)]
 pub use probe::TransactionSettings;
 
@@ -45,6 +47,10 @@ enum EssentialOp {
     ExternalIds {
         statuses: Vec<String>,
         accounts: Vec<String>,
+    },
+    Polls {
+        statuses: Vec<String>,
+        viewer: Option<String>,
     },
     TransactionSettings,
 }
@@ -88,6 +94,16 @@ impl Batch<'_> {
         self
     }
 
+    /// Polls attached to these statuses, tallies and the viewer's choices included. Essential: a poll that vanished from a status is a lie.
+    #[must_use]
+    pub fn polls(mut self, ids: &[String], viewer: Option<&str>) -> Self {
+        self.essential.push(EssentialOp::Polls {
+            statuses: ids.to_vec(),
+            viewer: viewer.map(ToOwned::to_owned),
+        });
+        self
+    }
+
     /// Reaction counts per status. Optional: a feed without reaction chips is still a feed, so this op may fail without taking the page with it.
     #[must_use]
     pub fn reactions(mut self, ids: &[String]) -> Self {
@@ -113,6 +129,7 @@ impl Batch<'_> {
             relationships: RowMap::new(),
             decorations: RowMap::new(),
             external_ids: ExternalIds::default(),
+            polls: RowMap::new(),
             reactions: Ok(RowMap::new()),
             transaction_settings: None,
         };
@@ -134,6 +151,10 @@ impl Batch<'_> {
                 EssentialOp::ExternalIds { statuses, accounts } => {
                     outcome.external_ids =
                         external_ids::fetch_external_ids(&mut *tx, statuses, accounts).await?;
+                }
+                EssentialOp::Polls { statuses, viewer } => {
+                    outcome.polls =
+                        polls::fetch_polls(&mut tx, statuses, viewer.as_deref()).await?;
                 }
                 EssentialOp::TransactionSettings => {
                     outcome.transaction_settings =
@@ -164,6 +185,8 @@ pub struct BatchOutcome {
     pub decorations: RowMap<StatusDecorations>,
     /// Dialect ids, keyed by the local id that was asked for; an unmapped id is absent.
     pub external_ids: ExternalIds,
+    /// Polls keyed by status id, tallies counted; a status with none is absent.
+    pub polls: RowMap<PollFacts>,
     /// Reaction counts, keyed by status id, or the optional op's failure.
     pub reactions: Result<RowMap<Vec<ReactionCount>>, StoreError>,
     /// What Postgres reported about the essential transaction, when the test-only

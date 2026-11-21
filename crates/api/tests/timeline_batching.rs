@@ -103,6 +103,59 @@ async fn decorate(pool: &PgPool, status_id: &str, mentioned: &str, tag: &str) {
         .expect("insert emoji");
 }
 
+/// Gives a status a two-option poll; `voter` votes for the first option when given.
+async fn attach_poll(pool: &PgPool, status_id: &str, voter: Option<&str>) {
+    let id = format!("{status_id}:poll");
+    let options = ["yes".to_owned(), "no".to_owned()];
+    polls::create(
+        pool,
+        &polls::NewPoll {
+            id: &id,
+            status_id,
+            options: &options,
+            multiple: false,
+            hide_totals: false,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("insert poll");
+    if let Some(voter) = voter {
+        polls::vote(pool, &id, voter, &[0])
+            .await
+            .expect("cast vote");
+    }
+}
+
+/// The removed poll path, replayed against the same page: one tally, one voter count and
+/// the viewer's two vote reads per poll, after the page's one poll scan.
+async fn old_poll_statements(
+    store: &Store,
+    page_ids: &[String],
+    viewer: &str,
+    log: &CapturedLog,
+) -> usize {
+    let found = polls::by_status_ids(store.pool(), page_ids)
+        .await
+        .expect("poll scan");
+    clear(log);
+    for poll in found.values() {
+        let _ = polls::option_counts(store.pool(), &poll.id)
+            .await
+            .expect("option counts");
+        let _ = polls::voters_count(store.pool(), &poll.id)
+            .await
+            .expect("voter count");
+        let _ = polls::has_voted(store.pool(), &poll.id, viewer)
+            .await
+            .expect("voted flag");
+        let _ = polls::own_votes(store.pool(), &poll.id, viewer)
+            .await
+            .expect("own votes");
+    }
+    statements(log)
+}
+
 /// The ids on the page, in the order the client reads them.
 async fn home_ids(app: &Router, token: &str) -> Vec<String> {
     let (status, body) = send(app, token, "GET", "/api/v1/timelines/home", None).await;
@@ -287,6 +340,9 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
             .expect("set reaction");
         let mentioned = create_account(store.pool(), "mentioned").await;
         decorate(store.pool(), &first_status, &mentioned, "nodus").await;
+        // A poll with the viewer's vote: the document needs the tally, the voter count
+        // and the viewer's choices, which used to be four reads per status.
+        attach_poll(store.pool(), &first_status, Some(&viewer)).await;
 
         // Warm the request path (instance settings, token cache) so the N=1 measurement
         // is not paying first-request one-offs the N=20 measurement never sees.
@@ -301,6 +357,7 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
             let status = seed_author(store.pool(), &viewer, index, index < 3).await;
             if index < 3 {
                 decorate(store.pool(), &status, &mentioned, "nodus").await;
+                attach_poll(store.pool(), &status, Some(&viewer)).await;
             }
         }
 
@@ -310,7 +367,11 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
         let twenty_tag_reads = table_reads(&log, "FROM status_tag");
         let twenty_emoji_reads = table_reads(&log, "FROM status_emoji");
         let twenty_mention_reads = table_reads(&log, "FROM status_mention");
+        let twenty_poll_reads = table_reads(&log, "FROM poll_vote");
+        let twenty_poll_row_reads = table_reads(&log, "FROM poll p");
         let twenty_old = old_path_statements(&store, &twenty_ids, &log).await;
+        let one_poll_old = old_poll_statements(&store, &one_ids, &viewer, &log).await;
+        let twenty_poll_old = old_poll_statements(&store, &twenty_ids, &viewer, &log).await;
 
         // The page order is the store page's order, not `RowMap`'s id order: the handler
         // must walk `page.items`, because keys sorted by id are not sorted by time.
@@ -348,6 +409,24 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
              N=20 {twenty_endpoint} statements (old {twenty_old}); \
              decorations: {twenty_tag_reads} tag, {twenty_emoji_reads} emoji, \
              {twenty_mention_reads} mention read"
+        );
+
+        // The poll's tallies are part of the page's one snapshot: three reads of
+        // `poll_vote` (counts, voters, the viewer's choices) whatever the page length.
+        assert_eq!(
+            twenty_poll_row_reads, 1,
+            "twenty statuses should read the poll table once, saw {twenty_poll_row_reads}"
+        );
+        assert_eq!(
+            twenty_poll_reads, 3,
+            "twenty statuses should read votes three times (counts, voters, own), saw \
+             {twenty_poll_reads}"
+        );
+        assert_eq!(
+            twenty_poll_old - one_poll_old,
+            8,
+            "the removed path paid four statements per extra poll (N=1 {one_poll_old}, \
+             N=20 {twenty_poll_old})"
         );
 
         assert_page_render_decorations(&app, &token, &first_status, &mentioned).await;

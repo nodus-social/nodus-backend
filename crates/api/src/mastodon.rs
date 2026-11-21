@@ -278,9 +278,11 @@ async fn timeline_response(
         .accounts(&author_ids)
         .media_by_status(&status_ids)
         .decorations(&status_ids)
+        .polls(&status_ids, viewer)
         .run()
         .await?;
-    let polls = nodus_server_store::polls::by_status_ids(state.store().pool(), &status_ids).await?;
+    // One `now` for the page: two rows cannot disagree about whether the same poll closed.
+    let now = chrono::Utc::now();
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let Some(account) = hydrated.accounts.get(&row.account_id) else {
@@ -296,8 +298,9 @@ async fn timeline_response(
         if let Some(decorations) = hydrated.decorations.get(&row.id) {
             crate::statuses::apply_decorations(&mut dto, decorations, instance);
         }
-        if let Some(poll) = polls.get(&row.id) {
-            let document = crate::polls::document(state, poll, viewer).await?;
+        // Poll tallies came with the page; shaping one costs no statement.
+        if let Some(poll) = hydrated.polls.get(&row.id) {
+            let document = crate::polls::page_document(poll, now);
             dto.poll = Some(serde_json::to_value(document).map_err(|error| {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
             })?);
