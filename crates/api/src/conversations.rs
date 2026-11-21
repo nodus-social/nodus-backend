@@ -64,14 +64,31 @@ pub async fn list(
     {
         by_root.entry(root).or_default().push(account);
     }
+    // The join above still names participants; one batch then fetches their rows, so a
+    // page of twenty threads costs one account query rather than one per participant.
+    let mut participant_ids: Vec<String> = by_root.values().flatten().cloned().collect();
+    participant_ids.sort_unstable();
+    participant_ids.dedup();
+    let mut participant_rows: nodus_server_store::RowMap<
+        nodus_server_store::accounts::AccountRow,
+    > = nodus_server_store::RowMap::new();
+    if !participant_ids.is_empty() {
+        participant_rows = state
+            .store()
+            .batch()
+            .accounts(&participant_ids)
+            .run()
+            .await?
+            .accounts;
+    }
 
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
         let mut accounts = Vec::new();
         let participants = by_root.get(&row.root_id).map_or(&[][..], Vec::as_slice);
         for id in participants {
-            if let Some(account) = nodus_server_store::accounts::by_id(pool, id).await? {
-                accounts.push(AccountDto::from_row(&account, state.instance()));
+            if let Some(account) = participant_rows.get(id) {
+                accounts.push(AccountDto::from_row(account, state.instance()));
             }
         }
         let last_status =

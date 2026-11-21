@@ -174,15 +174,23 @@ async fn batch(
                 }
                 let local = !name.contains("global") && !name.contains("federated");
                 let page = statuses::public_page(state.store().pool(), params, local).await?;
+                let author_ids: Vec<String> = page
+                    .items
+                    .iter()
+                    .map(|row| row.account_id.clone())
+                    .collect();
+                let mut authors: nodus_server_store::RowMap<accounts::AccountRow> =
+                    nodus_server_store::RowMap::new();
+                if !author_ids.is_empty() {
+                    authors = state.store().batch().accounts(&author_ids).run().await?.accounts;
+                }
                 let mut items = Vec::with_capacity(page.items.len());
                 for row in &page.items {
-                    if let Some(account) =
-                        accounts::by_id(state.store().pool(), &row.account_id).await?
-                    {
+                    if let Some(account) = authors.get(&row.account_id) {
                         items.push(
                             serde_json::to_value(crate::dto::StatusDto::from_row(
                                 row,
-                                &account,
+                                account,
                                 state.instance(),
                             ))
                             .map_err(|error| serialise_error(&error))?,

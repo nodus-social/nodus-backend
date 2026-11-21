@@ -25,12 +25,14 @@ pub async fn list(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<V
         i64::from(PageSize::clamp(None, PAGE_MAX).get()),
     )
     .await?;
+    let ids: Vec<String> = rows.iter().map(|row| row.account_id.clone()).collect();
+    let accounts = state.store().batch().accounts(&ids).run().await?;
+    // Walk the request rows, not the row map, so the pending list keeps its
+    // newest-first order instead of sorting by account id.
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
-        if let Some(account) =
-            nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id).await?
-        {
-            items.push(AccountDto::from_row(&account, state.instance()));
+        if let Some(account) = accounts.accounts.get(&row.account_id) {
+            items.push(AccountDto::from_row(account, state.instance()));
         }
     }
     Ok(Json(items))
