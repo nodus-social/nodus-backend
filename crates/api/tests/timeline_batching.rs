@@ -78,6 +78,30 @@ async fn attach(pool: &PgPool, account_id: &str, status_id: &str) {
     .expect("insert attachment");
 }
 
+/// Gives a status one hashtag, one custom emoji and one mention: the three families a
+/// page used to read per row.
+async fn decorate(pool: &PgPool, status_id: &str, mentioned: &str, tag: &str) {
+    sqlx::query("INSERT INTO status_tag (status_id, tag) VALUES ($1, $2)")
+        .bind(status_id)
+        .bind(tag)
+        .execute(pool)
+        .await
+        .expect("insert tag");
+    sqlx::query("INSERT INTO status_mention (status_id, account_id) VALUES ($1, $2)")
+        .bind(status_id)
+        .bind(mentioned)
+        .execute(pool)
+        .await
+        .expect("insert mention");
+    sqlx::query("INSERT INTO status_emoji (status_id, shortcode, url) VALUES ($1, $2, $3)")
+        .bind(status_id)
+        .bind(format!("emoji{status_id}"))
+        .bind("https://cdn.example/emoji.png")
+        .execute(pool)
+        .await
+        .expect("insert emoji");
+}
+
 /// The ids on the page, in the order the client reads them.
 async fn home_ids(app: &Router, token: &str) -> Vec<String> {
     let (status, body) = send(app, token, "GET", "/api/v1/timelines/home", None).await;
@@ -134,7 +158,7 @@ async fn misskey_page_stats(
     token: &str,
     log: &CapturedLog,
     limit: u32,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, usize) {
     clear(log);
     let (status, body) = send(
         app,
@@ -154,7 +178,39 @@ async fn misskey_page_stats(
         statements(log),
         table_reads(log, "FROM status_reaction"),
         table_reads(log, "FROM media_attachment"),
+        table_reads(log, "FROM status_tag"),
     )
+}
+
+/// The parked read has to reach the payload: a page whose statuses carry a tag, an emoji
+/// and a mention renders all three, the same as a single-status read does.
+async fn assert_page_render_decorations(
+    app: &Router,
+    token: &str,
+    status_id: &str,
+    mentioned: &str,
+) {
+    let (status, body) = send(app, token, "GET", "/api/v1/timelines/home", None).await;
+    let body = expect_ok(status, &body, "/api/v1/timelines/home");
+    let rendered = json_of(&body);
+    let first = rendered
+        .as_array()
+        .expect("timeline array")
+        .iter()
+        .find(|item| item["id"] == status_id)
+        .expect("the decorated status is on the page");
+    assert_eq!(first["tags"][0]["name"], "nodus");
+    assert!(
+        first["emojis"]
+            .as_array()
+            .is_some_and(|emojis| !emojis.is_empty()),
+        "the page rendered no custom emoji: {first}"
+    );
+    assert_eq!(first["mentions"][0]["id"], mentioned);
+    assert!(
+        first["mentions"][0]["acct"].is_string(),
+        "a mention without acct is a client decode failure: {first}"
+    );
 }
 
 #[tokio::test]
@@ -179,6 +235,8 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
         statuses::set_reaction(store.pool(), &first_status, &viewer, "⭐")
             .await
             .expect("set reaction");
+        let mentioned = create_account(store.pool(), "mentioned").await;
+        decorate(store.pool(), &first_status, &mentioned, "nodus").await;
 
         // Warm the request path (instance settings, token cache) so the N=1 measurement
         // is not paying first-request one-offs the N=20 measurement never sees.
@@ -190,12 +248,18 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
         let one_old = old_path_statements(&store, &one_ids, &log).await;
 
         for index in 1..20 {
-            seed_author(store.pool(), &viewer, index, index < 3).await;
+            let status = seed_author(store.pool(), &viewer, index, index < 3).await;
+            if index < 3 {
+                decorate(store.pool(), &status, &mentioned, "nodus").await;
+            }
         }
 
         clear(&log);
         let twenty_ids = home_ids(&app, &token).await;
         let twenty_endpoint = statements(&log);
+        let twenty_tag_reads = table_reads(&log, "FROM status_tag");
+        let twenty_emoji_reads = table_reads(&log, "FROM status_emoji");
+        let twenty_mention_reads = table_reads(&log, "FROM status_mention");
         let twenty_old = old_path_statements(&store, &twenty_ids, &log).await;
 
         // The page order is the store page's order, not `RowMap`'s id order: the handler
@@ -221,17 +285,29 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
             19,
             "the removed path paid one author lookup per extra row (N=1 {one_old}, N=20 {twenty_old})"
         );
+        // Decorations are the same read at any page length: three families in one
+        // statement, so a per-row regression shows up here as twenty.
+        assert_eq!(
+            (twenty_tag_reads, twenty_emoji_reads, twenty_mention_reads),
+            (1, 1, 1),
+            "twenty statuses should read tags, emoji and mentions once each, saw \
+             ({twenty_tag_reads}, {twenty_emoji_reads}, {twenty_mention_reads})"
+        );
         eprintln!(
             "mastodon home timeline: N=1 {one_endpoint} statements (old {one_old}); \
-             N=20 {twenty_endpoint} statements (old {twenty_old})"
+             N=20 {twenty_endpoint} statements (old {twenty_old}); \
+             decorations: {twenty_tag_reads} tag, {twenty_emoji_reads} emoji, \
+             {twenty_mention_reads} mention read"
         );
+
+        assert_page_render_decorations(&app, &token, &first_status, &mentioned).await;
 
         // Misskey maps each note and author through `external_id` one row at a time, so
         // its total is still linear. What this pass batched — reactions and attachments —
         // must be one read for the page, not one per note.
-        let (misskey_twenty, reaction_reads, media_reads) =
+        let (misskey_twenty, reaction_reads, media_reads, tag_reads) =
             misskey_page_stats(&app, &token, &log, 20).await;
-        let (misskey_one, _, _) = misskey_page_stats(&app, &token, &log, 1).await;
+        let (misskey_one, _, _, _) = misskey_page_stats(&app, &token, &log, 1).await;
         assert_eq!(
             reaction_reads, 1,
             "twenty notes should read the reaction table once, saw {reaction_reads}"
@@ -240,9 +316,14 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
             media_reads, 1,
             "twenty notes should read attachments once, saw {media_reads}"
         );
+        assert_eq!(
+            tag_reads, 1,
+            "twenty notes should read tags and emoji once, saw {tag_reads}"
+        );
         eprintln!(
             "misskey home timeline: N=20 {misskey_twenty} statements \
-             ({reaction_reads} reaction read, {media_reads} attachment read); \
+             ({reaction_reads} reaction read, {media_reads} attachment read, \
+              {tag_reads} tag read); \
              N=1 {misskey_one} statements; the rest is per-note external_id mapping"
         );
     })

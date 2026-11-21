@@ -18,7 +18,7 @@ use nodus_server_store::social::ViewerFlags;
 use nodus_server_store::statuses::{InteractionAudience, NewStatus, StatusRow};
 
 use crate::auth::{Auth, MaybeAuth};
-use crate::dto::{account_url, AccountDto, StatusDto};
+use crate::dto::{account_url_parts, AccountDto, StatusDto};
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
 use crate::state::AppState;
@@ -832,10 +832,44 @@ async fn decorate(
     viewer_id: Option<&str>,
 ) -> ApiResult<()> {
     let pool = state.store().pool();
-    let instance = state.instance();
     dto.poll = crate::polls::status_poll(state, status_id, viewer_id).await?;
     let tags = nodus_server_store::statuses::tags_of(pool, status_id).await?;
-    dto.tags = tags
+    let emojis = nodus_server_store::statuses::emojis_of(pool, status_id).await?;
+    let mut mentions = Vec::new();
+    for account_id in nodus_server_store::statuses::mentions_of(pool, status_id).await? {
+        let Some(account) = nodus_server_store::accounts::by_id(pool, &account_id).await? else {
+            continue;
+        };
+        mentions.push(nodus_server_store::MentionRow {
+            id: account.id,
+            username: account.username,
+            domain: account.domain,
+        });
+    }
+    apply_decorations(
+        dto,
+        &nodus_server_store::StatusDecorations {
+            tags,
+            emojis,
+            mentions,
+        },
+        state.instance(),
+    );
+    Ok(())
+}
+
+/// Writes a status's parked tags, custom emoji and mentions into its payload.
+///
+/// One implementation for both paths: the single-status read fills a
+/// [`nodus_server_store::StatusDecorations`] from the per-id store functions, a page takes
+/// its own from `Batch::decorations`, and neither can drift from the other's wire shape.
+pub(crate) fn apply_decorations(
+    dto: &mut StatusDto,
+    decorations: &nodus_server_store::StatusDecorations,
+    instance: &crate::state::InstanceConfig,
+) {
+    dto.tags = decorations
+        .tags
         .iter()
         .map(|tag| {
             serde_json::json!({
@@ -844,9 +878,9 @@ async fn decorate(
             })
         })
         .collect();
-    let emojis = nodus_server_store::statuses::emojis_of(pool, status_id).await?;
-    dto.emojis = emojis
-        .into_iter()
+    dto.emojis = decorations
+        .emojis
+        .iter()
         .map(|emoji| {
             serde_json::json!({
                 "shortcode": emoji.shortcode,
@@ -856,23 +890,22 @@ async fn decorate(
             })
         })
         .collect();
-    let mentions = nodus_server_store::statuses::mentions_of(pool, status_id).await?;
-    for account_id in mentions {
-        let Some(account) = nodus_server_store::accounts::by_id(pool, &account_id).await? else {
-            continue;
-        };
-        let acct = match &account.domain {
-            Some(domain) => format!("{}@{domain}", account.username),
-            None => account.username.clone(),
-        };
-        dto.mentions.push(serde_json::json!({
-            "id": account.id,
-            "username": account.username,
-            "acct": acct,
-            "url": account_url(&account, instance),
-        }));
-    }
-    Ok(())
+    dto.mentions = decorations
+        .mentions
+        .iter()
+        .map(|mention| {
+            let acct = match &mention.domain {
+                Some(domain) => format!("{}@{domain}", mention.username),
+                None => mention.username.clone(),
+            };
+            serde_json::json!({
+                "id": mention.id,
+                "username": mention.username,
+                "acct": acct,
+                "url": account_url_parts(&mention.username, mention.domain.as_deref(), instance),
+            })
+        })
+        .collect();
 }
 
 pub(crate) async fn visible_status(

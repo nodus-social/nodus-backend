@@ -21,9 +21,19 @@ use crate::state::InstanceConfig;
 /// A remote account's page lives on the instance that minted it: printing our own address
 /// with its name in it would point at a profile we do not have.
 pub(crate) fn account_url(row: &AccountRow, instance: &InstanceConfig) -> String {
-    match row.domain.as_deref() {
-        Some(domain) => format!("https://{domain}/@{}", row.username),
-        None => instance.url(&format!("/@{}", row.username)),
+    account_url_parts(&row.username, row.domain.as_deref(), instance)
+}
+
+/// The same url for an account described only by its parts: a mention carries no row,
+/// and building a second spelling of the url is how the two drift apart.
+pub(crate) fn account_url_parts(
+    username: &str,
+    domain: Option<&str>,
+    instance: &InstanceConfig,
+) -> String {
+    match domain {
+        Some(domain) => format!("https://{domain}/@{username}"),
+        None => instance.url(&format!("/@{username}")),
     }
 }
 

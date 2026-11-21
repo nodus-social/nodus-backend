@@ -127,13 +127,14 @@ async fn user_for(state: &AppState, account: &AccountRow) -> ApiResult<User> {
     })
 }
 
-/// Reaction chips and attachments for a whole page of notes, fetched together.
+/// Reaction chips, attachments and decorations for a whole page of notes, fetched together.
 struct PageReads {
     reactions: nodus_server_store::RowMap<Vec<statuses::ReactionCount>>,
     media: nodus_server_store::RowMap<Vec<MediaRow>>,
+    decorations: nodus_server_store::RowMap<nodus_server_store::StatusDecorations>,
 }
 
-/// Reads a page's reaction chips and attachments in one batch.
+/// Reads a page's reaction chips, attachments and decorations in one batch.
 ///
 /// The reaction op is optional by design: a page that cannot read reaction counts still
 /// renders, with no chips, rather than failing as a whole.
@@ -143,12 +144,34 @@ async fn page_reads(state: &AppState, ids: &[String]) -> ApiResult<PageReads> {
         .batch()
         .media_by_status(ids)
         .reactions(ids)
+        .decorations(ids)
         .run()
         .await?;
     Ok(PageReads {
         reactions: outcome.reactions.unwrap_or_default(),
         media: outcome.media_by_status,
+        decorations: outcome.decorations,
     })
+}
+
+/// A note's tags and custom emoji: the page's parked read when there is one, one note's
+/// own tables when there is not.
+///
+/// Absence from the parked read is not a cache miss — the page asked for this note's id —
+/// so it means the note has none, and a page never falls back to a per-note query.
+async fn note_decorations(
+    state: &AppState,
+    row: &StatusRow,
+    reads: Option<&PageReads>,
+) -> ApiResult<nodus_server_store::StatusDecorations> {
+    match reads {
+        Some(reads) => Ok(reads.decorations.get(&row.id).cloned().unwrap_or_default()),
+        None => Ok(nodus_server_store::StatusDecorations {
+            tags: statuses::tags_of(state.store().pool(), &row.id).await?,
+            emojis: statuses::emojis_of(state.store().pool(), &row.id).await?,
+            mentions: Vec::new(),
+        }),
+    }
 }
 
 async fn note_for(
@@ -175,6 +198,8 @@ async fn note_for(
         );
         (fetched.0.as_slice(), fetched.1.as_slice())
     };
+    // A note's `tags` and `emojis` were hardcoded empty while a status carried them.
+    let decorations = note_decorations(state, row, reads).await?;
     let reaction_map: BTreeMap<String, u64> = reactions
         .iter()
         .map(|entry| {
@@ -242,9 +267,13 @@ async fn note_for(
             .iter()
             .map(|file| file_for(state, file))
             .collect(),
-        tags: Vec::new(),
+        tags: decorations.tags,
         poll: None,
-        emojis: BTreeMap::new(),
+        emojis: decorations
+            .emojis
+            .iter()
+            .map(|emoji| (emoji.shortcode.clone(), emoji.url.clone()))
+            .collect(),
         channel_id: None,
         is_hidden: row.visibility != "public",
     })
@@ -672,11 +701,13 @@ async fn timeline(
         .accounts(&author_ids)
         .media_by_status(&ids)
         .reactions(&ids)
+        .decorations(&ids)
         .run()
         .await?;
     let reads = PageReads {
         reactions: hydrated.reactions.unwrap_or_default(),
         media: hydrated.media_by_status,
+        decorations: hydrated.decorations,
     };
     let mut notes = Vec::with_capacity(page.items.len());
     for row in &page.items {

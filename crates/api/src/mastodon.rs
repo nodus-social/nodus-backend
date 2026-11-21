@@ -277,6 +277,7 @@ async fn timeline_response(
         .batch()
         .accounts(&author_ids)
         .media_by_status(&status_ids)
+        .decorations(&status_ids)
         .run()
         .await?;
     let polls = nodus_server_store::polls::by_status_ids(state.store().pool(), &status_ids).await?;
@@ -290,6 +291,11 @@ async fn timeline_response(
             .get(&row.id)
             .map_or(&[][..], Vec::as_slice);
         let mut dto = StatusDto::from_row_with_media(&row, account, instance, attachments);
+        // Tags, emoji and mentions come from the same batch as the authors: a row with no
+        // decorations is absent from the map and keeps the empty lists the DTO starts with.
+        if let Some(decorations) = hydrated.decorations.get(&row.id) {
+            crate::statuses::apply_decorations(&mut dto, decorations, instance);
+        }
         if let Some(poll) = polls.get(&row.id) {
             let document = crate::polls::document(state, poll, viewer).await?;
             dto.poll = Some(serde_json::to_value(document).map_err(|error| {

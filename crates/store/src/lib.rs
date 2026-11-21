@@ -50,7 +50,7 @@ pub mod statuses;
 pub mod tags;
 pub mod writer;
 
-pub use hydrate::{Batch, BatchOutcome, RowMap};
+pub use hydrate::{Batch, BatchOutcome, MentionRow, RowMap, StatusDecorations};
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
