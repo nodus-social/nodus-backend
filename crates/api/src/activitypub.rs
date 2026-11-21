@@ -358,7 +358,9 @@ async fn verify_signature(
     let value: Value = serde_json::from_slice(body)
         .map_err(|_| ApiError::unprocessable("The activity is not JSON"))?;
     let activity = Activity::from_json(&value).or_else(|error| {
-        flag_activity(&value).ok_or_else(|| ApiError::unprocessable(error.to_string()))
+        flag_activity(&value)
+            .or_else(|| emoji_react_activity(&value))
+            .ok_or_else(|| ApiError::unprocessable(error.to_string()))
     })?;
 
     let key_actor = prepared
@@ -449,25 +451,10 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
                 follow_local(state, &remote, target, activity.id.as_deref()).await?;
             }
         }
-        ActivityKind::Undo => {
-            if let ActivityObject::Activity(inner) = &activity.object {
-                if inner.actor != activity.actor {
-                    return Err(ApiError::forbidden(
-                        "undo actor does not match inner activity actor",
-                    ));
-                }
-                if inner.kind == ActivityKind::Follow {
-                    if let Some(target) = activity_target_id(inner) {
-                        unfollow_local(state, &remote, target).await?;
-                    }
-                }
-            } else if let Some(target) = activity_target_id(activity) {
-                unfollow_local(state, &remote, target).await?;
-            }
-        }
+        ActivityKind::Undo => undo_local(state, &remote, activity).await?,
         ActivityKind::Like => {
             if let Some(target) = activity_target_id(activity) {
-                like_local(state, &remote, target).await?;
+                react_local(state, &remote, target, reaction_content(activity)).await?;
             }
         }
         ActivityKind::Announce => {
@@ -515,6 +502,30 @@ fn flag_activity(value: &Value) -> Option<Activity> {
         kind: ActivityKind::Flag,
         actor: value.get("actor")?.as_str()?.to_owned(),
         object: ActivityObject::Value(value.get("object")?.clone()),
+        to: Vec::new(),
+        cc: Vec::new(),
+        extra,
+    })
+}
+
+/// An `EmojiReact`, which the SDK's activity parser does not know.
+///
+/// Misskey sends a peer's custom reaction as its own activity type. It is shaped into the
+/// `Like` the ingest path already handles, with the glyph kept in `extra`, so signature
+/// verification and every guard run exactly as they do for a favourite.
+fn emoji_react_activity(value: &Value) -> Option<Activity> {
+    if value.get("type").and_then(Value::as_str) != Some("EmojiReact") {
+        return None;
+    }
+    let mut extra = Map::new();
+    if let Some(content) = value.get("content") {
+        extra.insert("content".to_owned(), content.clone());
+    }
+    Some(Activity {
+        id: value.get("id").and_then(Value::as_str).map(str::to_owned),
+        kind: ActivityKind::Like,
+        actor: value.get("actor")?.as_str()?.to_owned(),
+        object: ActivityObject::Id(value.get("object")?.as_str()?.to_owned()),
         to: Vec::new(),
         cc: Vec::new(),
         extra,
@@ -1126,25 +1137,136 @@ async fn follow_local(
     Ok(())
 }
 
-async fn like_local(state: &AppState, remote: &AccountRow, target: &str) -> ApiResult<()> {
-    let Some(row) = nodus_server_store::statuses::by_uri(state.store().pool(), target).await?
+/// The glyph a `Like` without a glyph of its own is stored as.
+///
+/// The local reaction path stores an unspecified reaction as the favourite star, so a
+/// peer favourite and a local one read back identically in every reaction listing.
+const FAVOURITE_REACTION: &str = "⭐";
+
+/// The custom glyph an activity carries, if it carries one at all.
+fn reaction_content(activity: &Activity) -> Option<&str> {
+    activity.extra.get("content").and_then(Value::as_str)
+}
+
+/// The local status an activity names.
+///
+/// A post this instance minted is stored without a canonical `uri`; it is identified by
+/// the URL `status_url` serves for it, so a peer that read it here addresses it by that.
+async fn reaction_status(state: &AppState, target: &str) -> ApiResult<Option<StatusRow>> {
+    let pool = state.store().pool();
+    if let Some(row) = statuses::by_uri(pool, target).await? {
+        return Ok(Some(row));
+    }
+    let Some(id) = target
+        .strip_prefix(&state.instance().url("/statuses/"))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
     else {
+        return Ok(None);
+    };
+    statuses::by_id(pool, id).await.map_err(Into::into)
+}
+
+/// The glyph to store, validated exactly as the local reaction endpoints validate it.
+fn reaction_glyph(content: Option<&str>) -> ApiResult<String> {
+    match content {
+        Some(content) => nodus_server_sdk::misskey::Reaction::parse(content)
+            .map(|reaction| reaction.as_str().to_owned())
+            .map_err(|error| ApiError::unprocessable(error.to_string())),
+        None => Ok(FAVOURITE_REACTION.to_owned()),
+    }
+}
+
+async fn react_local(
+    state: &AppState,
+    remote: &AccountRow,
+    target: &str,
+    content: Option<&str>,
+) -> ApiResult<()> {
+    let Some(row) = reaction_status(state, target).await? else {
         return Ok(());
     };
-    // Only a post this instance minted can be counted here: a remote post's favourite is
-    // the other server's business, and the count is read from its own payload.
+    // Only a post this instance minted can be reacted to here: a remote post's reactions
+    // are the other server's business, and they are read from its own payload.
     if !row.local {
         return Ok(());
     }
-    nodus_server_store::social::favourite(state.store().pool(), &remote.id, &row.id).await?;
-    nodus_server_store::social::notify(
-        state.store().pool(),
-        &row.account_id,
-        "favourite",
-        &remote.id,
-        Some(&row.id),
-    )
-    .await?;
+    // The actor may only react to a post it could open: the same rule that decides whether
+    // the post is served to it in a timeline.
+    if !crate::statuses::can_view_for_viewer(state, Some(&remote.id), &row).await? {
+        return Ok(());
+    }
+    let glyph = reaction_glyph(content)?;
+    // One account holds one reaction, so a second, different glyph replaces the first —
+    // the same rule `reactions/create` follows.
+    statuses::set_reaction(state.store().pool(), &row.id, &remote.id, &glyph).await?;
+    if content.is_none() {
+        // The store notifies the author on the row it actually inserted, so a retried
+        // Like tells the author once.
+        nodus_server_store::social::favourite(state.store().pool(), &remote.id, &row.id).await?;
+    }
+    Ok(())
+}
+
+async fn undo_local(state: &AppState, remote: &AccountRow, activity: &Activity) -> ApiResult<()> {
+    match &activity.object {
+        ActivityObject::Activity(inner) => {
+            if inner.actor != activity.actor {
+                return Err(ApiError::forbidden(
+                    "undo actor does not match inner activity actor",
+                ));
+            }
+            match inner.kind {
+                ActivityKind::Follow => {
+                    if let Some(target) = activity_target_id(inner) {
+                        unfollow_local(state, remote, target).await?;
+                    }
+                }
+                ActivityKind::Like => {
+                    if let Some(target) = activity_target_id(inner) {
+                        undo_reaction(state, remote, target, reaction_content(inner)).await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The SDK does not know `EmojiReact`, so an Undo of one arrives with a bare object
+        // document rather than an embedded activity.
+        ActivityObject::Value(value)
+            if value.get("type").and_then(Value::as_str) == Some("EmojiReact") =>
+        {
+            if let Some(target) = value.get("object").and_then(Value::as_str) {
+                let content = value.get("content").and_then(Value::as_str);
+                undo_reaction(state, remote, target, content).await?;
+            }
+        }
+        // A bare id is the older `Undo(Follow)` shape. Nothing else is retracted here.
+        _ => {
+            if let Some(target) = activity_target_id(activity) {
+                unfollow_local(state, remote, target).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn undo_reaction(
+    state: &AppState,
+    remote: &AccountRow,
+    target: &str,
+    content: Option<&str>,
+) -> ApiResult<()> {
+    let Some(row) = reaction_status(state, target).await? else {
+        return Ok(());
+    };
+    if !row.local {
+        return Ok(());
+    }
+    // Retracting needs no visibility check: an actor whose post is gone from its view
+    // still gets its own row removed, exactly as the local reaction path allows.
+    statuses::remove_reaction(state.store().pool(), &row.id, &remote.id).await?;
+    if content.is_none() {
+        nodus_server_store::social::unfavourite(state.store().pool(), &remote.id, &row.id).await?;
+    }
     Ok(())
 }
 
