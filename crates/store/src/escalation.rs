@@ -275,11 +275,7 @@ pub async fn escalate_in(
     .fetch_optional(&mut *conn)
     .await?
     .unwrap_or((false, false));
-    let current = if suspended {
-        2
-    } else {
-        i32::from(silenced)
-    };
+    let current = if suspended { 2 } else { i32::from(silenced) };
     let strengthens = step.weight() > current;
 
     let outcome = if strengthens {

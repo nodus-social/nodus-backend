@@ -465,37 +465,22 @@ async fn import_rules(
         let scope = text(row, "scope");
         let action = text(row, "action");
         let enabled = flag(row, "enabled");
-        match existing.iter().find(|(_, have, ..)| *have == name) {
-            Some((id, _, have_pattern, have_kind, have_scope, have_action, have_enabled)) => {
-                if *have_pattern == pattern
-                    && *have_kind == kind
-                    && *have_scope == scope
-                    && *have_action == action
-                    && *have_enabled == enabled
-                {
-                    outcome.unchanged += 1;
-                } else {
-                    sqlx::query(
-                        "UPDATE moderation_rule SET pattern = $2, pattern_kind = $3, scope = $4, \
-                         action = $5, enabled = $6, updated_at = now() WHERE id = $1::uuid",
-                    )
-                    .bind(id)
-                    .bind(&pattern)
-                    .bind(&kind)
-                    .bind(&scope)
-                    .bind(&action)
-                    .bind(enabled)
-                    .execute(&mut *conn)
-                    .await?;
-                    outcome.updated += 1;
-                }
-            }
-            None => {
+        if let Some((id, _, have_pattern, have_kind, have_scope, have_action, have_enabled)) =
+            existing.iter().find(|(_, have, ..)| *have == name)
+        {
+            if *have_pattern == pattern
+                && *have_kind == kind
+                && *have_scope == scope
+                && *have_action == action
+                && *have_enabled == enabled
+            {
+                outcome.unchanged += 1;
+            } else {
                 sqlx::query(
-                    "INSERT INTO moderation_rule (name, pattern, pattern_kind, scope, action, enabled) \
-                     VALUES ($1, $2, $3, $4, $5, $6)",
+                    "UPDATE moderation_rule SET pattern = $2, pattern_kind = $3, scope = $4, \
+                     action = $5, enabled = $6, updated_at = now() WHERE id = $1::uuid",
                 )
-                .bind(&name)
+                .bind(id)
                 .bind(&pattern)
                 .bind(&kind)
                 .bind(&scope)
@@ -503,8 +488,22 @@ async fn import_rules(
                 .bind(enabled)
                 .execute(&mut *conn)
                 .await?;
-                outcome.created += 1;
+                outcome.updated += 1;
             }
+        } else {
+            sqlx::query(
+                "INSERT INTO moderation_rule (name, pattern, pattern_kind, scope, action, enabled) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(&name)
+            .bind(&pattern)
+            .bind(&kind)
+            .bind(&scope)
+            .bind(&action)
+            .bind(enabled)
+            .execute(&mut *conn)
+            .await?;
+            outcome.created += 1;
         }
     }
     Ok(())
@@ -523,39 +522,34 @@ async fn import_instance_rules(
     for row in rows(value) {
         let body = text(row, "text");
         let hint = row.get("hint").and_then(Value::as_str).map(str::to_owned);
-        match existing.iter().find(|(_, have, ..)| *have == body) {
-            Some((id, _, have_hint)) => {
-                if *have_hint == hint {
-                    outcome.unchanged += 1;
-                } else {
-                    sqlx::query(
-                        "UPDATE instance_rule SET hint = $2, updated_at = now() WHERE id = $1",
-                    )
+        if let Some((id, _, have_hint)) = existing.iter().find(|(_, have, ..)| *have == body) {
+            if *have_hint == hint {
+                outcome.unchanged += 1;
+            } else {
+                sqlx::query("UPDATE instance_rule SET hint = $2, updated_at = now() WHERE id = $1")
                     .bind(id)
                     .bind(&hint)
                     .execute(&mut *conn)
                     .await?;
-                    outcome.updated += 1;
-                }
+                outcome.updated += 1;
             }
-            None => {
-                // Appended: a position in the source document is not a position in this
-                // instance's document, and the numbering is the instance's own promise.
-                let next: i32 =
-                    sqlx::query_scalar("SELECT coalesce(max(ordinal) + 1, 0) FROM instance_rule")
-                        .fetch_one(&mut *conn)
-                        .await?;
-                sqlx::query(
-                    "INSERT INTO instance_rule (id, ordinal, text, hint) VALUES ($1, $2, $3, $4)",
-                )
-                .bind(Id::new().to_string())
-                .bind(next)
-                .bind(&body)
-                .bind(&hint)
-                .execute(&mut *conn)
-                .await?;
-                outcome.created += 1;
-            }
+        } else {
+            // Appended: a position in the source document is not a position in this
+            // instance's document, and the numbering is the instance's own promise.
+            let next: i32 =
+                sqlx::query_scalar("SELECT coalesce(max(ordinal) + 1, 0) FROM instance_rule")
+                    .fetch_one(&mut *conn)
+                    .await?;
+            sqlx::query(
+                "INSERT INTO instance_rule (id, ordinal, text, hint) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(Id::new().to_string())
+            .bind(next)
+            .bind(&body)
+            .bind(&hint)
+            .execute(&mut *conn)
+            .await?;
+            outcome.created += 1;
         }
     }
     Ok(())
@@ -574,28 +568,25 @@ async fn import_warning_presets(
     for row in rows(value) {
         let title = text(row, "title");
         let body = text(row, "text");
-        match existing.iter().find(|(_, have, _)| *have == title) {
-            Some((id, _, have_text)) => {
-                if *have_text == body {
-                    outcome.unchanged += 1;
-                } else {
-                    sqlx::query("UPDATE warning_preset SET text = $2 WHERE id = $1")
-                        .bind(id)
-                        .bind(&body)
-                        .execute(&mut *conn)
-                        .await?;
-                    outcome.updated += 1;
-                }
-            }
-            None => {
-                sqlx::query("INSERT INTO warning_preset (id, title, text) VALUES ($1, $2, $3)")
-                    .bind(Id::new().to_string())
-                    .bind(&title)
+        if let Some((id, _, have_text)) = existing.iter().find(|(_, have, _)| *have == title) {
+            if *have_text == body {
+                outcome.unchanged += 1;
+            } else {
+                sqlx::query("UPDATE warning_preset SET text = $2 WHERE id = $1")
+                    .bind(id)
                     .bind(&body)
                     .execute(&mut *conn)
                     .await?;
-                outcome.created += 1;
+                outcome.updated += 1;
             }
+        } else {
+            sqlx::query("INSERT INTO warning_preset (id, title, text) VALUES ($1, $2, $3)")
+                .bind(Id::new().to_string())
+                .bind(&title)
+                .bind(&body)
+                .execute(&mut *conn)
+                .await?;
+            outcome.created += 1;
         }
     }
     Ok(())
@@ -670,33 +661,32 @@ async fn import_domain_pauses(
         let expires_at: Option<DateTime<Utc>> = row
             .get("expires_at")
             .and_then(|value| serde_json::from_value(value.clone()).ok());
-        match existing.iter().find(|(have, ..)| *have == domain) {
-            Some((_, have_reason, have_expiry)) => {
-                if *have_reason == reason && *have_expiry == expires_at {
-                    outcome.unchanged += 1;
-                } else {
-                    sqlx::query(
-                        "UPDATE domain_pause SET reason = $2, expires_at = $3 WHERE domain = $1",
-                    )
-                    .bind(&domain)
-                    .bind(&reason)
-                    .bind(expires_at)
-                    .execute(&mut *conn)
-                    .await?;
-                    outcome.updated += 1;
-                }
-            }
-            None => {
+        if let Some((_, have_reason, have_expiry)) =
+            existing.iter().find(|(have, ..)| *have == domain)
+        {
+            if *have_reason == reason && *have_expiry == expires_at {
+                outcome.unchanged += 1;
+            } else {
                 sqlx::query(
-                    "INSERT INTO domain_pause (domain, reason, expires_at) VALUES ($1, $2, $3)",
+                    "UPDATE domain_pause SET reason = $2, expires_at = $3 WHERE domain = $1",
                 )
                 .bind(&domain)
                 .bind(&reason)
                 .bind(expires_at)
                 .execute(&mut *conn)
                 .await?;
-                outcome.created += 1;
+                outcome.updated += 1;
             }
+        } else {
+            sqlx::query(
+                "INSERT INTO domain_pause (domain, reason, expires_at) VALUES ($1, $2, $3)",
+            )
+            .bind(&domain)
+            .bind(&reason)
+            .bind(expires_at)
+            .execute(&mut *conn)
+            .await?;
+            outcome.created += 1;
         }
     }
     Ok(())
@@ -730,61 +720,43 @@ async fn import_domain_blocks(
         let reject_reports = flag(row, "reject_reports");
         let obfuscate = flag(row, "obfuscate");
         let comment = text(row, "comment");
-        match existing.iter().find(|(_, have, ..)| *have == domain) {
-            Some((
-                id,
-                _,
-                have_severity,
-                have_media,
-                have_reports,
-                have_obfuscate,
-                have_comment,
-            )) => {
-                // Severity is a protection, and protecting less is a decision. A document
-                // that would turn a suspend into a silence is reported, never applied: the
-                // operator can still do it by hand, deliberately.
-                if severity_weight(&severity) < severity_weight(have_severity) {
-                    outcome.conflict(
-                        "domain_blocks",
-                        &domain,
-                        &format!(
-                            "refusing to lower severity from {have_severity} to {severity}; \
-                             change it by hand if that is intended"
-                        ),
-                    );
-                    continue;
-                }
-                if *have_severity == severity
-                    && *have_media == reject_media
-                    && *have_reports == reject_reports
-                    && *have_obfuscate == obfuscate
-                    && *have_comment == comment
-                {
-                    outcome.unchanged += 1;
-                } else {
-                    sqlx::query(
-                        "UPDATE instance_block SET severity = $2, reject_media = $3, \
-                         reject_reports = $4, obfuscate = $5, public_comment = $6 WHERE id = $1",
-                    )
-                    .bind(id)
-                    .bind(&severity)
-                    .bind(reject_media)
-                    .bind(reject_reports)
-                    .bind(obfuscate)
-                    .bind(&comment)
-                    .execute(&mut *conn)
-                    .await?;
-                    outcome.updated += 1;
-                }
+        if let Some((
+            id,
+            _,
+            have_severity,
+            have_media,
+            have_reports,
+            have_obfuscate,
+            have_comment,
+        )) = existing.iter().find(|(_, have, ..)| *have == domain)
+        {
+            // Severity is a protection, and protecting less is a decision. A document
+            // that would turn a suspend into a silence is reported, never applied: the
+            // operator can still do it by hand, deliberately.
+            if severity_weight(&severity) < severity_weight(have_severity) {
+                outcome.conflict(
+                    "domain_blocks",
+                    &domain,
+                    &format!(
+                        "refusing to lower severity from {have_severity} to {severity}; \
+                         change it by hand if that is intended"
+                    ),
+                );
+                continue;
             }
-            None => {
+            if *have_severity == severity
+                && *have_media == reject_media
+                && *have_reports == reject_reports
+                && *have_obfuscate == obfuscate
+                && *have_comment == comment
+            {
+                outcome.unchanged += 1;
+            } else {
                 sqlx::query(
-                    "INSERT INTO instance_block (id, domain, severity, reject_media, \
-                     reject_reports, obfuscate, public_comment) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    "UPDATE instance_block SET severity = $2, reject_media = $3, \
+                     reject_reports = $4, obfuscate = $5, public_comment = $6 WHERE id = $1",
                 )
-                .bind(Id::new().to_string())
-                .bind(&domain)
+                .bind(id)
                 .bind(&severity)
                 .bind(reject_media)
                 .bind(reject_reports)
@@ -792,8 +764,24 @@ async fn import_domain_blocks(
                 .bind(&comment)
                 .execute(&mut *conn)
                 .await?;
-                outcome.created += 1;
+                outcome.updated += 1;
             }
+        } else {
+            sqlx::query(
+                "INSERT INTO instance_block (id, domain, severity, reject_media, \
+                 reject_reports, obfuscate, public_comment) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(Id::new().to_string())
+            .bind(&domain)
+            .bind(&severity)
+            .bind(reject_media)
+            .bind(reject_reports)
+            .bind(obfuscate)
+            .bind(&comment)
+            .execute(&mut *conn)
+            .await?;
+            outcome.created += 1;
         }
     }
     Ok(())
@@ -812,33 +800,28 @@ async fn import_email_domain_blocks(
     for row in rows(value) {
         let domain = text(row, "domain");
         let allow_registration = flag(row, "allow_registration");
-        match existing.iter().find(|(_, have, _)| *have == domain) {
-            Some((id, _, have_allow)) => {
-                if *have_allow == allow_registration {
-                    outcome.unchanged += 1;
-                } else {
-                    sqlx::query(
-                        "UPDATE email_domain_block SET allow_registration = $2 WHERE id = $1",
-                    )
+        if let Some((id, _, have_allow)) = existing.iter().find(|(_, have, _)| *have == domain) {
+            if *have_allow == allow_registration {
+                outcome.unchanged += 1;
+            } else {
+                sqlx::query("UPDATE email_domain_block SET allow_registration = $2 WHERE id = $1")
                     .bind(id)
                     .bind(allow_registration)
                     .execute(&mut *conn)
                     .await?;
-                    outcome.updated += 1;
-                }
+                outcome.updated += 1;
             }
-            None => {
-                sqlx::query(
-                    "INSERT INTO email_domain_block (id, domain, allow_registration) \
-                     VALUES ($1, $2, $3)",
-                )
-                .bind(Id::new().to_string())
-                .bind(&domain)
-                .bind(allow_registration)
-                .execute(&mut *conn)
-                .await?;
-                outcome.created += 1;
-            }
+        } else {
+            sqlx::query(
+                "INSERT INTO email_domain_block (id, domain, allow_registration) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(Id::new().to_string())
+            .bind(&domain)
+            .bind(allow_registration)
+            .execute(&mut *conn)
+            .await?;
+            outcome.created += 1;
         }
     }
     Ok(())
@@ -873,39 +856,35 @@ async fn import_scanner_rules(
             );
             continue;
         };
-        match existing.iter().find(|(_, have_scanner, have_label, ..)| {
-            have_scanner == scanner_id && *have_label == label
-        }) {
-            Some((id, _, _, have_threshold, have_severity)) => {
-                if (*have_threshold - threshold).abs() < f64::EPSILON && *have_severity == severity
-                {
-                    outcome.unchanged += 1;
-                } else {
-                    sqlx::query(
-                        "UPDATE scanner_rule SET threshold = $2, severity = $3 WHERE id = $1",
-                    )
+        if let Some((id, _, _, have_threshold, have_severity)) =
+            existing.iter().find(|(_, have_scanner, have_label, ..)| {
+                have_scanner == scanner_id && *have_label == label
+            })
+        {
+            if (*have_threshold - threshold).abs() < f64::EPSILON && *have_severity == severity {
+                outcome.unchanged += 1;
+            } else {
+                sqlx::query("UPDATE scanner_rule SET threshold = $2, severity = $3 WHERE id = $1")
                     .bind(id)
                     .bind(threshold)
                     .bind(&severity)
                     .execute(&mut *conn)
                     .await?;
-                    outcome.updated += 1;
-                }
+                outcome.updated += 1;
             }
-            None => {
-                sqlx::query(
-                    "INSERT INTO scanner_rule (id, scanner_id, label, threshold, severity) \
-                     VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(Id::new().to_string())
-                .bind(scanner_id)
-                .bind(&label)
-                .bind(threshold)
-                .bind(&severity)
-                .execute(&mut *conn)
-                .await?;
-                outcome.created += 1;
-            }
+        } else {
+            sqlx::query(
+                "INSERT INTO scanner_rule (id, scanner_id, label, threshold, severity) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(Id::new().to_string())
+            .bind(scanner_id)
+            .bind(&label)
+            .bind(threshold)
+            .bind(&severity)
+            .execute(&mut *conn)
+            .await?;
+            outcome.created += 1;
         }
     }
     Ok(())

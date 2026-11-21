@@ -8,9 +8,7 @@ use axum::http::StatusCode;
 
 mod support;
 
-use support::{
-    create_account, create_status, create_token, json_of, run_db_test, send, send_anon,
-};
+use support::{create_account, create_status, create_token, json_of, run_db_test, send, send_anon};
 
 fn path(name: &str, action: &str) -> String {
     if action.is_empty() {
@@ -34,7 +32,9 @@ async fn a_tag_can_be_read_followed_and_unfollowed_idempotently() {
         let tag = json_of(&body);
         assert_eq!(tag["name"], "rust");
         assert_eq!(tag["following"], false);
-        assert!(tag["url"].as_str().is_some_and(|url| url.ends_with("/tags/rust")));
+        assert!(tag["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/tags/rust")));
 
         let (status, body) = send(&app, &token, "POST", &path("rust", "follow"), None).await;
         assert_eq!(status, StatusCode::OK, "first follow: {body}");

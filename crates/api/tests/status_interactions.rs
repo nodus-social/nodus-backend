@@ -126,15 +126,8 @@ async fn private_status_hides_non_followers_and_direct_hides_outsiders() {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        let direct = create_status(
-            pool,
-            &alice,
-            "just for bob",
-            "direct",
-            &[bob.clone()],
-            &[],
-        )
-        .await;
+        let direct =
+            create_status(pool, &alice, "just for bob", "direct", &[bob.clone()], &[]).await;
         social::favourite(pool, &bob, &direct)
             .await
             .expect("favourite");
@@ -142,11 +135,25 @@ async fn private_status_hides_non_followers_and_direct_hides_outsiders() {
             .await
             .expect("favourite");
 
-        let (status, body) = send(&app, &bob_token, "GET", &path(&direct, "favourited_by"), None).await;
+        let (status, body) = send(
+            &app,
+            &bob_token,
+            "GET",
+            &path(&direct, "favourited_by"),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "direct favourited_by: {body}");
         assert_eq!(ids(&body), vec![bob.clone()]);
 
-        let (status, _) = send(&app, &carol_token, "GET", &path(&direct, "favourited_by"), None).await;
+        let (status, _) = send(
+            &app,
+            &carol_token,
+            "GET",
+            &path(&direct, "favourited_by"),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     })
     .await;

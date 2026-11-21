@@ -155,14 +155,21 @@ mod tests {
             &Value::Null,
         )
         .expect_err("duplicate name");
-        assert!(error.message().contains("fields 1 and 3"), "{}", error.message());
+        assert!(
+            error.message().contains("fields 1 and 3"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]
     fn markup_is_refused_in_a_value() {
-        let error = to_stored(&[input("Blog", "<b>hi</b>")], &Value::Null)
-            .expect_err("markup");
-        assert!(error.message().contains("plain text"), "{}", error.message());
+        let error = to_stored(&[input("Blog", "<b>hi</b>")], &Value::Null).expect_err("markup");
+        assert!(
+            error.message().contains("plain text"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]

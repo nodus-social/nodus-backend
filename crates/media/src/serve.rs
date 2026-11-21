@@ -414,11 +414,7 @@ pub async fn serve(
 /// `serve_variant` falls back here when a layer is missing, so the range rules have to live
 /// in one place that two handlers can reach rather than in the handler that happened to be
 /// written first.
-async fn original(
-    serving: &Arc<Serving>,
-    id: &str,
-    range: Option<&HeaderValue>,
-) -> Response {
+async fn original(serving: &Arc<Serving>, id: &str, range: Option<&HeaderValue>) -> Response {
     let Some(row) = catalogue(serving, id).await else {
         return not_found();
     };

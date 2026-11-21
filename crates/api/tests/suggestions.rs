@@ -89,7 +89,11 @@ async fn suggestions_exclude_the_viewer_the_blocked_and_the_moderated() {
 
         let (status, body) = send(&app, &token, "GET", "/api/v2/suggestions", None).await;
         assert_eq!(status, StatusCode::OK, "suggestions: {body}");
-        assert_eq!(ids(&body), vec![wanted.clone()], "only the eligible local account");
+        assert_eq!(
+            ids(&body),
+            vec![wanted.clone()],
+            "only the eligible local account"
+        );
 
         let suggestion: &Value = &json_of(&body)[0];
         assert_eq!(suggestion["source"], "recent_activity");

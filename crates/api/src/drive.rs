@@ -983,7 +983,7 @@ pub(crate) fn share_links_configured() -> bool {
 /// Parses an optional id from a query string or form field. `None` is the root.
 fn parse_id(value: Option<&str>) -> ApiResult<Option<Uuid>> {
     match value.map(str::trim) {
-        None | Some("") | Some("root") => Ok(None),
+        None | Some("" | "root") => Ok(None),
         Some(value) => Uuid::parse_str(value)
             .map(Some)
             .map_err(|_| ApiError::unprocessable("not a valid id")),

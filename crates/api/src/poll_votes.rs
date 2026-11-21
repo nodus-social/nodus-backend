@@ -103,8 +103,7 @@ pub(crate) async fn consume_reply(
     let Ok(index) = i32::try_from(index) else {
         return Ok(VoteReply::Refused(VoteRefusal::UnknownOption));
     };
-    let counted =
-        polls::vote_option(state.store().pool(), &poll.id, &voter.id, index).await?;
+    let counted = polls::vote_option(state.store().pool(), &poll.id, &voter.id, index).await?;
     if counted {
         announce(state, &poll, &voter.id).await?;
     }
@@ -152,12 +151,9 @@ async fn announce(state: &AppState, poll: &PollRow, voter_id: &str) -> ApiResult
     };
     // The line is only useful to an author who can still open the poll; a deleted or
     // moderated-away status has nobody to show it to.
-    let author_can_see = crate::statuses::can_view_for_viewer(
-        state,
-        Some(status.account_id.as_str()),
-        &status,
-    )
-    .await?;
+    let author_can_see =
+        crate::statuses::can_view_for_viewer(state, Some(status.account_id.as_str()), &status)
+            .await?;
     if author_can_see {
         // A vote on your own poll is a notification like a favourite; the store
         // aggregates every voter into one line naming the latest one.

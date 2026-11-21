@@ -82,7 +82,7 @@ pub async fn stats(
 ) -> ApiResult<Json<StatsDto>> {
     auth.require_admin("admin:read")?;
     let (range, days) = match query.range.as_deref().map(str::trim) {
-        None | Some("") | Some("30d") => ("30d", 30),
+        None | Some("" | "30d") => ("30d", 30),
         Some("7d") => ("7d", 7),
         Some("90d") => ("90d", 90),
         Some(_) => {

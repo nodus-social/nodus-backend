@@ -15,13 +15,12 @@ use std::sync::Arc;
 use axum::Router;
 
 use nodus_server_api::home::{HomeCache, HomeShards, MemoryHomeCache};
-use nodus_server_api::{AppState, root_router};
+use nodus_server_api::{root_router, AppState};
 use nodus_server_core::{PageParams, PageSize};
 use nodus_server_store::Store;
 
 use support::{
-    create_account, create_status, create_token, expect_ok, follow, json_of, run_home_db_test,
-    send,
+    create_account, create_status, create_token, expect_ok, follow, json_of, run_home_db_test, send,
 };
 
 /// One in-memory shard per entry, all identical from the outside.
@@ -65,12 +64,7 @@ async fn home_ids(app: &Router, token: &str) -> Vec<String> {
     page.as_array()
         .expect("timeline is an array")
         .iter()
-        .map(|item| {
-            item["id"]
-                .as_str()
-                .expect("status has an id")
-                .to_owned()
-        })
+        .map(|item| item["id"].as_str().expect("status has an id").to_owned())
         .collect()
 }
 
@@ -106,7 +100,11 @@ async fn hydration_drops_a_deleted_id() {
 
 /// Three posts, the middle one deleted: the deleted id leaves the sorted set at once and
 /// the page the reader gets holds exactly the two survivors, with no hole in it.
-async fn hydration_drops_a_deleted_id_with(store: &Store, state: &AppState, home: &Arc<HomeShards>) {
+async fn hydration_drops_a_deleted_id_with(
+    store: &Store,
+    state: &AppState,
+    home: &Arc<HomeShards>,
+) {
     let pool = store.pool();
     let author = create_account(pool, "author").await;
     let reader = create_account(pool, "reader").await;
@@ -193,7 +191,12 @@ async fn hydration_keeps_order_with(store: &Store, state: &AppState, home: &Arc<
         home.push(id, score, std::slice::from_ref(&reader)).await;
     }
 
-    let expected = [ids[0].clone(), ids[2].clone(), ids[3].clone(), ids[1].clone()];
+    let expected = [
+        ids[0].clone(),
+        ids[2].clone(),
+        ids[3].clone(),
+        ids[1].clone(),
+    ];
     assert_eq!(
         home.shard(&reader)
             .range(&reader, home.cap())
@@ -242,14 +245,20 @@ async fn a_shard_move_keeps_every_id_with(store: &Store, state: &AppState, home:
         home.push(id, score, std::slice::from_ref(&reader)).await;
     }
     let app = app(state, home);
-    assert_eq!(home_ids(&app, &reader_token).await, ids.iter().rev().cloned().collect::<Vec<_>>());
+    assert_eq!(
+        home_ids(&app, &reader_token).await,
+        ids.iter().rev().cloned().collect::<Vec<_>>()
+    );
 
     // A third shard joins: some accounts move, and the reader's timeline is now on a shard
     // that has never heard of it. Only accounts whose owner changed are affected, and only
     // until their timeline is rebuilt — the read still answers with every visible id.
     let grown = Arc::new(HomeShards::new(memory_caches(3), home.cap()));
     assert_eq!(grown.len(), 3, "three shards after the move");
-    assert!(grown.shard_of(&reader) < grown.len(), "every account has one owner");
+    assert!(
+        grown.shard_of(&reader) < grown.len(),
+        "every account has one owner"
+    );
     assert_eq!(
         grown
             .shard(&reader)
@@ -300,11 +309,18 @@ async fn the_fallback_produces_exactly_the_sql_page() {
             .map(|row| row.id)
             .collect();
         assert_eq!(sql.len(), 3, "the database has the reader's three posts");
-        assert!(!sql.contains(&stranger_id), "an unfollowed account is not in the page");
+        assert!(
+            !sql.contains(&stranger_id),
+            "an unfollowed account is not in the page"
+        );
 
         // A miss: nothing was ever pushed.
         let app = app(&state, &home);
-        assert_eq!(home_ids(&app, &reader_token).await, sql, "empty cache = sql page");
+        assert_eq!(
+            home_ids(&app, &reader_token).await,
+            sql,
+            "empty cache = sql page"
+        );
 
         // An error: the very same ids are in the cache, and the cache refuses to answer.
         for (score, id) in (1..).zip(&sql) {

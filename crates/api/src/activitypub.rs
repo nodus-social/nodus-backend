@@ -3422,7 +3422,10 @@ mod tests {
                 .expect("look up reply")
                 .expect("reply is stored");
             assert_eq!(stored.in_reply_to_id.as_deref(), Some(parent.id.as_str()));
-            assert_eq!(stored.in_reply_to_account_id.as_deref(), Some(author.id.as_str()));
+            assert_eq!(
+                stored.in_reply_to_account_id.as_deref(),
+                Some(author.id.as_str())
+            );
         })
         .await;
     }

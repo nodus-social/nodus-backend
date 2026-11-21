@@ -88,7 +88,11 @@ async fn history_reports_changed_edits_newest_first() {
         assert_eq!(status, StatusCode::OK, "history: {body}");
         let entries = support::json_of(&body);
         let entries = entries.as_array().expect("history is an array");
-        assert_eq!(entries.len(), 1, "only the changed edit is recorded: {body}");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the changed edit is recorded: {body}"
+        );
         assert_eq!(entries[0]["content"], "second");
         assert_eq!(entries[0]["account"]["id"], author);
         assert!(entries[0]["created_at"].is_string());

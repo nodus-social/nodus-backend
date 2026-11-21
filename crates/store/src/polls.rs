@@ -306,12 +306,10 @@ pub async fn vote_option(
     option_index: i32,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let multiple: bool = sqlx::query_scalar(
-        "SELECT multiple FROM poll WHERE id = $1 FOR UPDATE",
-    )
-    .bind(poll_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let multiple: bool = sqlx::query_scalar("SELECT multiple FROM poll WHERE id = $1 FOR UPDATE")
+        .bind(poll_id)
+        .fetch_one(&mut *tx)
+        .await?;
     if !multiple {
         let already: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM poll_vote WHERE poll_id = $1 AND account_id = $2)",

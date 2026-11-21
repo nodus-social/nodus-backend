@@ -109,13 +109,12 @@ async fn the_surface_that_stayed_still_answers() {
         "the replacement must still be there, behind its grant"
     );
     assert_eq!(
-        get("/api/v1/nodus/sync/root?collection=timeline:local").await.0,
+        get("/api/v1/nodus/sync/root?collection=timeline:local")
+            .await
+            .0,
         StatusCode::UNAUTHORIZED,
         "sync/root is the collection probe a diff client still needs"
     );
-    assert_eq!(
-        get("/api/v1/nodus/capabilities").await.0,
-        StatusCode::OK
-    );
+    assert_eq!(get("/api/v1/nodus/capabilities").await.0, StatusCode::OK);
     assert_eq!(get("/api/v1/meta").await.0, StatusCode::OK);
 }

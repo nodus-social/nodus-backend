@@ -88,18 +88,17 @@ pub(super) async fn report_dto(state: &AppState, row: ReportRow) -> ApiResult<Re
     let mut rules = Vec::with_capacity(row.rule_ids.len());
     let mut missing_rule_ids = Vec::new();
     for id in &row.rule_ids {
-        match cited.iter().find(|rule| &rule.id == id) {
-            Some(rule) => rules.push(ReportRuleDto {
+        if let Some(rule) = cited.iter().find(|rule| &rule.id == id) {
+            rules.push(ReportRuleDto {
                 id: id.clone(),
                 text: Some(rule.text.clone()),
-            }),
-            None => {
-                missing_rule_ids.push(id.clone());
-                rules.push(ReportRuleDto {
-                    id: id.clone(),
-                    text: None,
-                });
-            }
+            });
+        } else {
+            missing_rule_ids.push(id.clone());
+            rules.push(ReportRuleDto {
+                id: id.clone(),
+                text: None,
+            });
         }
     }
     let instance = state.instance();

@@ -121,7 +121,10 @@ pub async fn search(
     }
     if want == "all" || want == "hashtags" {
         let rows = nodus_server_store::discovery::search_tags(pool, &term, limit).await?;
-        result.hashtags = rows.into_iter().map(|row| tag(&state, row, false)).collect();
+        result.hashtags = rows
+            .into_iter()
+            .map(|row| tag(&state, row, false))
+            .collect();
     }
     Ok(Json(result))
 }
@@ -210,7 +213,11 @@ pub async fn trending_tags(State(state): State<AppState>) -> ApiResult<Json<Vec<
         i64::from(nodus_server_core::limits::PAGE_DEFAULT),
     )
     .await?;
-    Ok(Json(rows.into_iter().map(|row| tag(&state, row, false)).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| tag(&state, row, false))
+            .collect(),
+    ))
 }
 
 /// `GET /api/v1/trends/statuses`

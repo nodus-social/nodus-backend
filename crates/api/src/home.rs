@@ -106,7 +106,11 @@ type Reply<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `Arc<dyn HomeCache>`, one per shard, chosen per account at request time.
 pub trait HomeCache: Send + Sync {
     /// Adds `entries`, cutting each account's set to `cap` in the same round trip.
-    fn push<'a>(&'a self, entries: &'a [HomeEntry], cap: usize) -> Reply<'a, Result<(), HomeCacheError>>;
+    fn push<'a>(
+        &'a self,
+        entries: &'a [HomeEntry],
+        cap: usize,
+    ) -> Reply<'a, Result<(), HomeCacheError>>;
 
     /// The newest `limit` status ids in one account's timeline, newest first.
     ///
@@ -118,7 +122,8 @@ pub trait HomeCache: Send + Sync {
     ) -> Reply<'a, Result<Vec<String>, HomeCacheError>>;
 
     /// Cuts one account's set to its oldest `cap` entries.
-    fn trim<'a>(&'a self, account_id: &'a str, cap: usize) -> Reply<'a, Result<(), HomeCacheError>>;
+    fn trim<'a>(&'a self, account_id: &'a str, cap: usize)
+        -> Reply<'a, Result<(), HomeCacheError>>;
 
     /// Removes one status from each of `account_ids`' timelines.
     fn remove<'a>(
@@ -218,7 +223,11 @@ impl HomeCache for MemoryHomeCache {
         })
     }
 
-    fn trim<'a>(&'a self, account_id: &'a str, cap: usize) -> Reply<'a, Result<(), HomeCacheError>> {
+    fn trim<'a>(
+        &'a self,
+        account_id: &'a str,
+        cap: usize,
+    ) -> Reply<'a, Result<(), HomeCacheError>> {
         Box::pin(async move {
             self.check()?;
             let mut timelines = self.lock();
@@ -266,7 +275,9 @@ pub struct ValkeyHomeCache {
 
 impl std::fmt::Debug for ValkeyHomeCache {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ValkeyHomeCache").finish_non_exhaustive()
+        formatter
+            .debug_struct("ValkeyHomeCache")
+            .finish_non_exhaustive()
     }
 }
 
@@ -379,7 +390,11 @@ impl HomeCache for ValkeyHomeCache {
         })
     }
 
-    fn trim<'a>(&'a self, account_id: &'a str, cap: usize) -> Reply<'a, Result<(), HomeCacheError>> {
+    fn trim<'a>(
+        &'a self,
+        account_id: &'a str,
+        cap: usize,
+    ) -> Reply<'a, Result<(), HomeCacheError>> {
         Box::pin(async move {
             let mut command = redis::cmd("ZREMRANGEBYRANK");
             command
@@ -398,7 +413,11 @@ impl HomeCache for ValkeyHomeCache {
         Box::pin(async move {
             let mut pipeline = redis::pipe();
             for account_id in account_ids {
-                pipeline.cmd("ZREM").arg(key(account_id)).arg(status_id).ignore();
+                pipeline
+                    .cmd("ZREM")
+                    .arg(key(account_id))
+                    .arg(status_id)
+                    .ignore();
             }
             self.run_pipeline(&mut pipeline).await
         })
@@ -845,9 +864,10 @@ pub async fn hide(state: &AppState, author_id: &str, status_id: &str) {
     let mut keys = Vec::new();
     let own = vec![author_id.to_owned()];
     home.remove(status_id, &own).await;
-    keys.extend(own.iter().map(|account| {
-        InvalidationKey::new(account, InvalidationKind::Home, status_id)
-    }));
+    keys.extend(
+        own.iter()
+            .map(|account| InvalidationKey::new(account, InvalidationKind::Home, status_id)),
+    );
 
     let mut after: Option<String> = None;
     loop {
@@ -871,9 +891,11 @@ pub async fn hide(state: &AppState, author_id: &str, status_id: &str) {
         }
         let complete = batch.len() < PIPELINE_BATCH;
         home.remove(status_id, &batch).await;
-        keys.extend(batch.iter().map(|account| {
-            InvalidationKey::new(account, InvalidationKind::Home, status_id)
-        }));
+        keys.extend(
+            batch
+                .iter()
+                .map(|account| InvalidationKey::new(account, InvalidationKind::Home, status_id)),
+        );
         if complete {
             break;
         }
@@ -914,7 +936,10 @@ pub fn spawn_subscriber(home: &Arc<HomeShards>) {
 /// stops.
 async fn listen(home: &Arc<HomeShards>, subscription: &Subscription) -> Result<(), HomeCacheError> {
     let client = redis::Client::open(subscription.url.as_str()).map_err(HomeCacheError::new)?;
-    let mut pubsub = client.get_async_pubsub().await.map_err(HomeCacheError::new)?;
+    let mut pubsub = client
+        .get_async_pubsub()
+        .await
+        .map_err(HomeCacheError::new)?;
     pubsub
         .subscribe(&subscription.channel)
         .await
@@ -998,10 +1023,7 @@ mod tests {
         let cache = MemoryHomeCache::new();
         cache
             .push(
-                &entries(
-                    "alice",
-                    &[(30, "c"), (10, "a"), (20, "b"), (40, "d")],
-                ),
+                &entries("alice", &[(30, "c"), (10, "a"), (20, "b"), (40, "d")]),
                 3,
             )
             .await
@@ -1046,13 +1068,9 @@ mod tests {
 
     #[test]
     fn a_shard_move_keeps_every_account_on_exactly_one_shard() {
-        let accounts: Vec<String> = (0..2000)
-            .map(|index| format!("01J{:022}", index))
-            .collect();
+        let accounts: Vec<String> = (0..2000).map(|index| format!("01J{:022}", index)).collect();
         let one = HomeShards::new(
-            vec![
-                Arc::new(MemoryHomeCache::new()) as Arc<dyn HomeCache>,
-            ],
+            vec![Arc::new(MemoryHomeCache::new()) as Arc<dyn HomeCache>],
             400,
         );
         let two = HomeShards::new(
@@ -1072,7 +1090,11 @@ mod tests {
                 .map(|(id, _)| id)
                 .collect();
             let unique: std::collections::HashSet<&&String> = set.iter().collect();
-            assert_eq!(set.len(), unique.len(), "shard {shard} cannot hold an account twice");
+            assert_eq!(
+                set.len(),
+                unique.len(),
+                "shard {shard} cannot hold an account twice"
+            );
         }
         // Every account is still owned by exactly one shard, so no id disappeared.
         assert_eq!(after.len(), accounts.len());

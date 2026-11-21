@@ -16,7 +16,10 @@ const VERIFY: &str = "/api/v1/accounts/verify_credentials";
 /// The error message a `422` carried, for a test that asserts on the reason rather than
 /// only the status.
 fn reason(body: &str) -> String {
-    json_of(body)["error"].as_str().unwrap_or_default().to_owned()
+    json_of(body)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[tokio::test]

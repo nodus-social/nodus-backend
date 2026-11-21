@@ -189,7 +189,11 @@ async fn fanout_and_cached_read_latency_on_a_thousand_followers() {
         for run in 0..RUNS {
             // Alternate which half goes first: a compile or a checkpoint on the host then
             // lands on both halves instead of only the one that always ran second.
-            let order = if run % 2 == 0 { [true, false] } else { [false, true] };
+            let order = if run % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            };
             for cached in order {
                 if cached {
                     timed_round(
