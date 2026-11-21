@@ -525,6 +525,11 @@ async fn variant_response(
 ///
 /// The range is applied to whichever bytes this answer carries, so a client is never handed
 /// a slice of a variant with the length of the original.
+///
+/// A 416 is the one answer that must not inherit the public policy. A refused range is a
+/// fact about this request, not about the resource, so the answer says `no-store`: a shared
+/// cache that pinned "416, length 16" for a year would keep refusing an otherwise healthy
+/// URL. A 200 or 206 keeps the policy it is given.
 fn with_cache(
     bytes: Vec<u8>,
     content_type: &str,
@@ -536,6 +541,11 @@ fn with_cache(
     let cache = HeaderValue::from_str(cache)
         .unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600"));
     let mut response = sliced_response(slice(bytes, range));
+    let cache = if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        HeaderValue::from_static("no-store")
+    } else {
+        cache
+    };
     let out = response.headers_mut();
     out.insert(header::CONTENT_TYPE, content_type);
     out.insert(header::CACHE_CONTROL, cache);
@@ -1456,6 +1466,11 @@ mod tests {
             headers.get("accept-ranges").and_then(|v| v.to_str().ok()),
             Some("bytes")
         );
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("public, max-age=31536000, immutable"),
+            "a partial answer keeps the resource's cache policy"
+        );
 
         let (status, headers, bytes) = public_answer(body, Some("bytes=999999-")).await;
         assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
@@ -1465,6 +1480,18 @@ mod tests {
             "a 416 has to say how long the object is"
         );
         assert!(bytes.is_empty(), "a 416 carries no body");
+        let cache_control = headers
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            cache_control.contains("no-store"),
+            "a 416 must not be stored by a shared cache"
+        );
+        assert!(
+            !cache_control.contains("immutable"),
+            "a negative answer is not a property of the resource"
+        );
 
         let (status, headers, bytes) = public_answer(body, None).await;
         assert_eq!(status, StatusCode::OK);
