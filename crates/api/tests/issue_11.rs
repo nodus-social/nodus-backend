@@ -917,3 +917,54 @@ async fn verify_signature_blocks_domain_and_ssrf_before_fetching() {
 // went with them. The guard itself is unchanged and still exercised here by
 // `verify_signature_blocks_domain_and_ssrf_before_fetching`, which drives it through the
 // signed inbox.
+
+/// How long authenticating a delivery from a peer we already know may take.
+///
+/// Generous next to a database read and an RSA verify, and far below the seconds a DNS
+/// failure for a name like `unresolvable.test` costs — so a regression to fetch-first
+/// either misses this budget or, once resolution starts failing fast, comes back 401.
+const KNOWN_PEER_KEY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A peer whose key the store already holds is authenticated from that key, never by
+/// asking its host: this is what keeps delivery from depending on the sender's DNS and
+/// stops a busy instance from dialling every peer on every delivery.
+///
+/// The address is unresolvable on purpose. The status assertion catches a regression that
+/// falls back to the network and fails fast; the budget catches one that hangs on it.
+#[tokio::test]
+async fn a_peer_we_hold_a_key_for_is_authenticated_without_dialling_its_host() {
+    run_db_test(|store, state| async move {
+        let pool = store.pool();
+        let (_local_id, local_username) = create_account(pool, "apknown").await;
+        let (peer_key, peer_pem) = generate_keypair();
+        let peer = "https://unresolvable.test/users/bob";
+        let _peer_row =
+            seed_remote_actor(pool, peer, "bob", "unresolvable.test", Some(&peer_pem)).await;
+
+        let activity = json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://unresolvable.test/follows/1",
+            "type": "Follow",
+            "actor": peer,
+            "object": format!("https://social.test/users/{local_username}"),
+        });
+
+        let (status, resp) = tokio::time::timeout(
+            KNOWN_PEER_KEY_BUDGET,
+            post_signed_inbox(&state, &peer_key, &format!("{peer}#main-key"), &activity),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "authenticating a delivery from a peer whose key we store must not dial its \
+                 host: {KNOWN_PEER_KEY_BUDGET:?} elapsed"
+            )
+        });
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a delivery signed by a peer whose key we store must be accepted: {resp}"
+        );
+    })
+    .await;
+}

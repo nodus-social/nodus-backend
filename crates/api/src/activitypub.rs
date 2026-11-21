@@ -382,13 +382,25 @@ async fn verify_signature(
 
     // Our own actors answer from local data: a POST signed by this instance (an operator
     // tool, a second service on the same key) must not be refused by the unsigned HTTP
-    // fetch that secure mode itself closes. A peer falls through to the signed client.
+    // fetch that secure mode itself closes.
     if let Some(pem) =
         crate::authorized_fetch::local_actor_key(state, key_actor, &prepared.params.key_id).await?
     {
         return verify_prepared(&prepared, &pem)
             .map(|()| activity)
             .map_err(|error| ApiError::unauthorized(error.to_string()));
+    }
+    // A peer we already hold a key for is authenticated from that key, so delivery costs
+    // no request to the sender's host — a peer whose host no longer resolves still gets
+    // its activities in, and a busy instance does not dial every peer on every delivery.
+    // The lookup is by `key_actor`, which the check above tied to `activity.actor`, so a
+    // key learned for one actor is never tried against an activity claiming to be
+    // another. A key we hold that does not verify is not fatal: the peer may have
+    // rotated it, and the fetch below is how that converges.
+    if let Some(pem) = crate::authorized_fetch::known_actor_key(state, key_actor).await? {
+        if verify_prepared(&prepared, &pem).is_ok() {
+            return Ok(activity);
+        }
     }
     let actor = state
         .fediverse_client()

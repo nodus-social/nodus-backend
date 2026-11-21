@@ -325,31 +325,50 @@ pub(crate) async fn local_actor_key(
     Ok(Some(pem))
 }
 
-/// The signer's public key: our own data when the actor is local, then memory cache,
-/// then the store, then its actor document.
+/// A signing key we already hold for `actor`: the memory cache, then the account row.
 ///
-/// A cold cache costs one fetch, guarded per actor so concurrent requests wait for it
-/// rather than each starting one. The fetch goes through the signing client
+/// No network. This is the whole reason inbox delivery does not dial the sender: the
+/// peer that signs a request is a peer we have a row for — we ingested its earlier
+/// activity, or it addressed us from a key it published — and asking its host again to
+/// learn what we store locally turns every delivery into a request to a host that may
+/// not even resolve. The document fetch stays as the refresh path, so a rotated key
+/// still converges rather than locking the peer out.
+///
+/// The gate is taken around the store lookup so concurrent misses for one actor share a
+/// single query instead of stampeding the pool.
+pub(crate) async fn known_actor_key(
+    state: &AppState,
+    actor: &str,
+) -> Result<Option<String>, ApiError> {
+    if let Some(pem) = state.cached_actor_key(actor) {
+        return Ok(Some(pem));
+    }
+    let gate = state.key_fetch_gate(actor);
+    let _cold = gate.lock().await;
+    if let Some(pem) = state.cached_actor_key(actor) {
+        return Ok(Some(pem));
+    }
+    let stored = accounts::by_uri(state.store().pool(), actor)
+        .await?
+        .and_then(|account| account.public_key_pem);
+    if let Some(pem) = &stored {
+        state.cache_actor_key(actor, pem.clone());
+    }
+    Ok(stored)
+}
+
+/// The signer's public key: our own data when the actor is local, then a key we already
+/// hold, then its actor document.
+///
+/// Reaching the document costs one fetch, guarded per actor so concurrent requests wait
+/// for it rather than each starting one. The fetch goes through the signing client
 /// (`fediverse_client`), so a peer that also enforces secure mode accepts it. A fetch
 /// that fails is an error and is never cached.
 async fn key_for(state: &AppState, actor: &str, key_id: &str) -> Result<String, ApiError> {
     if let Some(pem) = local_actor_key(state, actor, key_id).await? {
         return Ok(pem);
     }
-    if let Some(pem) = state.cached_actor_key(actor) {
-        return Ok(pem);
-    }
-    let gate = state.key_fetch_gate(actor);
-    let _cold = gate.lock().await;
-    if let Some(pem) = state.cached_actor_key(actor) {
-        return Ok(pem);
-    }
-    // A local account — or a peer we already cached — answers without the network.
-    if let Some(pem) = accounts::by_uri(state.store().pool(), actor)
-        .await?
-        .and_then(|account| account.public_key_pem)
-    {
-        state.cache_actor_key(actor, pem.clone());
+    if let Some(pem) = known_actor_key(state, actor).await? {
         return Ok(pem);
     }
     let document = state
