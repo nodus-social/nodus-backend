@@ -42,6 +42,7 @@ pub mod outbox;
 pub mod poll_votes;
 pub mod polls;
 pub mod preferences;
+pub mod profile_fields;
 pub mod reactions;
 pub mod remote;
 pub mod rulewatch;

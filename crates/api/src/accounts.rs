@@ -17,6 +17,7 @@ use crate::body::JsonOrForm;
 use crate::dto::AccountDto;
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
+use crate::profile_fields::ProfileFieldInput;
 use crate::state::{AppState, InstanceConfig};
 
 /// The fields a client may send to `PATCH /api/v1/accounts/update_credentials`.
@@ -42,6 +43,12 @@ pub struct UpdateCredentials {
     pub avatar: Option<String>,
     #[serde(default)]
     pub header: Option<String>,
+    /// The name/value rows shown beside the bio. A save replaces the whole list, which is
+    /// how the editor on the other side of the form works; omit the member to leave the
+    /// rows alone. Only a JSON body can carry it: the form encoding this route also accepts
+    /// has no nested keys, so a form post cannot set rows.
+    #[serde(default)]
+    pub fields: Option<Vec<ProfileFieldInput>>,
 }
 
 /// `PATCH /api/v1/accounts/update_credentials`
@@ -69,6 +76,11 @@ pub async fn update_credentials(
     }
     let avatar_ref = attachment_ref(&state, &auth, request.avatar.as_deref()).await?;
     let header_ref = attachment_ref(&state, &auth, request.header.as_deref()).await?;
+    let fields = request
+        .fields
+        .as_deref()
+        .map(|rows| crate::profile_fields::to_stored(rows, &auth.0.account.fields))
+        .transpose()?;
     let update = nodus_server_store::accounts::ProfileUpdate {
         display_name,
         note,
@@ -78,6 +90,7 @@ pub async fn update_credentials(
         indexable: request.indexable,
         avatar_ref: avatar_ref.as_deref(),
         header_ref: header_ref.as_deref(),
+        fields: fields.as_ref(),
     };
     let row = nodus_server_store::accounts::update_profile(
         state.store().pool(),

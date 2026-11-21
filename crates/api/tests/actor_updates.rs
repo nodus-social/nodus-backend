@@ -276,3 +276,63 @@ async fn the_object_is_the_actor_document_and_carries_the_changed_field() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn a_field_change_is_announced_with_the_attachment_array() {
+    run_db_test(|store, app| async move {
+        let pool = store.pool().clone();
+        let author = profile_account(&pool, "author").await;
+        let token = create_token(&pool, &author, &["read", "write"]).await;
+        let follower = remote_follower(
+            &pool,
+            "follower",
+            "remote.test",
+            "https://remote.test/inbox",
+        )
+        .await;
+        follow(&pool, &follower, &author).await;
+
+        // A verified link is state on the stored row; no verifier writes it yet, so the
+        // test seeds it and then edits the rows through the endpoint a reader would use.
+        sqlx::query("UPDATE account SET fields = $1 WHERE id = $2")
+            .bind(json!([{
+                "name": "Blog",
+                "value": "https://example.test",
+                "verified_at": "2026-01-01T00:00:00Z"
+            }]))
+            .bind(&author)
+            .execute(&pool)
+            .await
+            .expect("seed a verified row");
+
+        edit(
+            &app,
+            &token,
+            json!({ "fields": [
+                { "name": "Blog", "value": "https://example.test" },
+                { "name": "Pronouns", "value": "they/them" },
+            ] }),
+        )
+        .await;
+
+        let queued = queued_actor_updates(&pool).await;
+        assert_eq!(queued.len(), 1, "one save, one activity: {queued:?}");
+        let activity = &queued[0].1;
+        let object = &activity["object"];
+        assert_eq!(object["type"], "Person");
+        assert_eq!(
+            object["attachment"],
+            json!([
+                {
+                    "type": "PropertyValue",
+                    "name": "Blog",
+                    "value": "https://example.test",
+                    "verified": true
+                },
+                { "type": "PropertyValue", "name": "Pronouns", "value": "they/them" },
+            ]),
+            "the object carries the rows the reader just saved: {object}"
+        );
+    })
+    .await;
+}

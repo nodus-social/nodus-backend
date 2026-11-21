@@ -1779,6 +1779,10 @@ impl ActorKeys {
 
 fn actor_document(state: &AppState, account: &AccountRow) -> Actor {
     let actor = actor_url(state, account);
+    let mut extra = Map::default();
+    if let Some(attachment) = profile_attachment(&account.fields) {
+        extra.insert("attachment".to_owned(), attachment);
+    }
     Actor {
         id: actor.clone(),
         kind: "Person".to_owned(),
@@ -1809,8 +1813,34 @@ fn actor_document(state: &AppState, account: &AccountRow) -> Actor {
         discoverable: account.discoverable,
         indexable: account.indexable,
         manually_approves_followers: account.locked,
-        extra: Map::default(),
+        extra,
     }
+}
+
+/// The `attachment` array a peer reads as the profile's extra rows.
+///
+/// Each row becomes a `PropertyValue`; `verified` is present only for a row whose stored
+/// `verified_at` is set, so a peer can tell a confirmed link from one the reader typed.
+/// `None` when the profile publishes no rows, because an empty array and an absent one
+/// mean the same thing to a reader and only the absent one is omitted on the wire.
+fn profile_attachment(fields: &Value) -> Option<Value> {
+    let rows: Vec<Value> = fields
+        .as_array()?
+        .iter()
+        .filter_map(|row| {
+            let name = row.get("name")?.as_str()?;
+            let value = row.get("value")?.as_str()?;
+            let mut item = json!({"type": "PropertyValue", "name": name, "value": value});
+            if row.get("verified_at").is_some_and(|at| !at.is_null()) {
+                item["verified"] = json!(true);
+            }
+            Some(item)
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(Value::Array(rows))
 }
 
 pub(crate) fn actor_url(state: &AppState, account: &AccountRow) -> String {

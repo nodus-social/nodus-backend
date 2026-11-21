@@ -741,6 +741,10 @@ pub struct ProfileUpdate<'a> {
     /// picture.
     pub avatar_ref: Option<&'a str>,
     pub header_ref: Option<&'a str>,
+    /// The whole profile-row array, which the caller has already validated, trimmed and
+    /// checked for duplicates. A profile form edits a list, so the list is replaced rather
+    /// than merged row by row.
+    pub fields: Option<&'a Value>,
 }
 
 /// Writes the parts of a profile that were sent.
@@ -759,6 +763,7 @@ pub async fn update_profile(
             indexable = COALESCE($7, indexable), \
             avatar_ref = COALESCE($8, avatar_ref), \
             header_ref = COALESCE($9, header_ref), \
+            fields = COALESCE($10, fields), \
             updated_at = now() \
           WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}"
     );
@@ -772,6 +777,7 @@ pub async fn update_profile(
         .bind(update.indexable)
         .bind(update.avatar_ref)
         .bind(update.header_ref)
+        .bind(update.fields)
         .fetch_one(pool)
         .await
 }
