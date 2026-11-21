@@ -476,7 +476,7 @@ async fn receive(
     let content_type = row.content_type.clone();
     let account = auth.0.account.id.clone();
     tokio::spawn(async move {
-        process_upload(
+        let outcome = process_upload(
             pool.clone(),
             media_id.clone(),
             source,
@@ -487,7 +487,11 @@ async fn receive(
             lossless,
         )
         .await;
-        mirror_drive_state(&pool, &account, object_id, &media_id).await;
+        // The drive row is a projection of the media row, so it has to be written before
+        // the media row publishes its verdict: a client that polls the attachment until
+        // it is `ready` and then lists the drive must never see the older state.
+        mirror_drive_state(&pool, &account, object_id, &outcome).await;
+        publish_outcome(&pool, &media_id, &outcome).await;
         if let Some(path) = scratch {
             if let Err(error) = tokio::fs::remove_file(&path).await {
                 tracing::warn!(%error, path = %path.display(), "could not remove an upload's scratch copy");
@@ -500,17 +504,18 @@ async fn receive(
 
 /// Copies the pipeline's verdict onto the drive row, so a listing does not show a file
 /// that will be "pending" forever.
-async fn mirror_drive_state(pool: &PgPool, account: &str, object_id: Option<Uuid>, id: &str) {
+async fn mirror_drive_state(
+    pool: &PgPool,
+    account: &str,
+    object_id: Option<Uuid>,
+    outcome: &UploadOutcome,
+) {
     let Some(object_id) = object_id else {
         return;
     };
-    let Ok(Some(row)) = media::by_id(pool, id).await else {
-        return;
-    };
-    let state = match row.processing_state.as_str() {
-        "ready" => ProcessingState::Ready,
-        "failed" => ProcessingState::Failed,
-        _ => return,
+    let state = match outcome {
+        UploadOutcome::Ready => ProcessingState::Ready,
+        UploadOutcome::Failed(_) => ProcessingState::Failed,
     };
     if let Err(error) = drive::set_state(pool, account, object_id, state).await {
         tracing::warn!(%error, %object_id, "could not mirror a media state onto the drive");
@@ -601,6 +606,17 @@ async fn attach_stored(
     Ok(media_response(&row, state.instance(), deferred))
 }
 
+/// What the render step concluded, before anything publishes it.
+///
+/// The verdict is returned rather than written so the caller can project it onto the
+/// drive row first: [`publish_outcome`] is then the only writer of the terminal media
+/// state, which is what makes the projection causal.
+#[derive(Debug)]
+enum UploadOutcome {
+    Ready,
+    Failed(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_upload(
     pool: PgPool,
@@ -611,7 +627,7 @@ async fn process_upload(
     kind: Kind,
     plan: Vec<VariantSpec>,
     lossless: bool,
-) {
+) -> UploadOutcome {
     process_upload_in(
         pool,
         id,
@@ -623,7 +639,7 @@ async fn process_upload(
         lossless,
         &variants_dir(),
     )
-    .await;
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -637,10 +653,10 @@ async fn process_upload_in(
     plan: Vec<VariantSpec>,
     lossless: bool,
     variant_dir: &std::path::Path,
-) {
+) -> UploadOutcome {
     if let Err(error) = media::set_processing(&pool, &id, "processing", 5, None).await {
         tracing::error!(%error, %id, "could not mark media processing");
-        return;
+        return UploadOutcome::Failed(error.to_string());
     }
     let policy = CachePolicy::default();
     let mut rows = Vec::new();
@@ -654,8 +670,7 @@ async fn process_upload_in(
                 let digest = hex(&Sha256::digest(&rendered.bytes));
                 let path = variant_dir.join(&digest);
                 if let Err(error) = tokio::fs::write(&path, &rendered.bytes).await {
-                    fail(&pool, &id, &error.to_string()).await;
-                    return;
+                    return UploadOutcome::Failed(error.to_string());
                 }
                 rows.push(VariantRow {
                     media_id: id.clone(),
@@ -680,23 +695,29 @@ async fn process_upload_in(
                 });
             }
             Err(error) => {
-                fail(&pool, &id, &error.to_string()).await;
-                return;
+                return UploadOutcome::Failed(error.to_string());
             }
         }
         let progress = i16::try_from((index + 1) * 95 / total).unwrap_or(95);
         let _ = media::set_processing(&pool, &id, "processing", progress, None).await;
     }
     if let Err(error) = media::replace_variants(&pool, &id, &rows).await {
-        fail(&pool, &id, &error.to_string()).await;
-        return;
+        return UploadOutcome::Failed(error.to_string());
     }
-    let _ = media::set_processing(&pool, &id, "ready", 100, None).await;
+    UploadOutcome::Ready
 }
 
-async fn fail(pool: &PgPool, id: &str, message: &str) {
-    tracing::warn!(%id, %message, "media processing failed");
-    let _ = media::set_processing(pool, id, "failed", 0, Some(message)).await;
+/// Writes the render's verdict to the media row — the last write of the pipeline.
+async fn publish_outcome(pool: &PgPool, id: &str, outcome: &UploadOutcome) {
+    match outcome {
+        UploadOutcome::Ready => {
+            let _ = media::set_processing(pool, id, "ready", 100, None).await;
+        }
+        UploadOutcome::Failed(message) => {
+            tracing::warn!(%id, %message, "media processing failed");
+            let _ = media::set_processing(pool, id, "failed", 0, Some(message)).await;
+        }
+    }
 }
 
 /// `GET /api/v1/media/{id}` — processing state and metadata for the author.
@@ -845,7 +866,7 @@ mod tests {
                 .unwrap();
         assert_eq!(plan.len(), 3);
 
-        process_upload_in(
+        let outcome = process_upload_in(
             pool.clone(),
             media_id.clone(),
             source.clone(),
@@ -857,6 +878,11 @@ mod tests {
             &variant_dir,
         )
         .await;
+        assert!(
+            matches!(outcome, UploadOutcome::Ready),
+            "processing failed: {outcome:?}"
+        );
+        publish_outcome(&pool, &media_id, &outcome).await;
 
         let row = media::by_id(&pool, &media_id)
             .await
