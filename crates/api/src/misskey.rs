@@ -127,21 +127,59 @@ async fn user_for(state: &AppState, account: &AccountRow) -> ApiResult<User> {
     })
 }
 
+/// Reaction chips and attachments for a whole page of notes, fetched together.
+struct PageReads {
+    reactions: nodus_server_store::RowMap<Vec<statuses::ReactionCount>>,
+    media: nodus_server_store::RowMap<Vec<MediaRow>>,
+}
+
+/// Reads a page's reaction chips and attachments in one batch.
+///
+/// The reaction op is optional by design: a page that cannot read reaction counts still
+/// renders, with no chips, rather than failing as a whole.
+async fn page_reads(state: &AppState, ids: &[String]) -> ApiResult<PageReads> {
+    let outcome = state
+        .store()
+        .batch()
+        .media_by_status(ids)
+        .reactions(ids)
+        .run()
+        .await?;
+    Ok(PageReads {
+        reactions: outcome.reactions.unwrap_or_default(),
+        media: outcome.media_by_status,
+    })
+}
+
 async fn note_for(
     state: &AppState,
     row: &StatusRow,
     account: &AccountRow,
     viewer_id: Option<&str>,
+    reads: Option<&PageReads>,
 ) -> ApiResult<Note> {
     let id = dialect_id(state, "status", &row.id, row.created_at).await?;
     let user_id = dialect_id(state, "account", &account.id, account.created_at).await?;
-    let reactions = statuses::reactions(state.store().pool(), &row.id).await?;
-    let attachments = media::by_status(state.store().pool(), &row.id).await?;
+    // A page loop passes what it already read; a single-note endpoint, or a renote that is
+    // not on the page, still asks for one note's worth on its own.
+    let fetched;
+    let (reactions, attachments) = if let Some(reads) = reads {
+        (
+            reads.reactions.get(&row.id).map_or(&[][..], Vec::as_slice),
+            reads.media.get(&row.id).map_or(&[][..], Vec::as_slice),
+        )
+    } else {
+        fetched = (
+            statuses::reactions(state.store().pool(), &row.id).await?,
+            media::by_status(state.store().pool(), &row.id).await?,
+        );
+        (fetched.0.as_slice(), fetched.1.as_slice())
+    };
     let reaction_map: BTreeMap<String, u64> = reactions
-        .into_iter()
+        .iter()
         .map(|entry| {
             (
-                entry.reaction,
+                entry.reaction.clone(),
                 u64::try_from(entry.count).unwrap_or_default(),
             )
         })
@@ -156,7 +194,7 @@ async fn note_for(
                 let inner_note =
                     match accounts::by_id(state.store().pool(), &inner.account_id).await? {
                         Some(author) => Some(Box::new(
-                            Box::pin(note_for(state, &inner, &author, viewer_id)).await?,
+                            Box::pin(note_for(state, &inner, &author, viewer_id, None)).await?,
                         )),
                         None => None,
                     };
@@ -390,9 +428,11 @@ async fn user_notes(
         );
     }
     let page = statuses::account_page(state.store().pool(), &account.id, params).await?;
+    let ids: Vec<String> = page.items.iter().map(|row| row.id.clone()).collect();
+    let reads = page_reads(&state, &ids).await?;
     let mut notes = Vec::with_capacity(page.items.len());
     for row in &page.items {
-        notes.push(note_for(&state, row, &account, Some(&auth.account.id)).await?);
+        notes.push(note_for(&state, row, &account, Some(&auth.account.id), Some(&reads)).await?);
     }
     Ok(Json(notes))
 }
@@ -461,7 +501,7 @@ async fn favorite_note(
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(
-        note_for(&state, &row, &account, Some(&auth.account.id)).await?,
+        note_for(&state, &row, &account, Some(&auth.account.id), None).await?,
     ))
 }
 
@@ -476,7 +516,7 @@ async fn unfavorite_note(
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(
-        note_for(&state, &row, &account, Some(&auth.account.id)).await?,
+        note_for(&state, &row, &account, Some(&auth.account.id), None).await?,
     ))
 }
 
@@ -522,9 +562,10 @@ async fn notifications(
                     .await? =>
                 {
                     match accounts::by_id(state.store().pool(), &status.account_id).await? {
-                        Some(author) => {
-                            Some(note_for(&state, &status, &author, Some(&auth.account.id)).await?)
-                        }
+                        Some(author) => Some(
+                            note_for(&state, &status, &author, Some(&auth.account.id), None)
+                                .await?,
+                        ),
                         None => None,
                     }
                 }
@@ -617,12 +658,32 @@ async fn timeline(
             (page, Some(auth.account.id))
         }
     };
+    let ids: Vec<String> = page.items.iter().map(|row| row.id.clone()).collect();
+    let mut author_ids: Vec<String> = page
+        .items
+        .iter()
+        .map(|row| row.account_id.clone())
+        .collect();
+    author_ids.sort_unstable();
+    author_ids.dedup();
+    let hydrated = state
+        .store()
+        .batch()
+        .accounts(&author_ids)
+        .media_by_status(&ids)
+        .reactions(&ids)
+        .run()
+        .await?;
+    let reads = PageReads {
+        reactions: hydrated.reactions.unwrap_or_default(),
+        media: hydrated.media_by_status,
+    };
     let mut notes = Vec::with_capacity(page.items.len());
     for row in &page.items {
-        let Some(account) = accounts::by_id(state.store().pool(), &row.account_id).await? else {
+        let Some(account) = hydrated.accounts.get(&row.account_id) else {
             continue;
         };
-        notes.push(note_for(state, row, &account, viewer_id.as_deref()).await?);
+        notes.push(note_for(state, row, account, viewer_id.as_deref(), Some(&reads)).await?);
     }
     Ok(Json(notes))
 }
@@ -645,7 +706,7 @@ async fn show_note(
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(
-        note_for(&state, &row, &account, Some(&auth.account.id)).await?,
+        note_for(&state, &row, &account, Some(&auth.account.id), None).await?,
     ))
 }
 
@@ -781,7 +842,7 @@ async fn create_note(
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(
-        note_for(&state, &row, &account, Some(&auth.account.id)).await?,
+        note_for(&state, &row, &account, Some(&auth.account.id), None).await?,
     ))
 }
 

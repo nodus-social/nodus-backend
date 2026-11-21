@@ -265,24 +265,31 @@ async fn timeline_response(
     viewer: Option<&str>,
 ) -> ApiResult<Response> {
     let instance = state.instance();
-    // The account of each status is loaded per row for now; one join in the page query
-    // will replace this once the profile fields the DTO needs are settled.
-    let mut items = Vec::with_capacity(rows.len());
     let status_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
-    let media = nodus_server_store::media::by_statuses(state.store().pool(), &status_ids).await?;
+    // A page of twenty authors used to cost twenty account reads and a media scan; one
+    // batch reads both in a single snapshot. The id-keyed maps are not the page order, so
+    // the response is still built by walking `rows`.
+    let mut author_ids: Vec<String> = rows.iter().map(|row| row.account_id.clone()).collect();
+    author_ids.sort_unstable();
+    author_ids.dedup();
+    let hydrated = state
+        .store()
+        .batch()
+        .accounts(&author_ids)
+        .media_by_status(&status_ids)
+        .run()
+        .await?;
     let polls = nodus_server_store::polls::by_status_ids(state.store().pool(), &status_ids).await?;
+    let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let Some(account) =
-            nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id).await?
-        else {
+        let Some(account) = hydrated.accounts.get(&row.account_id) else {
             continue;
         };
-        let attachments: Vec<_> = media
-            .iter()
-            .filter(|attachment| attachment.status_id.as_deref() == Some(row.id.as_str()))
-            .cloned()
-            .collect();
-        let mut dto = StatusDto::from_row_with_media(&row, &account, instance, &attachments);
+        let attachments = hydrated
+            .media_by_status
+            .get(&row.id)
+            .map_or(&[][..], Vec::as_slice);
+        let mut dto = StatusDto::from_row_with_media(&row, account, instance, attachments);
         if let Some(poll) = polls.get(&row.id) {
             let document = crate::polls::document(state, poll, viewer).await?;
             dto.poll = Some(serde_json::to_value(document).map_err(|error| {
