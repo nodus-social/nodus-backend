@@ -25,9 +25,9 @@
 //!   paused domain, a suspended remote actor. A mute or a block therefore needs no
 //!   invalidation at all — the post is filtered where it is read.
 //!
-//! What is *not* here: provisioning. Production runs with `NODUS_VALKEY_URL` unset, and
+//! What is *not* here: provisioning. The cache is off until `NODUS_VALKEY_URL` is set; until
 //! then [`HomeShards::from_env`] returns `None`, the writer never pushes, and every read
-//! takes the SQL path. Turning it on is an operator decision; see
+//! takes the SQL path. Turning it on is an operator decision; the runbook is
 //! `docs/15-home-timelines.md`.
 
 use std::collections::{BTreeMap, HashMap};
@@ -526,12 +526,10 @@ impl HomeShards {
             channel = %channel,
             "home timelines are cached in valkey"
         );
-        let mut shards = Self::new(caches, cap);
-        shards.subscription = Some(Subscription {
-            url: urls.first().cloned().unwrap_or_default(),
-            channel,
-        });
-        Some(Arc::new(shards))
+        let channel_url = urls.first().cloned().unwrap_or_default();
+        Some(Arc::new(
+            Self::new(caches, cap).with_subscription(&channel_url, &channel),
+        ))
     }
 
     /// How many shards the account set is spread over.
@@ -571,6 +569,22 @@ impl HomeShards {
     #[must_use]
     pub fn shard(&self, account_id: &str) -> &Arc<dyn HomeCache> {
         &self.caches[self.shard_of(account_id).min(self.caches.len() - 1)]
+    }
+
+    /// Joins the invalidation channel at `url`, so removals another replica published are
+    /// applied to these shards.
+    ///
+    /// [`Self::from_env`] is the path the process takes, because it is the one that reads
+    /// the environment; this is for a caller that already holds its configuration. The
+    /// cross-replica tests in `tests/home_fanout.rs` build two replicas over one server
+    /// with it.
+    #[must_use]
+    pub fn with_subscription(mut self, url: &str, channel: &str) -> Self {
+        self.subscription = Some(Subscription {
+            url: url.to_owned(),
+            channel: channel.to_owned(),
+        });
+        self
     }
 
     /// Whether a replica could be listening for published removals.

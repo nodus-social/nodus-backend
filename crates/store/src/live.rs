@@ -11,9 +11,10 @@
 //! client fell behind. Every publish is fire-and-forget, so a stalled browser can never
 //! make a status create wait.
 //!
-//! The hub is process-local on purpose: production runs one API process
-//! (`docs/15-home-timelines.md` — `NODUS_VALKEY_URL` is unset), and a second replica would
-//! need a real broker rather than a fancier static. `live_streams` and the shutdown token
+//! The hub is process-local on purpose: an `EventSource` client is pinned to the replica it
+//! opened, and a second replica would need a real broker rather than a fancier static. The
+//! home-timeline cache (`docs/15-home-timelines.md`) is a read path; it does not carry live
+//! events between replicas. `live_streams` and the shutdown token
 //! are here too so the streaming handler, the deploy's stop signal, and the log line that
 //! counts what was open all read the same numbers.
 

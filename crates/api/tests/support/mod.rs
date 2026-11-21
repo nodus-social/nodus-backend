@@ -94,6 +94,28 @@ where
     }
 }
 
+/// The same isolated schema, handing `body` only the store.
+///
+/// The two-replica home tests build two states over one pool. Neither [`run_db_test`]
+/// (which owns the router) nor [`run_home_db_test`] (which owns one state and one shard
+/// set) can express that, and the schema has to outlive both replicas.
+pub async fn run_shared_db_test<F, Fut>(body: F)
+where
+    F: FnOnce(Store) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Some((admin, schema, store)) = isolated_store().await else {
+        return;
+    };
+    let outcome = tokio::spawn(async move { body(store).await }).await;
+    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(admin.pool())
+        .await;
+    if let Err(err) = outcome {
+        std::panic::resume_unwind(err.into_panic());
+    }
+}
+
 /// A schema that belongs to one test, with the migrations already applied.
 ///
 /// `None` when `DATABASE_URL` is unset: every contract test is skipped rather than failed,

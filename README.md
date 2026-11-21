@@ -48,8 +48,10 @@ nodus-backend/
 
 ## Running it
 
-Requires a Postgres 15+ database with `pg_trgm`. Redis is optional until streaming
-fan-out across replicas exists.
+Requires a Postgres 15+ database with `pg_trgm`. A Redis-compatible Valkey is optional:
+with `NODUS_VALKEY_URL` unset, home timelines are read from Postgres; set it to serve them
+from a cache shared by every replica (`docs/15-home-timelines.md`). Live streaming events
+remain local to the replica the client connected to.
 
 ```bash
 export DATABASE_URL=postgres://nodus:nodus@localhost:5432/nodus
@@ -73,4 +75,5 @@ cargo run -p nodus-server-worker   # job runner, one process per replica
 | `docs/09-deployment.md` | monolith default, split gRPC profile, media and federation workers |
 | `docs/10-auth.md` | Mastodon OAuth, optional OIDC/MAS-style identity provider |
 | `docs/11-service-boundaries.md` | service crates, gRPC contracts, monolith/strict/split modes |
+| `docs/15-home-timelines.md` | home-timeline Valkey fan-out, fallback, provisioning and runbook |
 | `docs/media-cluster.md` | media placement and replication, range answers, the two-node proof |
