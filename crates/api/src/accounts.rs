@@ -382,7 +382,9 @@ pub async fn unfollow(
     Path(id): Path<String>,
 ) -> ApiResult<Json<RelationshipDto>> {
     auth.require_scope("write:follows")?;
-    nodus_server_store::social::unfollow(state.store().pool(), &auth.0.account.id, &id).await?;
+    let purged =
+        nodus_server_store::social::unfollow(state.store().pool(), &auth.0.account.id, &id).await?;
+    crate::home::purge_unfollowed(&state, &auth.0.account.id, &purged).await;
     crate::outbox::deliver_follow(&state, &auth.0.account.id, &id, false).await;
     let relationship =
         nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)

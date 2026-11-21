@@ -184,9 +184,24 @@ pub async fn follow(
     })
 }
 
-pub async fn unfollow(pool: &PgPool, account_id: &str, target_id: &str) -> Result<(), sqlx::Error> {
+/// Unfollows, and clears what that follow had already put on the reader's home timeline.
+///
+/// The posts were fanned into `timeline_entry` at creation, which makes the row outlive
+/// the follow edge unless it is deleted here: the SQL page reads the row, not the follow,
+/// so a stale entry would keep the target's posts on the reader's timeline after an
+/// unfollow. Returns the ids removed, so the caller can take the same ids out of the
+/// reader's cached timeline (`crates/api/src/home.rs` owns that copy).
+///
+/// One `DELETE` for every status of that author, in the same transaction as the follow
+/// row: the two cannot be observed disagreeing. Entries written to *other* readers are
+/// untouched — the purge is scoped to `account_id`'s timeline.
+pub async fn unfollow(
+    pool: &PgPool,
+    account_id: &str,
+    target_id: &str,
+) -> Result<Vec<String>, sqlx::Error> {
     if account_id == target_id {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut tx = pool.begin().await?;
     lock_account_pair(&mut tx, account_id, target_id).await?;
@@ -200,7 +215,18 @@ pub async fn unfollow(pool: &PgPool, account_id: &str, target_id: &str) -> Resul
     if removed.as_ref().is_some_and(|(state,)| state == "accepted") {
         sync_follow_counts(&mut tx, account_id, target_id).await?;
     }
-    tx.commit().await
+    let purged: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM timeline_entry \
+          WHERE account_id = $1 AND kind = 'home' \
+            AND status_id IN (SELECT s.id FROM status s WHERE s.account_id = $2) \
+         RETURNING status_id",
+    )
+    .bind(account_id)
+    .bind(target_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(purged)
 }
 
 /// Accepts a pending follow request, if the target owns it.

@@ -133,6 +133,16 @@ pub trait HomeCache: Send + Sync {
         account_ids: &'a [String],
         status_id: &'a str,
     ) -> Reply<'a, Result<(), HomeCacheError>>;
+
+    /// Removes several statuses from each of `account_ids`' timelines in one round trip.
+    ///
+    /// An unfollow purges every post one author had on one reader's timeline; issuing one
+    /// [`Self::remove`] per id would make that a round trip per post.
+    fn remove_many<'a>(
+        &'a self,
+        account_ids: &'a [String],
+        status_ids: &'a [String],
+    ) -> Reply<'a, Result<(), HomeCacheError>>;
 }
 
 /// `home:{account_id}` — the key an account's timeline lives under.
@@ -251,12 +261,21 @@ impl HomeCache for MemoryHomeCache {
         account_ids: &'a [String],
         status_id: &'a str,
     ) -> Reply<'a, Result<(), HomeCacheError>> {
+        let ids = [status_id.to_owned()];
+        Box::pin(async move { self.remove_many(account_ids, &ids).await })
+    }
+
+    fn remove_many<'a>(
+        &'a self,
+        account_ids: &'a [String],
+        status_ids: &'a [String],
+    ) -> Reply<'a, Result<(), HomeCacheError>> {
         Box::pin(async move {
             self.check()?;
             let mut timelines = self.lock();
             for account_id in account_ids {
                 if let Some(timeline) = timelines.get_mut(account_id) {
-                    timeline.retain(|(_, id), ()| id != status_id);
+                    timeline.retain(|(_, id), ()| !status_ids.iter().any(|gone| gone == id));
                 }
             }
             Ok(())
@@ -412,14 +431,25 @@ impl HomeCache for ValkeyHomeCache {
         account_ids: &'a [String],
         status_id: &'a str,
     ) -> Reply<'a, Result<(), HomeCacheError>> {
+        let ids = [status_id.to_owned()];
+        Box::pin(async move { self.remove_many(account_ids, &ids).await })
+    }
+
+    fn remove_many<'a>(
+        &'a self,
+        account_ids: &'a [String],
+        status_ids: &'a [String],
+    ) -> Reply<'a, Result<(), HomeCacheError>> {
         Box::pin(async move {
             let mut pipeline = redis::pipe();
             for account_id in account_ids {
-                pipeline
-                    .cmd("ZREM")
-                    .arg(key(account_id))
-                    .arg(status_id)
-                    .ignore();
+                for status_id in status_ids {
+                    pipeline
+                        .cmd("ZREM")
+                        .arg(key(account_id))
+                        .arg(status_id)
+                        .ignore();
+                }
             }
             self.run_pipeline(&mut pipeline).await
         })
@@ -655,12 +685,21 @@ impl HomeShards {
 
     /// Removes one status from each account's timeline.
     pub async fn remove(&self, status_id: &str, accounts: &[String]) {
+        let ids = [status_id.to_owned()];
+        self.remove_many(&ids, accounts).await;
+    }
+
+    /// Removes `status_ids` from each account's timeline, one round trip per shard.
+    pub async fn remove_many(&self, status_ids: &[String], accounts: &[String]) {
+        if status_ids.is_empty() {
+            return;
+        }
         for (shard, batch) in self.group(accounts) {
             for chunk in batch.chunks(PIPELINE_BATCH) {
                 let owned: Vec<String> = chunk.iter().map(|id| (*id).clone()).collect();
                 match tokio::time::timeout(
                     CACHE_DEADLINE,
-                    self.caches[shard].remove(&owned, status_id),
+                    self.caches[shard].remove_many(&owned, status_ids),
                 )
                 .await
                 {
@@ -923,6 +962,31 @@ pub async fn hide(state: &AppState, author_id: &str, status_id: &str) {
     }
 
     if let Some(sink) = state.invalidation_sink() {
+        sink.invalidate(&keys);
+    }
+}
+
+/// Removes the posts of an author the reader no longer follows from the reader's cached
+/// home timeline, on this replica and through the invalidation channel on the others.
+///
+/// Called after [`nodus_server_store::social::unfollow`] has deleted the materialised
+/// entries and returned their ids. The ids are the ones `fan_out` pushed, so this purges
+/// exactly the copy the same write created; a purge that skipped the cache would leave
+/// a warm range serving the posts the rows no longer admit.
+pub async fn purge_unfollowed(state: &AppState, reader_id: &str, status_ids: &[String]) {
+    if status_ids.is_empty() {
+        return;
+    }
+    let Some(home) = state.home() else {
+        return;
+    };
+    let accounts = [reader_id.to_owned()];
+    home.remove_many(status_ids, &accounts).await;
+    if let Some(sink) = state.invalidation_sink() {
+        let keys: Vec<InvalidationKey> = status_ids
+            .iter()
+            .map(|id| InvalidationKey::new(reader_id, InvalidationKind::Home, id.clone()))
+            .collect();
         sink.invalidate(&keys);
     }
 }
