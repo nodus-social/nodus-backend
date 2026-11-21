@@ -85,6 +85,9 @@ impl Batch<'_> {
     ///
     /// Returns the first essential op's failure; optional failures are reported per slot in the outcome instead.
     pub async fn run(self) -> Result<BatchOutcome, StoreError> {
+        // Counted next to the `begin_with`, not assumed: a refactor that opens a second transaction in here must bump this to keep the test honest.
+        let mut snapshots_opened = 0;
+        snapshots_opened += 1;
         // `begin_with` so the isolation level is part of the transaction's first statement; `SET TRANSACTION` after a query would be rejected by Postgres.
         let mut tx = self
             .store
@@ -96,7 +99,7 @@ impl Batch<'_> {
             media_by_status: RowMap::new(),
             relationships: RowMap::new(),
             reactions: Ok(RowMap::new()),
-            snapshots_opened: 1,
+            snapshots_opened: 0,
         };
         for op in &self.essential {
             match op {
@@ -112,6 +115,7 @@ impl Batch<'_> {
             }
         }
         tx.commit().await?;
+        outcome.snapshots_opened = snapshots_opened;
         for op in &self.optional {
             let OptionalOp::Reactions(ids) = op;
             outcome.reactions = fetch_reactions(self.store.pool(), ids)
