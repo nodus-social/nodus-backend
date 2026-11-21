@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use nodus_server_api::home::{self as home_timeline, HomeCache, HomeShards, MemoryHomeCache};
 use nodus_server_core::pagination::PageParams;
 use nodus_server_core::Id;
-use nodus_server_store::{accounts, media, polls, statuses, Store};
+use nodus_server_store::{accounts, media, polls, social, statuses, Store};
 
 use support::{
     create_account, create_status, create_token, expect_ok, follow, json_of, run_db_test, send,
@@ -432,9 +432,74 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
         assert_page_render_decorations(&app, &token, &first_status, &mentioned).await;
 
         assert_misskey_page_is_flat(&app, &token, &log).await;
+        assert_notifications_page_is_flat(&store, &app, &token, &viewer, &log).await;
         assert_a_cached_page_pays_only_for_its_shortfall(&store, &viewer, &log).await;
     })
     .await;
+}
+
+/// The notifications page reads each of its senders and statuses once, not once per line.
+async fn notifications_page(
+    app: &Router,
+    token: &str,
+    log: &CapturedLog,
+    limit: usize,
+) -> (usize, usize, Vec<String>) {
+    clear(log);
+    let path = format!("/api/v1/notifications?limit={limit}");
+    let (status, body) = send(app, token, "GET", &path, None).await;
+    let body = expect_ok(status, &body, &path);
+    let lines = json_of(&body);
+    let lines = lines.as_array().expect("a page of notifications");
+    assert_eq!(lines.len(), limit, "the endpoint returned the whole page");
+    let statuses = lines
+        .iter()
+        .filter_map(|line| line["status"]["id"].as_str().map(ToOwned::to_owned))
+        .collect();
+    (statements(log), table_reads(log, "FROM status s"), statuses)
+}
+
+async fn assert_notifications_page_is_flat(
+    store: &Store,
+    app: &Router,
+    token: &str,
+    viewer: &str,
+    log: &CapturedLog,
+) {
+    let status = create_status(store.pool(), viewer, "notified post", "public", &[], &[]).await;
+    for index in 0..3 {
+        let actor = create_account(store.pool(), &format!("notifier{index}")).await;
+        social::notify(store.pool(), viewer, "favourite", &actor, Some(&status))
+            .await
+            .expect("seed notification");
+    }
+    let (three, _, three_statuses) = notifications_page(app, token, log, 3).await;
+    for index in 3..20 {
+        let actor = create_account(store.pool(), &format!("notifier{index}")).await;
+        social::notify(store.pool(), viewer, "favourite", &actor, Some(&status))
+            .await
+            .expect("seed notification");
+    }
+    let (twenty, status_reads, twenty_statuses) = notifications_page(app, token, log, 20).await;
+    assert_eq!(
+        three, twenty,
+        "a page of twenty notifications must cost the same as a page of three \
+         (N=3 {three}, N=20 {twenty})"
+    );
+    assert_eq!(
+        status_reads, 2,
+        "twenty lines should read the status table twice (the page, then the boosts), saw \
+         {status_reads}"
+    );
+    assert!(
+        three_statuses.iter().all(|id| id == &status)
+            && twenty_statuses.iter().all(|id| id == &status),
+        "every line must still render the status it points at"
+    );
+    eprintln!(
+        "notifications: N=3 {three} statements, N=20 {twenty} statements \
+         ({status_reads} status read)"
+    );
 }
 
 /// The cached read has exactly three possible statements: the big-account probe, the

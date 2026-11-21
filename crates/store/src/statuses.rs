@@ -72,6 +72,20 @@ pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<StatusRow>, sqlx::E
         .await
 }
 
+/// Many statuses by id, for a page that points at several; deleted rows are absent.
+pub async fn by_ids(pool: &PgPool, ids: &[String]) -> Result<Vec<StatusRow>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM status s WHERE s.id = ANY($1) AND s.deleted_at IS NULL"
+    );
+    sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(ids)
+        .fetch_all(pool)
+        .await
+}
+
 /// The hashtags a status carries, alphabetically.
 ///
 /// Tags live in `status_tag` rather than on the row, so every payload that shows a post

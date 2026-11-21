@@ -15,10 +15,16 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::collections::HashMap;
 
 use nodus_server_core::limits::PAGE_MAX;
 use nodus_server_core::pagination::PageSize;
-use nodus_server_store::social::NotificationRow;
+use nodus_server_store::accounts::AccountRow;
+use nodus_server_store::hydrate::PollFacts;
+use nodus_server_store::media::MediaRow;
+use nodus_server_store::social::{NotificationRow, ViewerFlags};
+use nodus_server_store::statuses::StatusRow;
+use nodus_server_store::{RowMap, StatusDecorations};
 
 use crate::appeals::AppealDto;
 use crate::auth::{AppealAuth, Auth};
@@ -185,9 +191,17 @@ pub async fn list(
     )
     .await?;
 
+    // Two status reads and one batch for the whole page, then shaping with no statement
+    // of its own: a page of twenty notifications costs what a page of one costs.
+    let parts = page_parts(&state, &auth.0 .0.account.id, &rows).await?;
+    let now = Utc::now();
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
-        items.push(dto(&state, row, Some(&auth.0)).await?);
+        let mut item = dto_from_page(&state, row, &parts, now)?;
+        if item.kind == "moderation" {
+            item.moderation = Some(moderation_dto(&state, row).await?);
+        }
+        items.push(item);
     }
 
     let next = rows.last().map(|row| row.id.clone());
@@ -258,22 +272,127 @@ async fn notification(state: &AppState, auth: &Auth, id: &str) -> ApiResult<Noti
         .ok_or_else(|| ApiError::not_found("Record not found"))
 }
 
-/// Builds the payload, loading the sender and the status it refers to.
+/// Everything a page of notifications points at, read once.
+struct PageParts {
+    statuses: HashMap<String, StatusRow>,
+    accounts: RowMap<AccountRow>,
+    media: RowMap<Vec<MediaRow>>,
+    decorations: RowMap<StatusDecorations>,
+    polls: RowMap<PollFacts>,
+    flags: HashMap<String, ViewerFlags>,
+}
+
+/// Reads the senders, the statuses they point at and what those boost in one snapshot.
 ///
-/// Public inside the crate: the streaming handler renders the notification it was just
-/// told about through this same function, so an SSE frame and a list row cannot drift.
-pub(crate) async fn dto(
+/// A line used to be built on its own: sender, status, author, attachments, decorations
+/// and the poll's tallies, twenty times for twenty lines. The page is the unit here, so a
+/// longer page costs no more than a short one. A status or author that is gone stays
+/// absent rather than being padded.
+async fn page_parts(
+    state: &AppState,
+    viewer: &str,
+    rows: &[NotificationRow],
+) -> ApiResult<PageParts> {
+    let pool = state.store().pool();
+    let mut page_ids: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.status_id.clone())
+        .collect();
+    page_ids.sort_unstable();
+    page_ids.dedup();
+    let mut statuses: HashMap<String, StatusRow> =
+        nodus_server_store::statuses::by_ids(pool, &page_ids)
+            .await?
+            .into_iter()
+            .map(|row| (row.id.clone(), row))
+            .collect();
+    // A boost renders the status it boosted, so the originals belong to the page too.
+    let mut originals: Vec<String> = statuses
+        .values()
+        .filter_map(|row| row.reblog_of_id.clone())
+        .collect();
+    originals.sort_unstable();
+    originals.dedup();
+    for row in nodus_server_store::statuses::by_ids(pool, &originals).await? {
+        statuses.insert(row.id.clone(), row);
+    }
+    page_ids.extend(originals);
+
+    let mut account_ids: Vec<String> = rows.iter().map(|row| row.from_account_id.clone()).collect();
+    account_ids.extend(statuses.values().map(|row| row.account_id.clone()));
+    account_ids.sort_unstable();
+    account_ids.dedup();
+
+    let hydrated = state
+        .store()
+        .batch()
+        .accounts(&account_ids)
+        .media_by_status(&page_ids)
+        .decorations(&page_ids)
+        .polls(&page_ids, Some(viewer))
+        .run()
+        .await?;
+    let flags = nodus_server_store::social::viewer_flags(pool, viewer, &page_ids).await?;
+    Ok(PageParts {
+        statuses,
+        accounts: hydrated.accounts,
+        media: hydrated.media_by_status,
+        decorations: hydrated.decorations,
+        polls: hydrated.polls,
+        flags,
+    })
+}
+
+/// A status payload from the page's reads; `None` when its author is gone.
+fn status_from_page(
+    state: &AppState,
+    row: &StatusRow,
+    parts: &PageParts,
+    now: DateTime<Utc>,
+) -> ApiResult<Option<StatusDto>> {
+    let Some(account) = parts.accounts.get(&row.account_id) else {
+        return Ok(None);
+    };
+    let media = parts.media.get(&row.id).map_or(&[][..], Vec::as_slice);
+    let mut dto = StatusDto::from_row_with_media(row, account, state.instance(), media);
+    if let Some(decorations) = parts.decorations.get(&row.id) {
+        statuses::apply_decorations(&mut dto, decorations, state.instance());
+    }
+    if let Some(poll) = parts.polls.get(&row.id) {
+        dto.poll = Some(
+            serde_json::to_value(crate::polls::page_document(poll, now)).map_err(|error| {
+                ApiError::new(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                )
+            })?,
+        );
+    }
+    if let Some(flags) = parts.flags.get(&row.id) {
+        statuses::apply_flags(&mut dto, *flags);
+    }
+    if let Some(original_id) = &row.reblog_of_id {
+        if let Some(original) = parts.statuses.get(original_id) {
+            dto.reblog = status_from_page(state, original, parts, now)?.map(Box::new);
+        }
+    }
+    Ok(Some(dto))
+}
+
+/// The payload for one row of a page whose reads are already in hand.
+fn dto_from_page(
     state: &AppState,
     row: &NotificationRow,
-    viewer: Option<&Auth>,
+    parts: &PageParts,
+    now: DateTime<Utc>,
 ) -> ApiResult<NotificationDto> {
-    let account = nodus_server_store::accounts::by_id(state.store().pool(), &row.from_account_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    let Some(account) = parts.accounts.get(&row.from_account_id) else {
+        return Err(ApiError::not_found("Record not found"));
+    };
     let status = match &row.status_id {
         None => None,
-        Some(id) => match nodus_server_store::statuses::by_id(state.store().pool(), id).await? {
-            Some(status) => Some(statuses::dto(state, &status, viewer).await?),
+        Some(id) => match parts.statuses.get(id) {
+            Some(status) => status_from_page(state, status, parts, now)?,
             // A notification whose status was deleted stays readable as the event it
             // records; a client shows "liked your post" without a post body.
             None => None,
@@ -284,15 +403,11 @@ pub(crate) async fn dto(
         .find(|kind| **kind == row.kind)
         .copied()
         .unwrap_or("status");
-    let moderation = match kind {
-        "moderation" => Some(moderation_dto(state, row).await?),
-        _ => None,
-    };
     Ok(NotificationDto {
         id: row.id.clone(),
         kind,
         created_at: row.created_at,
-        account: AccountDto::from_row(&account, state.instance()),
+        account: AccountDto::from_row(account, state.instance()),
         status,
         group_key: format!(
             "{}:{}",
@@ -301,8 +416,28 @@ pub(crate) async fn dto(
         ),
         group_count: row.group_count,
         note: row.note.clone(),
-        moderation,
+        moderation: None,
     })
+}
+
+/// Builds the payload, reading the sender and the status it refers to.
+///
+/// Public inside the crate: the streaming handler renders the notification it was just
+/// told about through this same function, so an SSE frame and a list row cannot drift.
+/// One row is a page of one; the shaping is shared with [`list`], and the moderation
+/// fields — two per-row lookups that only a `moderation` line needs — are added here.
+pub(crate) async fn dto(
+    state: &AppState,
+    row: &NotificationRow,
+    viewer: Option<&Auth>,
+) -> ApiResult<NotificationDto> {
+    let viewer_id = viewer.map_or(row.account_id.as_str(), |auth| auth.0.account.id.as_str());
+    let parts = page_parts(state, viewer_id, std::slice::from_ref(row)).await?;
+    let mut dto = dto_from_page(state, row, &parts, Utc::now())?;
+    if dto.kind == "moderation" {
+        dto.moderation = Some(moderation_dto(state, row).await?);
+    }
+    Ok(dto)
 }
 
 /// Fills in the structured half of a `moderation` row, including the answer the reader

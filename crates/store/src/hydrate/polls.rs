@@ -26,6 +26,55 @@ pub struct PollFacts {
     pub own_votes: Option<Vec<i32>>,
 }
 
+/// The raw vote rows for a page of polls: per-option counts, distinct voters, and the
+/// viewer's own choices (empty when signed out).
+struct Votes {
+    tallies: Vec<(String, i32, i64)>,
+    voters: Vec<(String, i64)>,
+    own: Vec<(String, i32)>,
+}
+
+async fn read_votes(
+    conn: &mut PgConnection,
+    poll_ids: &[String],
+    viewer: Option<&str>,
+) -> Result<Votes, sqlx::Error> {
+    let tallies: Vec<(String, i32, i64)> = sqlx::query_as(
+        "SELECT poll_id, option_index, COUNT(*)::bigint AS votes FROM poll_vote \
+           WHERE poll_id = ANY($1) GROUP BY poll_id, option_index \
+         UNION ALL \
+         SELECT poll_id, option_index, votes FROM poll_tally WHERE poll_id = ANY($1)",
+    )
+    .bind(poll_ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    let voters: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT poll_id, COUNT(DISTINCT account_id) AS voters FROM poll_vote \
+          WHERE poll_id = ANY($1) GROUP BY poll_id",
+    )
+    .bind(poll_ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    let own: Vec<(String, i32)> = match viewer {
+        Some(account_id) => {
+            sqlx::query_as(
+                "SELECT poll_id, option_index FROM poll_vote \
+                  WHERE poll_id = ANY($1) AND account_id = $2 ORDER BY poll_id, option_index",
+            )
+            .bind(poll_ids)
+            .bind(account_id)
+            .fetch_all(&mut *conn)
+            .await?
+        }
+        None => Vec::new(),
+    };
+    Ok(Votes {
+        tallies,
+        voters,
+        own,
+    })
+}
+
 /// Reads every poll attached to a page of statuses, keyed by status id.
 ///
 /// A status with no poll, or whose status has been deleted, is absent from the map: the
@@ -51,46 +100,22 @@ pub(crate) async fn fetch_polls(
     }
     let poll_ids: Vec<String> = polls.iter().map(|poll| poll.id.clone()).collect();
 
-    let tallies: Vec<(String, i32, i64)> = sqlx::query_as(
-        "SELECT poll_id, option_index, COUNT(*)::bigint AS votes FROM poll_vote \
-           WHERE poll_id = ANY($1) GROUP BY poll_id, option_index \
-         UNION ALL \
-         SELECT poll_id, option_index, votes FROM poll_tally WHERE poll_id = ANY($1)",
-    )
-    .bind(&poll_ids)
-    .fetch_all(&mut *conn)
-    .await?;
-    let voters: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT poll_id, COUNT(DISTINCT account_id) AS voters FROM poll_vote \
-          WHERE poll_id = ANY($1) GROUP BY poll_id",
-    )
-    .bind(&poll_ids)
-    .fetch_all(&mut *conn)
-    .await?;
-    let own: Vec<(String, i32)> = match viewer {
-        Some(account_id) => {
-            sqlx::query_as(
-                "SELECT poll_id, option_index FROM poll_vote \
-                  WHERE poll_id = ANY($1) AND account_id = $2 ORDER BY poll_id, option_index",
-            )
-            .bind(&poll_ids)
-            .bind(account_id)
-            .fetch_all(&mut *conn)
-            .await?
-        }
-        None => Vec::new(),
-    };
+    let Votes {
+        tallies,
+        voters,
+        own,
+    } = read_votes(&mut *conn, &poll_ids, viewer).await?;
 
-    let mut votes_by_poll: HashMap<&str, Vec<(i32, i64)>> = HashMap::new();
-    for (poll_id, index, votes) in &tallies {
-        votes_by_poll
+    let mut counts_by_poll: HashMap<&str, Vec<(i32, i64)>> = HashMap::new();
+    for (poll_id, index, count) in &tallies {
+        counts_by_poll
             .entry(poll_id.as_str())
             .or_default()
-            .push((*index, *votes));
+            .push((*index, *count));
     }
     let voters_by_poll: HashMap<&str, i64> = voters
         .iter()
-        .map(|(poll_id, voters)| (poll_id.as_str(), *voters))
+        .map(|(poll_id, total)| (poll_id.as_str(), *total))
         .collect();
     let mut own_by_poll: HashMap<&str, Vec<i32>> = HashMap::new();
     for (poll_id, index) in &own {
@@ -103,7 +128,7 @@ pub(crate) async fn fetch_polls(
     let mut map: RowMap<PollFacts> = RowMap::new();
     for poll in polls {
         let mut counts = vec![0; poll.options.0.len()];
-        for (index, votes) in votes_by_poll
+        for (index, votes) in counts_by_poll
             .get(poll.id.as_str())
             .map_or(&[][..], Vec::as_slice)
         {

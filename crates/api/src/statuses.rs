@@ -814,7 +814,7 @@ pub(crate) async fn dto(
     Ok(dto)
 }
 
-fn apply_flags(dto: &mut StatusDto, flags: ViewerFlags) {
+pub(crate) fn apply_flags(dto: &mut StatusDto, flags: ViewerFlags) {
     dto.favourited = flags.favourited;
     dto.reblogged = flags.reblogged;
     dto.bookmarked = flags.bookmarked;
