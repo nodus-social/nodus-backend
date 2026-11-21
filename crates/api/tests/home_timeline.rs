@@ -58,7 +58,18 @@ fn app(state: &AppState, home: &Arc<HomeShards>) -> Router {
 
 /// The ids on one page, in the order the client reads them.
 async fn home_ids(app: &Router, token: &str) -> Vec<String> {
-    let (status, body) = send(app, token, "GET", "/api/v1/timelines/home", None).await;
+    home_ids_query(app, token, "").await
+}
+
+async fn home_ids_query(app: &Router, token: &str, query: &str) -> Vec<String> {
+    let (status, body) = send(
+        app,
+        token,
+        "GET",
+        &format!("/api/v1/timelines/home{query}"),
+        None,
+    )
+    .await;
     let body = expect_ok(status, &body, "/api/v1/timelines/home");
     let page = json_of(&body);
     page.as_array()
@@ -335,4 +346,195 @@ async fn the_fallback_produces_exactly_the_sql_page() {
         cache.fail(false);
     })
     .await;
+}
+
+#[tokio::test]
+async fn a_short_set_is_topped_up_from_the_database() {
+    run_home_db_test(memory_caches(1), |store, state, home| async move {
+        a_short_set_is_topped_up_with(&store, &state, &home).await;
+    })
+    .await;
+    match valkey_caches(1) {
+        Some(caches) => {
+            run_home_db_test(caches, |store, state, home| async move {
+                a_short_set_is_topped_up_with(&store, &state, &home).await;
+            })
+            .await;
+        }
+        None => skip("a_short_set_is_topped_up_from_the_database"),
+    }
+}
+
+/// Six entries in `timeline_entry`, one id in the set: the set narrows the page, it does
+/// not define it, so the five rows it cannot name come from the database.
+async fn a_short_set_is_topped_up_with(store: &Store, state: &AppState, home: &Arc<HomeShards>) {
+    let pool = store.pool();
+    let author = create_account(pool, "author").await;
+    let reader = create_account(pool, "reader").await;
+    follow(pool, &reader, &author).await;
+    let reader_token = create_token(pool, &reader, &["read"]).await;
+
+    let mut ids = Vec::new();
+    for index in 0..6 {
+        ids.push(create_status(pool, &author, &format!("post {index}"), "public", &[], &[]).await);
+    }
+    // The set was created after the history existed: only the newest entry was fanned out.
+    let newest = ids.last().expect("six ids").clone();
+    home.push(&newest, 6, std::slice::from_ref(&reader)).await;
+
+    let app = app(state, home);
+    let page = home_ids(&app, &reader_token).await;
+    assert_eq!(
+        page,
+        ids.iter().rev().cloned().collect::<Vec<_>>(),
+        "a one-id set must not hide the five older entries"
+    );
+}
+
+#[tokio::test]
+async fn cursors_cross_the_set_database_boundary_without_gaps() {
+    run_home_db_test(memory_caches(1), |store, state, home| async move {
+        cursors_cross_the_boundary_with(&store, &state, &home).await;
+    })
+    .await;
+    match valkey_caches(1) {
+        Some(caches) => {
+            run_home_db_test(caches, |store, state, home| async move {
+                cursors_cross_the_boundary_with(&store, &state, &home).await;
+            })
+            .await;
+        }
+        None => skip("cursors_cross_the_set_database_boundary_without_gaps"),
+    }
+}
+
+/// The same short set, paged two at a time: the first page ends inside the top-up, the
+/// next ones are database-only. No id may repeat or vanish across that seam.
+async fn cursors_cross_the_boundary_with(store: &Store, state: &AppState, home: &Arc<HomeShards>) {
+    let pool = store.pool();
+    let author = create_account(pool, "author").await;
+    let reader = create_account(pool, "reader").await;
+    follow(pool, &reader, &author).await;
+    let reader_token = create_token(pool, &reader, &["read"]).await;
+
+    let mut ids = Vec::new();
+    for index in 0..6 {
+        ids.push(create_status(pool, &author, &format!("post {index}"), "public", &[], &[]).await);
+    }
+    home.push(
+        ids.last().expect("six ids"),
+        6,
+        std::slice::from_ref(&reader),
+    )
+    .await;
+
+    let app = app(state, home);
+    let mut seen = Vec::new();
+    let mut query = "?limit=2".to_owned();
+    for _ in 0..3 {
+        let page = home_ids_query(&app, &reader_token, &query).await;
+        assert_eq!(page.len(), 2, "a two-wide page mid-timeline is never short");
+        let last = page.last().expect("two ids").clone();
+        seen.extend(page);
+        query = format!("?limit=2&max_id={last}");
+    }
+    let expected: Vec<String> = ids.iter().rev().cloned().collect();
+    assert_eq!(
+        seen, expected,
+        "two-wide pages must cover the timeline exactly"
+    );
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "a row appeared twice across the seam"
+    );
+    assert!(
+        home_ids_query(&app, &reader_token, &query).await.is_empty(),
+        "the last page must hand out no cursor to an empty page"
+    );
+}
+
+#[tokio::test]
+async fn the_empty_set_and_big_account_still_take_the_sql_page() {
+    run_home_db_test(memory_caches(1), |store, state, home| async move {
+        the_empty_set_and_big_account_take_sql_with(&store, &state, &home).await;
+    })
+    .await;
+    match valkey_caches(1) {
+        Some(caches) => {
+            run_home_db_test(caches, |store, state, home| async move {
+                the_empty_set_and_big_account_take_sql_with(&store, &state, &home).await;
+            })
+            .await;
+        }
+        None => skip("the_empty_set_and_big_account_still_take_the_sql_page"),
+    }
+}
+
+/// Both cases the cache was already forbidden to answer: an empty set is a miss, and a
+/// reader who follows a big account needs the read-time merge. Neither may change.
+async fn the_empty_set_and_big_account_take_sql_with(
+    store: &Store,
+    state: &AppState,
+    home: &Arc<HomeShards>,
+) {
+    let pool = store.pool();
+    let sql_page = |account_id: String| async move {
+        let params = PageParams {
+            max_id: None,
+            since_id: None,
+            min_id: None,
+            limit: Some(PageSize::default_max(None).get()),
+        };
+        nodus_server_store::statuses::home_page(pool, &account_id, params)
+            .await
+            .expect("sql page")
+            .items
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    };
+
+    let author = create_account(pool, "author").await;
+    let reader = create_account(pool, "reader").await;
+    follow(pool, &reader, &author).await;
+    let reader_token = create_token(pool, &reader, &["read"]).await;
+    for index in 0..3 {
+        create_status(pool, &author, &format!("post {index}"), "public", &[], &[]).await;
+    }
+    let sql = sql_page(reader.clone()).await;
+    let app = app(state, home);
+    assert_eq!(
+        home_ids(&app, &reader_token).await,
+        sql,
+        "an empty set is a miss"
+    );
+
+    let big = create_account(pool, "bigauthor").await;
+    let big_reader = create_account(pool, "bigreader").await;
+    follow(pool, &big_reader, &big).await;
+    sqlx::query("UPDATE account SET followers_count = $2 WHERE id = $1")
+        .bind(&big)
+        .bind(nodus_server_core::limits::BIG_ACCOUNT_THRESHOLD)
+        .execute(pool)
+        .await
+        .expect("mark the author big");
+    let big_token = create_token(pool, &big_reader, &["read"]).await;
+    let mut big_ids = Vec::new();
+    for index in 0..2 {
+        big_ids.push(create_status(pool, &big, &format!("big {index}"), "public", &[], &[]).await);
+    }
+    // A non-empty set must not change the answer: a big account is merged at read time.
+    home.push(&big_ids[0], 1, std::slice::from_ref(&big_reader))
+        .await;
+    let sql = sql_page(big_reader.clone()).await;
+    assert_eq!(sql.len(), 2, "the big-account lane holds both posts");
+    assert_eq!(
+        home_ids(&app, &big_token).await,
+        sql,
+        "a reader who follows a big account still takes the sql page"
+    );
 }

@@ -15,6 +15,7 @@ use axum::Router;
 use serde_json::json;
 use sqlx::PgPool;
 
+use nodus_server_api::home::{self as home_timeline, HomeCache, HomeShards, MemoryHomeCache};
 use nodus_server_core::pagination::PageParams;
 use nodus_server_core::Id;
 use nodus_server_store::{accounts, media, polls, statuses, Store};
@@ -352,6 +353,110 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
         assert_page_render_decorations(&app, &token, &first_status, &mentioned).await;
 
         assert_misskey_page_is_flat(&app, &token, &log).await;
+        assert_a_cached_page_pays_only_for_its_shortfall(&store, &viewer, &log).await;
     })
     .await;
+}
+
+/// The cached read has exactly three possible statements: the big-account probe, the
+/// hydration of the ids it serves, and — only when the set runs out before `limit + 1`
+/// rows — the database page that shortfall needs. A set wider than the page narrows it
+/// and pays two. A set that exactly fills it still pays three, because an exhausted set
+/// cannot prove nothing older exists without asking the database; answering without that
+/// read would hand out no cursor and truncate the timeline it was meant to narrow.
+async fn assert_a_cached_page_pays_only_for_its_shortfall(
+    store: &Store,
+    viewer: &str,
+    log: &CapturedLog,
+) {
+    let sql_ids: Vec<String> = statuses::home_page(store.pool(), viewer, PageParams::new())
+        .await
+        .expect("home page")
+        .items
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(sql_ids.len(), 20, "the fixture has twenty entries");
+    let accounts = vec![viewer.to_owned()];
+
+    let full = HomeShards::new(
+        vec![Arc::new(MemoryHomeCache::new()) as Arc<dyn HomeCache>],
+        nodus_server_api::home::DEFAULT_CAP,
+    );
+    for (index, id) in sql_ids.iter().enumerate() {
+        let rank = i64::try_from(sql_ids.len() - index).expect("rank fits");
+        full.push(id, rank, &accounts).await;
+    }
+
+    // More ids than the page: the set narrows it, and the hot path stays probe+hydration.
+    clear(log);
+    let page = home_timeline::page(
+        store.pool(),
+        Some(&full),
+        viewer,
+        PageParams::new().with_limit(Some(10)),
+    )
+    .await
+    .expect("narrowed page");
+    assert_eq!(page.items.len(), 10, "the set narrows the page");
+    let narrowed = statements(log);
+    assert_eq!(
+        narrowed, 2,
+        "a set wider than the page pays the big-account probe and one hydration read, saw \
+         {narrowed}"
+    );
+    assert_eq!(
+        table_reads(log, "FROM timeline_entry"),
+        0,
+        "a set that can fill the page must not read the database page"
+    );
+
+    // Exactly a page of ids: the set is exhausted, so only the database can say whether
+    // anything older exists. Skipping that read would return no cursor and hide rows.
+    let exact = HomeShards::new(
+        vec![Arc::new(MemoryHomeCache::new()) as Arc<dyn HomeCache>],
+        nodus_server_api::home::DEFAULT_CAP,
+    );
+    for (index, id) in sql_ids.iter().enumerate() {
+        let rank = i64::try_from(sql_ids.len() - index).expect("rank fits");
+        exact.push(id, rank, &accounts).await;
+    }
+    clear(log);
+    let page = home_timeline::page(store.pool(), Some(&exact), viewer, PageParams::new())
+        .await
+        .expect("exactly full page");
+    assert_eq!(page.items.len(), 20, "the set fills the whole page");
+    let exact_statements = statements(log);
+    assert_eq!(
+        exact_statements, 3,
+        "an exactly-full set pays 3 = probe + hydration + shortfall read; it cannot know \
+         the database holds nothing older without asking, saw {exact_statements}"
+    );
+    assert_eq!(
+        table_reads(log, "FROM timeline_entry"),
+        1,
+        "the shortfall read is the one database page"
+    );
+
+    let short = HomeShards::new(
+        vec![Arc::new(MemoryHomeCache::new()) as Arc<dyn HomeCache>],
+        nodus_server_api::home::DEFAULT_CAP,
+    );
+    short.push(&sql_ids[0], 20, &accounts).await;
+    clear(log);
+    let page = home_timeline::page(store.pool(), Some(&short), viewer, PageParams::new())
+        .await
+        .expect("topped-up page");
+    assert_eq!(page.items.len(), 20, "the top-up restores the missing rows");
+    let short_statements = statements(log);
+    assert_eq!(
+        short_statements, exact_statements,
+        "a short set pays the same probe + hydration + shortfall read, saw \
+         {short_statements} against {exact_statements}"
+    );
+    assert_eq!(
+        table_reads(log, "FROM timeline_entry"),
+        1,
+        "the shortfall read is one query for the missing window, not one per row"
+    );
 }

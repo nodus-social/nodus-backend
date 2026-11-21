@@ -49,6 +49,8 @@ use sqlx::PgPool;
 
 use crate::AppState;
 
+mod topup;
+
 /// Entries one account's home timeline keeps by default.
 pub const DEFAULT_CAP: usize = 400;
 
@@ -700,6 +702,10 @@ fn env_count(name: &str, default: usize) -> usize {
 /// cache existed — for all four reasons a cache cannot be read: none configured, an empty
 /// timeline (a miss), a failed range, or a reader who follows a big account (whose posts
 /// are merged at read time and never materialised).
+///
+/// A non-empty set narrows the page; it never defines it. When the set yields fewer rows
+/// than `limit + 1`, the database page for the same cursors is merged in, so a cache that
+/// was created after history existed or that missed a fan-out cannot hide that history.
 pub async fn page(
     pool: &PgPool,
     home: Option<&HomeShards>,
@@ -784,15 +790,18 @@ async fn cached_page(
             .iter()
             .filter_map(|id| by_id.remove(id.as_str()))
             .collect();
-        if items.len() > limit || take == ordered.len() {
+        if items.len() > limit {
             // Same rule as `statuses::finish`: one extra row is what says "there is more".
-            let next_max_id = if items.len() > limit {
-                items.truncate(limit);
-                items.last().map(|row| row.id.clone())
-            } else {
-                None
-            };
+            items.truncate(limit);
+            let next_max_id = items.last().map(|row| row.id.clone());
             return Ok(Some(StatusPage { items, next_max_id }));
+        }
+        if take == ordered.len() {
+            // The set is exhausted and still short of a page: it narrows the timeline,
+            // it does not define it. Read the missing window under the same cursors and
+            // merge, so the hot path above — a set that fills the page — gains no query.
+            let sql = statuses::home_page(pool, account_id, params).await?;
+            return Ok(Some(topup::merge(items, sql, size, params.order())));
         }
         take = (take * 2).min(ordered.len());
     }
