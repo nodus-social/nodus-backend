@@ -933,9 +933,26 @@ async fn fetch_remote_actor(
     upsert_remote_actor(state, actor_url, domain, &actor).await
 }
 
+/// Whether an inbound document may name this URL.
+///
+/// Federation is `https` because a peer's identity is the origin its signature is checked
+/// against: plain http lets anyone on the path rewrite the key document and then vouch
+/// for themselves. A lab peer in development mode has no certificate, so the same escape
+/// hatch the outbound client uses must apply on the way in as well: an `http` URL is
+/// accepted only when its host is named in `NODUS_ALLOW_INSECURE_PEERS`, the single
+/// definition of "this host may be plain http in this deployment". Nothing else widens:
+/// the private-address rule below still rejects a named host that is an address literal or
+/// an internal name, so the operator's cost is exactly the readability and modifiability
+/// of traffic to that host.
 pub(crate) fn validate_remote_url(raw: &str) -> ApiResult<url::Url> {
     let parsed = url::Url::parse(raw).map_err(|_| ApiError::unprocessable("URL must be valid"))?;
-    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ApiError::unprocessable("URL must be a public HTTPS URL"));
+    }
+    // `scheme_allowed` accepts `https` for everyone and `http` only for a named host; with
+    // the variable unset this is the previous `scheme == "https"` check exactly.
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if !crate::remote::scheme_allowed(parsed.scheme(), &host) {
         return Err(ApiError::unprocessable("URL must be a public HTTPS URL"));
     }
     match parsed.host() {

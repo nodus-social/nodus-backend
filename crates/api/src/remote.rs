@@ -230,8 +230,10 @@ fn is_insecure_peer(host: &str) -> bool {
 ///
 /// `https` is the transport for everyone. `http` is permitted only for a host the
 /// operator named in `NODUS_ALLOW_INSECURE_PEERS`; every other scheme is not a
-/// federation transport at all.
-fn scheme_allowed(scheme: &str, host: &str) -> bool {
+/// federation transport at all. Both directions use this one decision: the outbound
+/// client when it dials a peer, and `activitypub::validate_remote_url` when an inbound
+/// document or a signer names a URL.
+pub(crate) fn scheme_allowed(scheme: &str, host: &str) -> bool {
     scheme_allowed_with(scheme, host, insecure_peer_hosts())
 }
 
