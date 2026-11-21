@@ -491,8 +491,19 @@ impl HomeShards {
     pub fn from_env() -> Option<Arc<Self>> {
         let url = match std::env::var("NODUS_VALKEY_URL") {
             Ok(url) if !url.trim().is_empty() => url,
-            _ => {
-                tracing::info!("NODUS_VALKEY_URL is unset: home timelines read from the database");
+            Ok(_) => {
+                tracing::warn!(
+                    "NODUS_VALKEY_URL is empty: the home cache is off and home timelines take the \
+                     pull path from the database; set a URL behind a multi-process deployment"
+                );
+                return None;
+            }
+            Err(_) => {
+                tracing::info!(
+                    "NODUS_VALKEY_URL is unset: home timelines take the pull path from the \
+                     database, which is correct for one process and wrong behind a multi-process \
+                     deployment"
+                );
                 return None;
             }
         };
