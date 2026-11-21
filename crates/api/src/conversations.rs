@@ -69,9 +69,8 @@ pub async fn list(
     let mut participant_ids: Vec<String> = by_root.values().flatten().cloned().collect();
     participant_ids.sort_unstable();
     participant_ids.dedup();
-    let mut participant_rows: nodus_server_store::RowMap<
-        nodus_server_store::accounts::AccountRow,
-    > = nodus_server_store::RowMap::new();
+    let mut participant_rows: nodus_server_store::RowMap<nodus_server_store::accounts::AccountRow> =
+        nodus_server_store::RowMap::new();
     if !participant_ids.is_empty() {
         participant_rows = state
             .store()

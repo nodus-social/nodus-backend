@@ -182,7 +182,13 @@ async fn batch(
                 let mut authors: nodus_server_store::RowMap<accounts::AccountRow> =
                     nodus_server_store::RowMap::new();
                 if !author_ids.is_empty() {
-                    authors = state.store().batch().accounts(&author_ids).run().await?.accounts;
+                    authors = state
+                        .store()
+                        .batch()
+                        .accounts(&author_ids)
+                        .run()
+                        .await?
+                        .accounts;
                 }
                 let mut items = Vec::with_capacity(page.items.len());
                 for row in &page.items {

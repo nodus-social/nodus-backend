@@ -22,8 +22,8 @@ use nodus_server_api::{root_router, AppState, InstanceConfig};
 use nodus_server_core::Id;
 use nodus_server_sdk::activitypub::Actor;
 use nodus_server_store::accounts::{self, NewAccount, RemoteAccount};
-use nodus_server_store::statuses::{self, NewRemoteStatus};
 use nodus_server_store::remote_moderation::NewRemoteModeration;
+use nodus_server_store::statuses::{self, NewRemoteStatus};
 use nodus_server_store::{apps, delivery, remote_moderation, Store};
 
 fn instance_config() -> InstanceConfig {
