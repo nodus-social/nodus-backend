@@ -1164,12 +1164,12 @@ pub async fn create_with_poll(
     media_ids: &[String],
     mention_ids: &[String],
     tags: &[String],
-    poll: Option<&crate::polls::NewPoll<'_>>,
+    new_poll: Option<&crate::polls::NewPoll<'_>>,
 ) -> Result<StatusRow, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let row = insert_row(&mut tx, new).await?;
-    if let Some(poll) = poll {
-        crate::polls::create_in_tx(&mut tx, poll).await?;
+    if let Some(new_poll) = new_poll {
+        crate::polls::create_in_tx(&mut tx, new_poll).await?;
     }
 
     if !media_ids.is_empty() {

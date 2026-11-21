@@ -277,10 +277,8 @@ pub async fn escalate_in(
     .unwrap_or((false, false));
     let current = if suspended {
         2
-    } else if silenced {
-        1
     } else {
-        0
+        i32::from(silenced)
     };
     let strengthens = step.weight() > current;
 

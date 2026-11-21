@@ -491,6 +491,14 @@ impl Command {
     }
 
     /// Splits a command into the statement and the slot its answer will be sent to.
+    ///
+    /// One arm per command: the arm moves the command's fields into the mutation and hands
+    /// the reply slot over, so a helper per arm would be a second place naming the same
+    /// fields. Length is the shape of the command set, not of one operation.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat match arm per command; splitting it would duplicate every field"
+    )]
     fn into_parts(self) -> (Mutation, Reply) {
         match self {
             Self::CreateFolder {

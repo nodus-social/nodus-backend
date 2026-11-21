@@ -1025,7 +1025,7 @@ pub async fn suggestions(
     limit: i64,
 ) -> Result<Vec<AccountRow>, sqlx::Error> {
     let sql = format!(
-        "SELECT {columns} FROM account a \
+        "SELECT {ACCOUNT_COLUMNS_ALIASED} FROM account a \
           WHERE a.id <> $1 AND a.local AND a.approved AND a.discoverable \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL AND a.deleted_at IS NULL \
             AND NOT EXISTS ( \
@@ -1038,7 +1038,6 @@ pub async fn suggestions(
                      OR (r.account_id = a.id AND r.target_account_id = $1))) \
           ORDER BY a.last_status_at DESC NULLS LAST, a.followers_count DESC, a.username ASC \
           LIMIT $2",
-        columns = ACCOUNT_COLUMNS_ALIASED,
     );
     sqlx::query_as(&sql)
         .bind(viewer_id)

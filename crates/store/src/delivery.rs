@@ -185,6 +185,12 @@ pub async fn enqueue_actor_update(
     // One actor, one pending update: the id of the activity already in the queue is reused
     // so the `(inbox_url, activity_id)` conflict turns this save into an object replacement.
     let prefix = format!("{actor}#updates/");
+    // The window is a whole number of seconds far inside f64's exact integer range, and
+    // `make_interval` takes its seconds as a float, so the cast cannot lose anything.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a whole number of seconds this small is exact in f64"
+    )]
     let existing: Option<(String,)> = sqlx::query_as(
         "SELECT activity_id FROM federation_delivery \
           WHERE account_id = $1 AND delivered_at IS NULL \
@@ -198,7 +204,7 @@ pub async fn enqueue_actor_update(
     .fetch_optional(pool)
     .await?;
     if let Some((id,)) = existing {
-        activity_id = id.clone();
+        activity_id.clone_from(&id);
         if let Some(map) = activity.as_object_mut() {
             map.insert("id".to_owned(), Value::String(id));
         }

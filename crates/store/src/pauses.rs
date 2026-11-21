@@ -47,6 +47,17 @@ pub struct NewDomainPause<'a> {
     pub created_by: Option<&'a str>,
 }
 
+/// What `RETURNING` hands back from [`upsert`]: the pause's columns in the order
+/// [`row_from`] takes them, plus the `xmax = 0` flag that tells an insert from an update.
+type UpsertedPause = (
+    String,
+    String,
+    Option<DateTime<Utc>>,
+    Option<String>,
+    DateTime<Utc>,
+    bool,
+);
+
 fn row_from(
     (domain, reason, expires_at, created_by, created_at): (
         String,
@@ -73,14 +84,7 @@ pub async fn upsert(
     pool: &PgPool,
     pause: &NewDomainPause<'_>,
 ) -> Result<(DomainPauseRow, bool), sqlx::Error> {
-    let inserted: (
-        String,
-        String,
-        Option<DateTime<Utc>>,
-        Option<String>,
-        DateTime<Utc>,
-        bool,
-    ) = sqlx::query_as(
+    let inserted: UpsertedPause = sqlx::query_as(
         "INSERT INTO domain_pause (domain, reason, expires_at, created_by) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (domain) DO UPDATE \

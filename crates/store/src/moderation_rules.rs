@@ -419,7 +419,7 @@ pub async fn screen(
                 // Creation validates the pattern, so this is a row written by hand. It is
                 // recorded and skipped: an ingest must not fail because a rule is broken.
                 moderation::audit_in_as(
-                    &mut *tx,
+                    &mut tx,
                     None,
                     "moderation_rule_error",
                     "moderation_rule",
@@ -452,7 +452,7 @@ pub async fn screen(
             _ => None,
         } {
             moderation::apply_action_noted_in(
-                &mut *tx,
+                &mut tx,
                 account_id,
                 action,
                 &moderation::Notice {
@@ -468,7 +468,7 @@ pub async fn screen(
         }
 
         let report = moderation::create_report_in(
-            &mut *tx,
+            &mut tx,
             &NewReport {
                 account_id: None,
                 target_account_id: account_id,
@@ -487,7 +487,7 @@ pub async fn screen(
             .await?;
 
         moderation::audit_in_as(
-            &mut *tx,
+            &mut tx,
             None,
             "moderation_rule_fired",
             "moderation_rule",
