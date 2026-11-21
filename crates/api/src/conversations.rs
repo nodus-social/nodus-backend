@@ -152,18 +152,8 @@ pub async fn read(
         &last_read,
     )
     .await?;
-    let mut accounts = Vec::new();
-    for (_, account_id) in nodus_server_store::conversations::participants(
-        pool,
-        &auth.0.account.id,
-        std::slice::from_ref(&id),
-    )
-    .await?
-    {
-        if let Some(account) = state.store().account(&account_id).await? {
-            accounts.push(AccountDto::from_row(&account, state.instance()));
-        }
-    }
+    let mut accounts = participant_dtos(&state, &auth, &id).await?;
+    accounts.shrink_to_fit();
     let last_status = match nodus_server_store::statuses::by_id(pool, &row.last_status_id).await? {
         Some(status) => Some(statuses::dto(&state, &status, Some(&auth)).await?),
         None => None,
@@ -227,18 +217,7 @@ async fn conversation_dto(
     row: &nodus_server_store::conversations::ConversationRow,
 ) -> ApiResult<ConversationDto> {
     let pool = state.store().pool();
-    let mut accounts = Vec::new();
-    for (_, account_id) in nodus_server_store::conversations::participants(
-        pool,
-        &auth.0.account.id,
-        std::slice::from_ref(&row.root_id),
-    )
-    .await?
-    {
-        if let Some(account) = state.store().account(&account_id).await? {
-            accounts.push(AccountDto::from_row(&account, state.instance()));
-        }
-    }
+    let accounts = participant_dtos(state, auth, &row.root_id).await?;
     let last_status = match nodus_server_store::statuses::by_id(pool, &row.last_status_id).await? {
         Some(status) => Some(statuses::dto(state, &status, Some(auth)).await?),
         None => None,
@@ -256,6 +235,35 @@ async fn conversation_dto(
         accounts,
         last_status,
     })
+}
+
+/// One thread's participants as payloads, their rows read in one statement.
+///
+/// A thread is a single subject, but its participants are a page of accounts: the
+/// participant list names them all, and one batch answers for all of them.
+async fn participant_dtos(state: &AppState, auth: &Auth, root: &str) -> ApiResult<Vec<AccountDto>> {
+    let mut ids: Vec<String> = nodus_server_store::conversations::participants(
+        state.store().pool(),
+        &auth.0.account.id,
+        std::slice::from_ref(&root.to_owned()),
+    )
+    .await?
+    .into_iter()
+    .map(|(_, account_id)| account_id)
+    .collect();
+    // The join can name a person once per message; ask for each of them once.
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = state.store().batch().accounts(&ids).run().await?.accounts;
+    // A participant whose account row is gone is omitted rather than defaulted.
+    Ok(ids
+        .iter()
+        .filter_map(|id| rows.get(id))
+        .map(|account| AccountDto::from_row(account, state.instance()))
+        .collect())
 }
 
 /// The router fragment, mounted by `crate::router`.

@@ -11,9 +11,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use nodus_server_store::accounts::AccountRow;
 use nodus_server_store::moderation::{self, NewReport, ReportRow};
 use nodus_server_store::rules as store_rules;
 use nodus_server_store::statuses;
+use nodus_server_store::RowMap;
 
 use super::Body;
 use crate::auth::Auth;
@@ -57,9 +59,48 @@ pub struct ReportRuleDto {
     pub text: Option<String>,
 }
 
+/// The accounts one report names: the reporter, the target, the assignee and the
+/// moderator who acted. Sorted and deduplicated, so a report that names the same person
+/// twice (the reporter assigned to their own report, say) asks for them once.
+fn named_account_ids(rows: &[ReportRow]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::with_capacity(rows.len() * 4);
+    for row in rows {
+        ids.extend(row.account_id.iter().cloned());
+        ids.push(row.target_account_id.clone());
+        ids.extend(row.assigned_account_id.iter().cloned());
+        ids.extend(row.action_taken_by_account_id.iter().cloned());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Every account a page of reports names, read in one statement.
+///
+/// A row that does not exist is absent from the map, so each field keeps its own
+/// `Option` rather than being filled with a default account. A single report reads its
+/// own smaller set the same way: one path decides which accounts a report needs.
+async fn report_accounts(state: &AppState, rows: &[ReportRow]) -> ApiResult<RowMap<AccountRow>> {
+    let ids = named_account_ids(rows);
+    if ids.is_empty() {
+        return Ok(RowMap::new());
+    }
+    Ok(state.store().batch().accounts(&ids).run().await?.accounts)
+}
+
+/// One report with its accounts, read in a batch of its own.
+async fn one_report_dto(state: &AppState, row: ReportRow) -> ApiResult<ReportDto> {
+    let accounts = report_accounts(state, std::slice::from_ref(&row)).await?;
+    report_dto(state, row, &accounts).await
+}
+
 /// Builds one report for the queue. Statuses are hydrated in order: a report is about a
 /// handful of posts, and a moderator reads them, so the cost is worth paying once.
-pub(super) async fn report_dto(state: &AppState, row: ReportRow) -> ApiResult<ReportDto> {
+pub(super) async fn report_dto(
+    state: &AppState,
+    row: ReportRow,
+    accounts: &RowMap<AccountRow>,
+) -> ApiResult<ReportDto> {
     let pool = state.store().pool();
     let mut hydrated = Vec::with_capacity(row.status_ids.len());
     for id in &row.status_ids {
@@ -69,19 +110,16 @@ pub(super) async fn report_dto(state: &AppState, row: ReportRow) -> ApiResult<Re
     }
     // The instance files some reports itself (a content-set match), so a report may have
     // no reporter account; the console renders the field as optional either way.
-    let reporter = match row.account_id.as_deref() {
-        Some(id) => state.store().account(id).await?,
-        None => None,
-    };
-    let target = state.store().account(&row.target_account_id).await?;
-    let assigned = match row.assigned_account_id.as_deref() {
-        Some(id) => state.store().account(id).await?,
-        None => None,
-    };
-    let action_by = match row.action_taken_by_account_id.as_deref() {
-        Some(id) => state.store().account(id).await?,
-        None => None,
-    };
+    let reporter = row.account_id.as_deref().and_then(|id| accounts.get(id));
+    let target = accounts.get(&row.target_account_id);
+    let assigned = row
+        .assigned_account_id
+        .as_deref()
+        .and_then(|id| accounts.get(id));
+    let action_by = row
+        .action_taken_by_account_id
+        .as_deref()
+        .and_then(|id| accounts.get(id));
     // A citation outlives the rule it names. Resolve what still exists and mark the rest
     // rather than dropping them: the console has to be able to say "rule 4 (deleted)".
     let cited = store_rules::by_ids(pool, &row.rule_ids).await?;
@@ -113,13 +151,13 @@ pub(super) async fn report_dto(state: &AppState, row: ReportRow) -> ApiResult<Re
         action_taken: row.action_taken,
         action_taken_note: row.action_taken_note,
         action_taken_at: row.action_taken_at,
-        action_taken_by: action_by.map(|account| AccountDto::from_row(&account, instance)),
+        action_taken_by: action_by.map(|account| AccountDto::from_row(account, instance)),
         assigned_account_id: row.assigned_account_id,
-        assigned_account: assigned.map(|account| AccountDto::from_row(&account, instance)),
+        assigned_account: assigned.map(|account| AccountDto::from_row(account, instance)),
         created_at: row.created_at,
         updated_at: row.updated_at,
-        reporter: reporter.map(|account| AccountDto::from_row(&account, instance)),
-        target_account: target.map(|account| AccountDto::from_row(&account, instance)),
+        reporter: reporter.map(|account| AccountDto::from_row(account, instance)),
+        target_account: target.map(|account| AccountDto::from_row(account, instance)),
         statuses: hydrated,
     })
 }
@@ -157,9 +195,11 @@ async fn list(
         },
     )
     .await?;
+    // One read for the whole page's accounts, whatever the page length.
+    let accounts = report_accounts(&state, &rows).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        out.push(report_dto(&state, row).await?);
+        out.push(report_dto(&state, row, &accounts).await?);
     }
     Ok(Json(out))
 }
@@ -173,7 +213,7 @@ async fn detail(
     let row = moderation::report(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("that report does not exist"))?;
-    Ok(Json(report_dto(&state, row).await?))
+    Ok(Json(one_report_dto(&state, row).await?))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -219,7 +259,7 @@ async fn resolve(
         json!({ "note": note.trim() }),
     )
     .await?;
-    Ok(Json(report_dto(&state, row).await?))
+    Ok(Json(one_report_dto(&state, row).await?))
 }
 
 async fn reopen(
@@ -232,7 +272,7 @@ async fn reopen(
         .await?
         .ok_or_else(|| ApiError::not_found("that report does not exist"))?;
     audit_write_detail(&state, &auth, "reopen_report", "report", &row.id, json!({})).await?;
-    Ok(Json(report_dto(&state, row).await?))
+    Ok(Json(one_report_dto(&state, row).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,7 +306,7 @@ async fn assign(
         json!({ "account_id": body.account_id }),
     )
     .await?;
-    Ok(Json(report_dto(&state, row).await?))
+    Ok(Json(one_report_dto(&state, row).await?))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -379,7 +419,7 @@ async fn create(
             );
         }
     }
-    Ok(Json(report_dto(&state, row).await?))
+    Ok(Json(one_report_dto(&state, row).await?))
 }
 
 #[derive(Debug, Deserialize)]
