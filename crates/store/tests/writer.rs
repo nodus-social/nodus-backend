@@ -6,7 +6,7 @@
 //! background queue. Each test seeds an account of its own and deletes it again, so the
 //! shared database is left as it was found.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -227,45 +227,82 @@ async fn ten_commands_commit_in_one_batch() {
 }
 
 /// A high-priority write is not starved behind a long background queue.
+///
+/// The actor is held at the database instead of being assumed not to have run: a
+/// `FOR UPDATE` on the account row blocks the foreign-key check every folder insert makes,
+/// so no batch commits — and the actor collects no second batch — until the queue is full.
+/// What is asserted afterwards is the order of the commits, which is what priority means
+/// and does not depend on how the runtime interleaved the enqueue loop with the actor.
 #[tokio::test]
 async fn high_priority_is_not_starved() {
+    let recorder = Arc::new(Recorder::default());
     let config = WriterConfig {
         batch_size: 8,
         flush_window: Duration::from_millis(5),
+        sink: Some(recorder.clone()),
         ..WriterConfig::default()
     };
     let Some((writer, pool, account)) = setup(config).await else {
         return;
     };
 
-    let finished = Arc::new(AtomicUsize::new(0));
+    // Every folder insert checks the account's foreign key, so locking that row parks the
+    // actor inside its first batch and the bulk queue is still full when `urgent` arrives.
+    let mut block = pool.begin().await.expect("begin the blocking transaction");
+    let locked: Option<String> =
+        sqlx::query_scalar("SELECT id FROM account WHERE id = $1 FOR UPDATE")
+            .bind(&account)
+            .fetch_optional(&mut *block)
+            .await
+            .expect("lock the account row");
+    assert!(locked.is_some(), "the seeded account is there to lock");
+
+    let mut bulk = Vec::with_capacity(100);
     for index in 0..100 {
         let (command, reply) = Command::create_folder(&account, None, &format!("bulk {index}"));
         writer
             .enqueue(Channel::Bulk, command)
             .await
             .expect("enqueue bulk");
-        let finished = Arc::clone(&finished);
-        tokio::spawn(async move {
-            if reply.await.is_ok_and(|result| result.is_ok()) {
-                finished.fetch_add(1, Ordering::SeqCst);
-            }
-        });
+        bulk.push(reply);
     }
-
-    // Nothing above yielded, so the actor has not run yet: its first batch sees a full
-    // bulk queue and this one high-priority write, and must take the high one first.
+    let (command, urgent_reply) = Command::create_folder(&account, None, "urgent");
     writer
-        .create_folder(&account, None, "urgent")
+        .enqueue(Channel::High, command)
         .await
-        .expect("high-priority write");
+        .expect("enqueue the urgent write");
 
-    let done = finished.load(Ordering::SeqCst);
-    assert!(
-        done < 100,
-        "the high write waited for {done} of 100 bulk writes"
-    );
+    block.commit().await.expect("release the account row");
+
+    let urgent = urgent_reply
+        .await
+        .expect("urgent reply")
+        .expect("high-priority write");
+    for reply in bulk {
+        reply.await.expect("bulk reply").expect("bulk write");
+    }
     assert_eq!(writer.metrics().bulk, 100);
+
+    let urgent_key = key(&account, InvalidationKind::Folder, urgent.id);
+    let calls = recorder.calls();
+    // Only one batch was ever in flight while the lock was held, so the urgent write is in
+    // that batch or in the one collected immediately after the lock was released.
+    let committed_in = calls
+        .iter()
+        .position(|keys| keys.contains(&urgent_key))
+        .expect("the urgent write invalidated its folder");
+    assert!(
+        committed_in <= 1,
+        "the urgent write committed in batch {committed_in}, behind the bulk queue"
+    );
+    assert_eq!(
+        calls[committed_in][0], urgent_key,
+        "the urgent write leads its batch"
+    );
+    assert!(
+        committed_in + 1 < calls.len(),
+        "bulk work was still queued when the urgent write committed"
+    );
 
     cleanup(&pool, &account).await;
 }
