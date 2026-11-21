@@ -5,7 +5,6 @@
 //! `aid` mapping lives in `external_id`.
 
 use std::collections::BTreeMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -14,7 +13,6 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -25,13 +23,14 @@ use nodus_server_core::limits::STATUS_MAX_CHARS;
 use nodus_server_core::pagination::{PageParams, PageSize};
 use nodus_server_core::Visibility;
 use nodus_server_sdk::misskey::api::{File, Meta, Note, NoteVisibility, User};
-use nodus_server_sdk::misskey::{Aid, Reaction};
+use nodus_server_sdk::misskey::Reaction;
 use nodus_server_store::accounts::{self, AccountRow, Authenticated};
 use nodus_server_store::media::{self, MediaRow};
 use nodus_server_store::statuses::{self, StatusRow};
 use nodus_server_store::{events, external_ids, social};
 
 use crate::error::{ApiError, ApiResult};
+use crate::misskey_page::{page_dialect_id, page_reads, user_for, user_for_with, PageReads};
 use crate::state::AppState;
 
 /// Misskey routes, with `AppState` still to be attached by the caller.
@@ -71,89 +70,6 @@ async fn authenticate(state: &AppState, token: Option<&str>) -> ApiResult<Authen
         .ok_or_else(|| ApiError::unauthorized("Authentication required"))
 }
 
-async fn dialect_id(
-    state: &AppState,
-    kind: &str,
-    local_id: &str,
-    created_at: DateTime<Utc>,
-) -> ApiResult<String> {
-    let pool = state.store().pool();
-    if let Some(existing) = external_ids::by_local(pool, kind, local_id).await? {
-        return Ok(existing);
-    }
-    let timestamp_ms = u64::try_from(created_at.timestamp_millis()).unwrap_or_default();
-    for attempt in 0..8_u16 {
-        let mut hasher = DefaultHasher::new();
-        local_id.hash(&mut hasher);
-        attempt.hash(&mut hasher);
-        let candidate = Aid::from_parts(
-            timestamp_ms,
-            u16::try_from(hasher.finish() % 1000).unwrap_or_default(),
-        )
-        .as_str();
-        if let Some(id) = external_ids::get_or_create(pool, kind, local_id, &candidate).await? {
-            return Ok(id);
-        }
-    }
-    Err(ApiError::new(
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        "Could not allocate an external id",
-    ))
-}
-
-async fn user_for(state: &AppState, account: &AccountRow) -> ApiResult<User> {
-    let id = dialect_id(state, "account", &account.id, account.created_at).await?;
-    Ok(User {
-        id,
-        username: account.username.clone(),
-        name: Some(account.display_name.clone()).filter(|name| !name.is_empty()),
-        host: account.domain.clone(),
-        description: Some(account.note.clone()).filter(|note| !note.is_empty()),
-        avatar_url: account.avatar_ref.clone(),
-        banner_url: account.header_ref.clone(),
-        is_bot: account.bot,
-        is_cat: false,
-        is_admin: false,
-        is_moderator: false,
-        is_locked: account.locked,
-        is_suspended: account.suspended_at.is_some(),
-        followers_count: u64::try_from(account.followers_count).unwrap_or_default(),
-        following_count: u64::try_from(account.following_count).unwrap_or_default(),
-        notes_count: u64::try_from(account.statuses_count).unwrap_or_default(),
-        created_at: Some(account.created_at.to_rfc3339()),
-        uri: account.uri.clone(),
-        moved_to_uri: account.moved_to.clone(),
-        also_known_as: account.also_known_as.clone(),
-    })
-}
-
-/// Reaction chips, attachments and decorations for a whole page of notes, fetched together.
-struct PageReads {
-    reactions: nodus_server_store::RowMap<Vec<statuses::ReactionCount>>,
-    media: nodus_server_store::RowMap<Vec<MediaRow>>,
-    decorations: nodus_server_store::RowMap<nodus_server_store::StatusDecorations>,
-}
-
-/// Reads a page's reaction chips, attachments and decorations in one batch.
-///
-/// The reaction op is optional by design: a page that cannot read reaction counts still
-/// renders, with no chips, rather than failing as a whole.
-async fn page_reads(state: &AppState, ids: &[String]) -> ApiResult<PageReads> {
-    let outcome = state
-        .store()
-        .batch()
-        .media_by_status(ids)
-        .reactions(ids)
-        .decorations(ids)
-        .run()
-        .await?;
-    Ok(PageReads {
-        reactions: outcome.reactions.unwrap_or_default(),
-        media: outcome.media_by_status,
-        decorations: outcome.decorations,
-    })
-}
-
 /// A note's tags and custom emoji: the page's parked read when there is one, one note's
 /// own tables when there is not.
 ///
@@ -181,8 +97,8 @@ async fn note_for(
     viewer_id: Option<&str>,
     reads: Option<&PageReads>,
 ) -> ApiResult<Note> {
-    let id = dialect_id(state, "status", &row.id, row.created_at).await?;
-    let user_id = dialect_id(state, "account", &account.id, account.created_at).await?;
+    let id = page_dialect_id(state, "status", &row.id, row.created_at, reads).await?;
+    let user_id = page_dialect_id(state, "account", &account.id, account.created_at, reads).await?;
     // A page loop passes what it already read; a single-note endpoint, or a renote that is
     // not on the page, still asks for one note's worth on its own.
     let fetched;
@@ -215,7 +131,8 @@ async fn note_for(
             Some(inner)
                 if crate::statuses::can_view_for_viewer(state, viewer_id, &inner).await? =>
             {
-                let inner_id = dialect_id(state, "status", &inner.id, inner.created_at).await?;
+                let inner_id =
+                    page_dialect_id(state, "status", &inner.id, inner.created_at, reads).await?;
                 let inner_note =
                     match accounts::by_id(state.store().pool(), &inner.account_id).await? {
                         Some(author) => Some(Box::new(
@@ -234,7 +151,7 @@ async fn note_for(
             Some(inner)
                 if crate::statuses::can_view_for_viewer(state, viewer_id, &inner).await? =>
             {
-                Some(dialect_id(state, "status", &inner.id, inner.created_at).await?)
+                Some(page_dialect_id(state, "status", &inner.id, inner.created_at, reads).await?)
             }
             _ => None,
         },
@@ -244,7 +161,7 @@ async fn note_for(
         id,
         created_at: row.created_at.to_rfc3339(),
         user_id,
-        user: Some(user_for(state, account).await?),
+        user: Some(user_for_with(state, account, reads).await?),
         text: Some(row.content.clone()).filter(|text| !text.is_empty()),
         cw: Some(row.spoiler_text.clone()).filter(|cw| !cw.is_empty()),
         visibility: visibility_out(&row.visibility),
@@ -458,7 +375,7 @@ async fn user_notes(
     }
     let page = statuses::account_page(state.store().pool(), &account.id, params).await?;
     let ids: Vec<String> = page.items.iter().map(|row| row.id.clone()).collect();
-    let reads = page_reads(&state, &ids).await?;
+    let reads = page_reads(&state, &ids, std::slice::from_ref(&account.id)).await?;
     let mut notes = Vec::with_capacity(page.items.len());
     for row in &page.items {
         notes.push(note_for(&state, row, &account, Some(&auth.account.id), Some(&reads)).await?);
@@ -702,12 +619,14 @@ async fn timeline(
         .media_by_status(&ids)
         .reactions(&ids)
         .decorations(&ids)
+        .external_ids(&ids, &author_ids)
         .run()
         .await?;
     let reads = PageReads {
         reactions: hydrated.reactions.unwrap_or_default(),
         media: hydrated.media_by_status,
         decorations: hydrated.decorations,
+        external: hydrated.external_ids,
     };
     let mut notes = Vec::with_capacity(page.items.len());
     for row in &page.items {

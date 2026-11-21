@@ -36,6 +36,7 @@ pub mod media;
 pub mod meta;
 pub mod miauth;
 pub mod misskey;
+mod misskey_page;
 pub mod nodus;
 pub mod notifications;
 pub mod outbox;

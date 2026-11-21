@@ -3,9 +3,9 @@
 //! The Mastodon timeline used to read each author and each status's attachments on its
 //! own, so a page of twenty posts paid twenty account queries. This binary captures
 //! sqlx's statement log and measures the same endpoint at N=1 and N=20: the count must
-//! not grow. Misskey still maps every note and author through `external_id` row by row,
-//! so its total stays linear; the test pins that the reaction and attachment reads
-//! themselves are one query each, not one per note.
+//! not grow. Misskey names every note and author through `external_id`; the page reads
+//! all of those mappings in one statement, so its total is also flat, and a per-note
+//! regression shows up in the pinned `external_id` read count.
 
 mod support;
 
@@ -158,7 +158,7 @@ async fn misskey_page_stats(
     token: &str,
     log: &CapturedLog,
     limit: u32,
-) -> (usize, usize, usize, usize) {
+) -> (usize, usize, usize, usize, usize) {
     clear(log);
     let (status, body) = send(
         app,
@@ -179,6 +179,7 @@ async fn misskey_page_stats(
         table_reads(log, "FROM status_reaction"),
         table_reads(log, "FROM media_attachment"),
         table_reads(log, "FROM status_tag"),
+        table_reads(log, "FROM external_id"),
     )
 }
 
@@ -210,6 +211,54 @@ async fn assert_page_render_decorations(
     assert!(
         first["mentions"][0]["acct"].is_string(),
         "a mention without acct is a client decode failure: {first}"
+    );
+}
+
+/// The Misskey page's reads are flat too: every table is read once, including the page's
+/// dialect ids.
+async fn assert_misskey_page_is_flat(app: &Router, token: &str, log: &CapturedLog) {
+    // Misskey names every note and author through `external_id`. Allocating a
+    // missing mapping is a write path and stays row by row, so warm the page once;
+    // the measured request is the read path a returning client sees.
+    let _ = misskey_page_stats(app, token, log, 20).await;
+    let (misskey_twenty, reaction_reads, media_reads, tag_reads, external_reads) =
+        misskey_page_stats(app, token, log, 20).await;
+    let (misskey_one, one_reaction, one_media, one_tag, one_external) =
+        misskey_page_stats(app, token, log, 1).await;
+    assert_eq!(
+        misskey_one, misskey_twenty,
+        "a page of twenty must cost the same statements as a page of one \
+         (N=1 {misskey_one}, N=20 {misskey_twenty})"
+    );
+    assert_eq!(
+        reaction_reads, 1,
+        "twenty notes should read the reaction table once, saw {reaction_reads}"
+    );
+    assert_eq!(
+        media_reads, 1,
+        "twenty notes should read attachments once, saw {media_reads}"
+    );
+    assert_eq!(
+        tag_reads, 1,
+        "twenty notes should read tags and emoji once, saw {tag_reads}"
+    );
+    // One statement covers the page's status ids and its authors' account ids. A
+    // per-note regression would read `external_id` at least once per note or author.
+    assert_eq!(
+        (one_external, external_reads),
+        (1, 1),
+        "twenty notes should read external ids once for the whole page, saw \
+         {external_reads} (N=1 saw {one_external})"
+    );
+    assert_eq!(
+        (one_reaction, one_media, one_tag),
+        (1, 1, 1),
+        "the single note's page should read each table once"
+    );
+    eprintln!(
+        "misskey home timeline: N=1 {misskey_one} statements, N=20 {misskey_twenty} \
+         statements ({reaction_reads} reaction read, {media_reads} attachment read, \
+          {tag_reads} tag read, {external_reads} external_id read)"
     );
 }
 
@@ -302,30 +351,7 @@ async fn a_feed_page_reads_the_same_statements_at_any_page_size() {
 
         assert_page_render_decorations(&app, &token, &first_status, &mentioned).await;
 
-        // Misskey maps each note and author through `external_id` one row at a time, so
-        // its total is still linear. What this pass batched — reactions and attachments —
-        // must be one read for the page, not one per note.
-        let (misskey_twenty, reaction_reads, media_reads, tag_reads) =
-            misskey_page_stats(&app, &token, &log, 20).await;
-        let (misskey_one, _, _, _) = misskey_page_stats(&app, &token, &log, 1).await;
-        assert_eq!(
-            reaction_reads, 1,
-            "twenty notes should read the reaction table once, saw {reaction_reads}"
-        );
-        assert_eq!(
-            media_reads, 1,
-            "twenty notes should read attachments once, saw {media_reads}"
-        );
-        assert_eq!(
-            tag_reads, 1,
-            "twenty notes should read tags and emoji once, saw {tag_reads}"
-        );
-        eprintln!(
-            "misskey home timeline: N=20 {misskey_twenty} statements \
-             ({reaction_reads} reaction read, {media_reads} attachment read, \
-              {tag_reads} tag read); \
-             N=1 {misskey_one} statements; the rest is per-note external_id mapping"
-        );
+        assert_misskey_page_is_flat(&app, &token, &log).await;
     })
     .await;
 }

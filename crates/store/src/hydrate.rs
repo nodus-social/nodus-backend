@@ -9,9 +9,11 @@
 //! Authorisation has no batch form. `accounts::verify_token` and the API's `can_view_for_viewer` stay one subject at a time: a `can_view(&[id])` invites "check twenty, then serve twenty", and moderation state changed between the check and the serve is a TOCTOU window. The seam does not offer one.
 
 mod decorations;
+mod external_ids;
 mod relationships;
 
 pub use decorations::{MentionRow, StatusDecorations};
+pub use external_ids::ExternalIds;
 
 use std::collections::BTreeMap;
 
@@ -37,6 +39,10 @@ enum EssentialOp {
     MediaByStatus(Vec<String>),
     Relationships(String, Vec<String>),
     Decorations(Vec<String>),
+    ExternalIds {
+        statuses: Vec<String>,
+        accounts: Vec<String>,
+    },
 }
 
 enum OptionalOp {
@@ -105,6 +111,7 @@ impl Batch<'_> {
             media_by_status: RowMap::new(),
             relationships: RowMap::new(),
             decorations: RowMap::new(),
+            external_ids: ExternalIds::default(),
             reactions: Ok(RowMap::new()),
             snapshots_opened: 0,
         };
@@ -122,6 +129,10 @@ impl Batch<'_> {
                 }
                 EssentialOp::Decorations(ids) => {
                     outcome.decorations = decorations::fetch_decorations(&mut *tx, ids).await?;
+                }
+                EssentialOp::ExternalIds { statuses, accounts } => {
+                    outcome.external_ids =
+                        external_ids::fetch_external_ids(&mut *tx, statuses, accounts).await?;
                 }
             }
         }
@@ -147,6 +158,8 @@ pub struct BatchOutcome {
     pub relationships: RowMap<Relationship>,
     /// Tags, custom emoji and mentions, keyed by status id; a status with none is absent.
     pub decorations: RowMap<StatusDecorations>,
+    /// Dialect ids, keyed by the local id that was asked for; an unmapped id is absent.
+    pub external_ids: ExternalIds,
     /// Reaction counts, keyed by status id, or the optional op's failure.
     pub reactions: Result<RowMap<Vec<ReactionCount>>, StoreError>,
     /// How many snapshot transactions this batch opened: a test asserts a four-op page costs one.
