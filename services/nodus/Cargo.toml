@@ -26,5 +26,8 @@ nodus-server-transport = { path = "../../crates/transport" }
 tokio.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+sqlx = { workspace = true }
+
 [lints]
 workspace = true

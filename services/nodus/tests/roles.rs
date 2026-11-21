@@ -7,10 +7,14 @@
 //! use, so a role that ignored the flag would fail instead of passing quietly.
 //!
 //! The `aio` listener test needs a database because both roles run migrations before they
-//! bind, so it is gated on `DATABASE_URL` and skips with a message otherwise. It proves the
-//! listeners with a TCP connect: the process prints the two addresses it was given and
-//! stops itself after `NODUS_AIO_ANNOUNCE_SECS` seconds, so the test can dial both ports
-//! and then expect a clean exit without signalling the process itself.
+//! bind, so it is gated on `DATABASE_URL` and skips with a message otherwise. It gives the
+//! child a schema of its own (see [`support::PrivateSchema`]), so the shared `public`
+//! schema cannot decide the result. It proves the listeners with a TCP connect: the
+//! process prints the two addresses it was given and stops itself after
+//! `NODUS_AIO_ANNOUNCE_SECS` seconds, so the test can dial both ports and then expect a
+//! clean exit without signalling the process itself.
+
+mod support;
 
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
@@ -282,6 +286,10 @@ fn aio_opens_both_listeners_and_stops_cleanly() {
     if database_url.is_empty() {
         return;
     }
+    // Both roles migrate before they bind, so the child gets a schema the test created.
+    // Dropped after the assertions, or while unwinding from one of them.
+    let schema = support::PrivateSchema::new(&database_url);
+    let database_url = schema.url();
 
     let api_port = free_port();
     let media_port = free_port();

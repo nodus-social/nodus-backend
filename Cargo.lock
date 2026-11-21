@@ -2588,6 +2588,7 @@ dependencies = [
  "nodus-server-runtime",
  "nodus-server-scan",
  "nodus-server-transport",
+ "sqlx",
  "tokio",
  "tracing",
 ]
