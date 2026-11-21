@@ -21,5 +21,9 @@ tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+# `RuleRow` carries timestamps, so tests that build one need the same clock crate the store uses.
+chrono.workspace = true
+
 [lints]
 workspace = true

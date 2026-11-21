@@ -314,7 +314,6 @@ fn plain(content: &str, spoiler_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodus_server_scan::Severity;
 
     fn rule(label: &str, threshold: f64, severity: &str) -> RuleRow {
         RuleRow {

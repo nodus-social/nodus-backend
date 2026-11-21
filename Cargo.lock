@@ -2787,6 +2787,7 @@ name = "nodus-server-scan"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "nodus-server-proto",
  "nodus-server-runtime",
  "nodus-server-store",
