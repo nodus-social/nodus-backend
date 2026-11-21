@@ -100,6 +100,7 @@ pub fn router(state: AppState) -> axum::Router {
             "/api/v1/accounts/{id}/follow",
             post(accounts::follow).delete(accounts::unfollow),
         )
+        .route("/api/v1/accounts/{id}/unfollow", post(accounts::unfollow))
         .route(
             "/api/v1/accounts/{id}/block",
             axum::routing::post(accounts::block),
