@@ -88,6 +88,37 @@ window, and originals are retained only when the author marked them lossless. Fe
 (`/actor`), because some instances refuse unsigned fetches — Mastodon itself does
 not, but spending one signature is cheaper than discovering who does.
 
+### Plain-http peers in a local lab
+
+The outbound client speaks `https` on port 443, because that is what a real peer does.
+A federation lab on a local network is the exception: the peers run in development
+mode, over plain http, often on a port of their own. `NODUS_ALLOW_INSECURE_PEERS` is
+the opt-in that makes exactly those peers reachable.
+
+```text
+NODUS_ALLOW_INSECURE_PEERS=mastodon.local,misskey.local
+```
+
+- It is a **host allowlist**, not a global switch. A host named there may be fetched
+  over `http` and on the port its target names; the connection is still pinned to the
+  address the SSRF guard resolved for that port. Any other `http` link is refused by
+  `parse_target` before a lookup happens.
+- It is **not** `NODUS_ALLOW_PRIVATE_HOSTS`, and neither implies the other. "Resolves
+  to a private address" and "may be spoken to without TLS" are different risks, and a
+  named host is still subject to the private-address guard unless it is also listed
+  there. Both variables take the same comma-separated, trimmed, lowercased form.
+- A bare handle carries no port, so handle resolution uses `http` on port 80 for a
+  named host. A peer on a non-standard port is reached by actor URL
+  (`http://peer.local:3000/@alice`), which carries the port.
+- The first use of a named host logs one warning saying TLS is skipped for it; later
+  requests to that host do not repeat it.
+- Without a listing nothing changes: `http` links are dropped, handle resolution
+  builds `https://<host>`, actor documents must be `https`, and the client probes 443.
+
+This is for a lab only. Traffic to a listed host is readable and modifiable by anyone
+on the path, and TLS no longer proves which instance answered; a listed host is
+otherwise trusted exactly as far as the federation policy already trusts it.
+
 ## What "compatible" means here
 
 Testable against real software, in this order:

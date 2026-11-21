@@ -101,18 +101,29 @@ pub enum Target {
 }
 
 /// Reads a handle (`@user@host`, `user@host`) or a profile link (`https://host/@user`).
+///
+/// A link is normally `https`. It may be `http` only when its host is named in
+/// `NODUS_ALLOW_INSECURE_PEERS`, which is the one way an operator running a lab on the
+/// local network can point this instance at a peer that has no certificate. Refusing an
+/// unlisted plain-http link here, before any lookup, keeps that decision in one place.
 #[must_use]
 pub fn parse_target(raw: &str) -> Option<Target> {
+    parse_target_with(raw, insecure_peer_hosts())
+}
+
+/// The same parse against an explicit allowlist, so the tests do not depend on the
+/// process environment.
+fn parse_target_with(raw: &str, insecure: &[String]) -> Option<Target> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
     if trimmed.contains("://") {
         let url = url::Url::parse(trimmed).ok()?;
-        if url.scheme() != "https" {
+        let host = url.host_str()?.to_ascii_lowercase();
+        if !scheme_allowed_with(url.scheme(), &host, insecure) {
             return None;
         }
-        let host = url.host_str()?.to_ascii_lowercase();
         if !valid_host(&host) {
             return None;
         }
@@ -160,6 +171,26 @@ fn valid_user(user: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
+/// Splits a comma-separated host list from the environment.
+///
+/// Both allowlists below share this parse: a name may be written bare or with an
+/// `https://` prefix and a trailing slash, names are lowercased, and an empty variable
+/// yields no hosts. One spelling for both means an operator does not have to remember
+/// which variable expects which form.
+fn env_host_list(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|host| {
+            host.trim()
+                .trim_start_matches("https://")
+                .trim_end_matches('/')
+        })
+        .filter(|host| !host.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// Hosts the operator has vouched for, which may resolve to a private address.
 ///
 /// The guard below exists so a stranger cannot point us at `127.0.0.1` or the LAN. An
@@ -170,24 +201,85 @@ fn valid_user(user: &str) -> bool {
 /// (comma separated); nothing is trusted that is not named.
 fn trusted_private_hosts() -> &'static [String] {
     static HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    HOSTS.get_or_init(|| {
-        std::env::var("NODUS_ALLOW_PRIVATE_HOSTS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|host| {
-                host.trim()
-                    .trim_start_matches("https://")
-                    .trim_end_matches('/')
-            })
-            .filter(|host| !host.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect()
+    HOSTS.get_or_init(|| env_host_list("NODUS_ALLOW_PRIVATE_HOSTS"))
+}
+
+/// Hosts the operator has named as reachable without TLS.
+///
+/// This answers a different question from [`trusted_private_hosts`], not a stronger form
+/// of the same one. A private address is still spoken to over TLS unless it is also named
+/// here; a public host named here is spoken to in clear. The use case is a local
+/// federation lab whose peers run in development mode with no certificate, where the only
+/// alternative is terminating TLS for a peer that exists for an afternoon. The default,
+/// an empty list, accepts `https` only and is the previous behaviour exactly; listing a
+/// host does not lift the private-address guard, it only permits `http` and the port that
+/// target names. This is an escape hatch with a real cost: traffic to a named host is
+/// readable and modifiable on the path, and TLS no longer proves who answered.
+fn insecure_peer_hosts() -> &'static [String] {
+    static HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HOSTS.get_or_init(|| env_host_list("NODUS_ALLOW_INSECURE_PEERS"))
+}
+
+fn is_insecure_peer(host: &str) -> bool {
+    insecure_peer_hosts()
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host))
+}
+
+/// Whether this instance may speak to `host` with `scheme`.
+///
+/// `https` is the transport for everyone. `http` is permitted only for a host the
+/// operator named in `NODUS_ALLOW_INSECURE_PEERS`; every other scheme is not a
+/// federation transport at all.
+fn scheme_allowed(scheme: &str, host: &str) -> bool {
+    scheme_allowed_with(scheme, host, insecure_peer_hosts())
+}
+
+/// The same decision against an explicit list, so a test does not depend on the process
+/// environment.
+fn scheme_allowed_with(scheme: &str, host: &str, insecure: &[String]) -> bool {
+    scheme == "https" || (scheme == "http" && insecure.iter().any(|allowed| allowed == host))
+}
+
+/// Whether a link inside a document points somewhere this instance could fetch.
+///
+/// Actor ids and avatars are usually absolute `https` URLs, but a development-mode peer
+/// publishes `http` ones. Such a link is acceptable only when its own host is named in
+/// `NODUS_ALLOW_INSECURE_PEERS` — a document cannot smuggle in a plain-http link to some
+/// other host.
+fn acceptable_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| {
+        scheme_allowed(
+            parsed.scheme(),
+            &parsed.host_str().unwrap_or_default().to_ascii_lowercase(),
+        )
     })
 }
 
-/// Anything about the target itself that cannot succeed, without touching the network.
-async fn client_for(host: &str) -> ApiResult<reqwest::Client> {
-    client_for_with(host, TIMEOUT).await
+/// Says once per host that its peer is being reached without TLS.
+///
+/// The warning is the operator's only signal that the escape hatch is in use: a lab left
+/// configured this way otherwise looks exactly like a peer with a working certificate.
+/// One line per host, not per request, so a busy timeline cannot bury it.
+fn warn_insecure_peer(host: &str) {
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warned.iter().any(|seen| seen.eq_ignore_ascii_case(host)) {
+        return;
+    }
+    warned.push(host.to_owned());
+    tracing::warn!(
+        %host,
+        "reaching this peer over plain http because NODUS_ALLOW_INSECURE_PEERS names it; \
+         TLS is not used"
+    );
+}
+
+/// The client for an outbound URL, with the default budget.
+async fn client_for(url: &url::Url) -> ApiResult<reqwest::Client> {
+    client_for_with(url, TIMEOUT).await
 }
 
 /// The same guard, with a budget of the caller's choosing.
@@ -196,14 +288,29 @@ async fn client_for(host: &str) -> ApiResult<reqwest::Client> {
 /// asking an actor's inbox to accept a delivery, and too little to read a few thousand
 /// lines from a list host over a slow link. The address check is identical either way —
 /// only how long we are willing to wait for the body changes.
-async fn client_for_with(host: &str, timeout: Duration) -> ApiResult<reqwest::Client> {
-    let addrs: Vec<_> = tokio::net::lookup_host((host, 443))
+///
+/// The scheme and port come from `url`, never from a constant: a named plain-http peer is
+/// dialled on the port its target names, and the address pinned for the SSRF guard is the
+/// one resolved for that same port. For an `https` target this is 443 as before.
+async fn client_for_with(url: &url::Url, timeout: Duration) -> ApiResult<reqwest::Client> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiError::unprocessable("that URL has no host"))?
+        .to_ascii_lowercase();
+    if !scheme_allowed(url.scheme(), &host) {
+        return Err(ApiError::unprocessable("only https URLs can be fetched"));
+    }
+    if url.scheme() == "http" {
+        warn_insecure_peer(&host);
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
         .await
-        .map_err(|_| unreachable(host))?
+        .map_err(|_| unreachable(&host))?
         .collect();
     let trusted = trusted_private_hosts()
         .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(host));
+        .any(|allowed| allowed.eq_ignore_ascii_case(&host));
     let address = addrs
         .iter()
         .find(|addr| {
@@ -214,12 +321,12 @@ async fn client_for_with(host: &str, timeout: Duration) -> ApiResult<reqwest::Cl
                 }
         })
         .copied()
-        .ok_or_else(|| unreachable(host))?;
+        .ok_or_else(|| unreachable(&host))?;
     reqwest::Client::builder()
         .timeout(timeout)
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
-        .resolve(host, address)
+        .resolve(&host, address)
         .build()
         .map_err(|error| {
             tracing::warn!(%host, %error, "could not build the outbound client");
@@ -227,23 +334,17 @@ async fn client_for_with(host: &str, timeout: Duration) -> ApiResult<reqwest::Cl
         })
 }
 
-/// The client for an `https` URL an administrator supplied, built by the same guard.
+/// The client for a URL an administrator supplied, built by the same guard.
 ///
 /// The scheme check lives here rather than in the handler because it is the same decision
 /// either way: what this instance is willing to talk to. `client_for_with` then resolves the
 /// host once, refuses a private answer, and pins the connection to the address it checked,
-/// so a host that answers differently on the second lookup gains nothing.
+/// so a host that answers differently on the second lookup gains nothing. `http` is
+/// accepted only for a host named in `NODUS_ALLOW_INSECURE_PEERS`.
 pub(crate) async fn outbound_client(url: &str, timeout: Duration) -> ApiResult<reqwest::Client> {
     let parsed =
         url::Url::parse(url).map_err(|_| ApiError::unprocessable("that URL is not a URL"))?;
-    if parsed.scheme() != "https" {
-        return Err(ApiError::unprocessable("only https URLs can be fetched"));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| ApiError::unprocessable("that URL has no host"))?
-        .to_ascii_lowercase();
-    client_for_with(&host, timeout).await
+    client_for_with(&parsed, timeout).await
 }
 
 fn unreachable(host: &str) -> ApiError {
@@ -274,11 +375,8 @@ const MEDIA_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 /// host that is down is not a reason to refuse a post; it only means we cannot look.
 pub(crate) async fn fetch_media_bytes(url: &str) -> Option<Vec<u8>> {
     let parsed = url::Url::parse(url).ok()?;
-    if parsed.scheme() != "https" {
-        return None;
-    }
     let host = parsed.host_str()?.to_ascii_lowercase();
-    let client = match client_for(&host).await {
+    let client = match client_for(&parsed).await {
         Ok(client) => client,
         Err(error) => {
             tracing::debug!(%host, message = error.message(), "refused a media fetch");
@@ -334,7 +432,17 @@ pub(crate) async fn fetch_media_bytes(url: &str) -> Option<Vec<u8>> {
 async fn webfinger(user: &str, host: &str, signer: Option<&Signer>) -> ApiResult<String> {
     let resource = url::form_urlencoded::byte_serialize(format!("acct:{user}@{host}").as_bytes())
         .collect::<String>();
-    let url = format!("https://{host}/.well-known/webfinger?resource={resource}");
+    // A bare handle carries no port, so a named plain-http peer is asked on port 80. A
+    // peer on any other port has to be named by actor URL, which does carry one.
+    let scheme = if is_insecure_peer(host) {
+        "http"
+    } else {
+        "https"
+    };
+    let url = url::Url::parse(&format!(
+        "{scheme}://{host}/.well-known/webfinger?resource={resource}"
+    ))
+    .map_err(|_| ApiError::unprocessable("That account's host is not usable."))?;
     let body = get(&url, host, "application/jrd+json, application/json", signer).await?;
     let href = body
         .get("links")
@@ -351,7 +459,7 @@ async fn webfinger(user: &str, host: &str, signer: Option<&Signer>) -> ApiResult
         .and_then(|link| link.get("href"))
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::not_found("That account was not found on its instance."))?;
-    if !href.starts_with("https://") {
+    if !acceptable_url(href) {
         return Err(ApiError::unprocessable(
             "That instance pointed at a link we will not follow.",
         ));
@@ -364,13 +472,13 @@ async fn webfinger(user: &str, host: &str, signer: Option<&Signer>) -> ApiResult
 async fn actor_document(url: &str, expected: &str, signer: Option<&Signer>) -> ApiResult<Value> {
     let parsed = url::Url::parse(url)
         .map_err(|_| ApiError::unprocessable("That is not a link to an account."))?;
-    if parsed.scheme() != "https" || parsed.host_str() != Some(expected) {
+    if !scheme_allowed(parsed.scheme(), expected) || parsed.host_str() != Some(expected) {
         return Err(ApiError::unprocessable(
             "That link does not belong to the account's instance.",
         ));
     }
     get(
-        url,
+        &parsed,
         expected,
         "application/activity+json, application/ld+json",
         signer,
@@ -378,17 +486,21 @@ async fn actor_document(url: &str, expected: &str, signer: Option<&Signer>) -> A
     .await
 }
 
-async fn get(url: &str, host: &str, accept: &str, signer: Option<&Signer>) -> ApiResult<Value> {
-    let client = client_for(host).await?;
-    let mut request = client.get(url).header(reqwest::header::ACCEPT, accept);
+async fn get(
+    url: &url::Url,
+    host: &str,
+    accept: &str,
+    signer: Option<&Signer>,
+) -> ApiResult<Value> {
+    let client = client_for(url).await?;
+    let mut request = client
+        .get(url.as_str())
+        .header(reqwest::header::ACCEPT, accept);
     if let Some(signer) = signer {
-        let path = match url::Url::parse(url) {
-            Ok(parsed) => parsed.query().map_or_else(
-                || parsed.path().to_owned(),
-                |query| format!("{}?{query}", parsed.path()),
-            ),
-            Err(_) => "/".to_owned(),
-        };
+        let path = url.query().map_or_else(
+            || url.path().to_owned(),
+            |query| format!("{}?{query}", url.path()),
+        );
         if let Some(headers) = federation_sign(signer, "GET", &path, host) {
             for (name, value) in headers.pairs() {
                 request = request.header(name, value);
@@ -443,7 +555,7 @@ pub fn actor_from_document(
     let uri = document
         .get("id")
         .and_then(Value::as_str)
-        .filter(|id| id.starts_with("https://"))
+        .filter(|id| acceptable_url(id))
         .ok_or_else(not_an_actor)?
         .to_owned();
     let username = document
@@ -473,7 +585,7 @@ pub fn actor_from_document(
                 Value::String(url) => Some(url.clone()),
                 other => other.get("url").and_then(Value::as_str).map(str::to_owned),
             })
-            .filter(|url| url.starts_with("https://"))
+            .filter(|url| acceptable_url(url))
     };
     let endpoints = document.get("endpoints");
     Ok(RemoteActor {
@@ -516,24 +628,45 @@ mod tests {
     #[test]
     fn handles_and_links_are_recognised() {
         assert_eq!(
-            parse_target("@alice@remote.test"),
+            parse_target_with("@alice@remote.test", &[]),
             Some(Target::Handle {
                 user: "alice".to_owned(),
                 host: "remote.test".to_owned()
             })
         );
         assert_eq!(
-            parse_target(" alice@Remote.Test "),
+            parse_target_with(" alice@Remote.Test ", &[]),
             Some(Target::Handle {
                 user: "alice".to_owned(),
                 host: "remote.test".to_owned()
             })
         );
         assert_eq!(
-            parse_target("https://baraag.net/@Tomostrawberry"),
+            parse_target_with("https://baraag.net/@Tomostrawberry", &[]),
             Some(Target::Link {
                 url: "https://baraag.net/@Tomostrawberry".to_owned(),
                 host: "baraag.net".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn an_http_link_is_accepted_only_for_a_named_peer() {
+        let named = ["peer.test".to_owned()];
+        assert!(parse_target_with("http://peer.test/@alice", &[]).is_none());
+        assert!(parse_target_with("http://other.test/@alice", &named).is_none());
+        assert_eq!(
+            parse_target_with("http://peer.test:3000/@alice", &named),
+            Some(Target::Link {
+                url: "http://peer.test:3000/@alice".to_owned(),
+                host: "peer.test".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_target_with("https://peer.test/@alice", &[]),
+            Some(Target::Link {
+                url: "https://peer.test/@alice".to_owned(),
+                host: "peer.test".to_owned()
             })
         );
     }
@@ -555,7 +688,10 @@ mod tests {
             "bob@-remote.test",
             "b ob@remote.test",
         ] {
-            assert!(parse_target(raw).is_none(), "{raw} should not parse");
+            assert!(
+                parse_target_with(raw, &[]).is_none(),
+                "{raw} should not parse"
+            );
         }
     }
 

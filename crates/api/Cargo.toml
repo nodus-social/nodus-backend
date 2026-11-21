@@ -53,6 +53,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
+# The insecure-peer test captures the once-per-host warning, the way
+# `crates/store/tests/invalidate.rs` captures its once-per-outage one.
+tracing-subscriber = { workspace = true }
 tower = { workspace = true }
 # Secure-mode tests sign with the same `RsaSigner` the outbound client uses, so the
 # test cannot pass by agreeing with a reimplementation.
