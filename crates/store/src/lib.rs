@@ -27,6 +27,7 @@ pub mod external_ids;
 pub mod filters;
 pub mod forwarded;
 pub mod highlights;
+pub mod hydrate;
 pub mod invalidate;
 pub mod jobs;
 pub mod lists;
@@ -48,6 +49,8 @@ pub mod stats;
 pub mod statuses;
 pub mod tags;
 pub mod writer;
+
+pub use hydrate::{Batch, BatchOutcome, RowMap};
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
