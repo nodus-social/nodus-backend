@@ -98,6 +98,24 @@ pub async fn asset_in_use(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> 
         .await
 }
 
+/// `(name, content)` for every set of one `kind`, oldest first — the order an
+/// administrator registered them in, which is the order a matcher should report hits in.
+///
+/// Separate from [`assets`] because the bytes are up to sixty-four megabytes each and a
+/// listing almost never wants them: only the caller that is about to parse the sets asks
+/// for the contents.
+pub async fn assets_of_kind(
+    pool: &PgPool,
+    kind: &str,
+) -> Result<Vec<(String, Vec<u8>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT name, content FROM scanner_asset WHERE kind = $1 ORDER BY created_at ASC",
+    )
+    .bind(kind)
+    .fetch_all(pool)
+    .await
+}
+
 // ---------------------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------------------

@@ -23,6 +23,7 @@ use crate::state::AppState;
 use nodus_server_media::hash::Hashes;
 use nodus_server_store::media::{self, MediaRow};
 use nodus_server_store::moderation::{self, NewReport};
+use nodus_server_store::scanners;
 use nodus_server_store::statuses;
 
 use crate::remote::fetch_media_bytes;
@@ -81,14 +82,10 @@ impl Sets {
     /// Reads the sets named `kind = 'hashes'` and parses them.
     ///
     /// One query per status, not one per attachment: a set is up to sixty-four megabytes
-    /// and the ingest path already knows how many attachments it has.
+    /// and the ingest path already knows how many attachments it has. The read belongs to
+    /// the store, which owns `scanner_asset` — this module only decides what a match means.
     pub async fn load(pool: &PgPool) -> Result<Self, sqlx::Error> {
-        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-            "SELECT name, content FROM scanner_asset WHERE kind = 'hashes' \
-             ORDER BY created_at ASC",
-        )
-        .fetch_all(pool)
-        .await?;
+        let rows = scanners::assets_of_kind(pool, "hashes").await?;
         Ok(Self::parse(rows))
     }
 
