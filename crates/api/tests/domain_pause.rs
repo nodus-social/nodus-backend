@@ -23,7 +23,8 @@ use nodus_server_core::Id;
 use nodus_server_sdk::activitypub::Actor;
 use nodus_server_store::accounts::{self, NewAccount, RemoteAccount};
 use nodus_server_store::statuses::{self, NewRemoteStatus};
-use nodus_server_store::{apps, delivery, Store};
+use nodus_server_store::remote_moderation::NewRemoteModeration;
+use nodus_server_store::{apps, delivery, remote_moderation, Store};
 
 fn instance_config() -> InstanceConfig {
     InstanceConfig {
@@ -142,12 +143,22 @@ async fn seed_remote(
     username: &str,
     public_key_pem: Option<&str>,
 ) -> String {
+    seed_remote_on(pool, "remote.test", uri, username, public_key_pem).await
+}
+
+async fn seed_remote_on(
+    pool: &PgPool,
+    domain: &str,
+    uri: &str,
+    username: &str,
+    public_key_pem: Option<&str>,
+) -> String {
     accounts::upsert_remote(
         pool,
         &RemoteAccount {
             uri,
             username,
-            domain: "remote.test",
+            domain,
             display_name: username,
             note: "",
             avatar_url: None,
@@ -620,6 +631,73 @@ async fn an_unreachable_peer_answers_502_with_the_error() {
         assert!(
             message.contains("could not fetch the actor"),
             "the body must carry the fetch error: {body}"
+        );
+    })
+    .await;
+}
+
+/// `/timelines/public` with no `local` parameter is the federated view, so the
+/// moderation predicates that used to be reachable only with `?local=false` are
+/// the page's only guards: a paused host and a silenced account must stay out of
+/// a request that names neither.
+#[tokio::test]
+async fn the_default_public_page_is_federated_and_still_hides_paused_and_silenced() {
+    run_db_test(|store, state| async move {
+        let pool = store.pool();
+        let staff = create_account(pool, "staff", true).await;
+        let token = create_token(pool, &staff, &["read", "admin:read", "admin:write"]).await;
+
+        let open_actor = "https://open.test/users/ok";
+        let open = seed_remote_on(pool, "open.test", open_actor, "ok", None).await;
+        let open_status =
+            seed_remote_status(pool, &open, "https://open.test/notes/ok", "open").await;
+
+        let paused_actor = "https://paused.test/users/paused";
+        let paused = seed_remote_on(pool, "paused.test", paused_actor, "paused", None).await;
+        let paused_status =
+            seed_remote_status(pool, &paused, "https://paused.test/notes/one", "paused").await;
+
+        let silenced_actor = "https://quiet.test/users/eve";
+        let silenced = seed_remote_on(pool, "quiet.test", silenced_actor, "eve", None).await;
+        let silenced_status =
+            seed_remote_status(pool, &silenced, "https://quiet.test/notes/one", "quiet").await;
+
+        let (code, body) = send(
+            &state,
+            "POST",
+            "/api/v1/admin/federation/domain-pauses",
+            Some(&token),
+            Some(json!({ "domain": "paused.test", "reason": "test" })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "body: {body}");
+        remote_moderation::upsert(
+            pool,
+            &NewRemoteModeration {
+                actor_uri: silenced_actor,
+                action: remote_moderation::SILENCE,
+                reason: Some("test"),
+                expires_at: None,
+                created_by: Some(&staff),
+            },
+        )
+        .await
+        .expect("silence actor");
+
+        let (code, timeline) = get(&state, "/api/v1/timelines/public").await;
+        assert_eq!(code, StatusCode::OK, "body: {timeline}");
+        let ids = timeline_ids(&timeline);
+        assert!(
+            ids.contains(&open_status),
+            "the default page must carry a remote post: {timeline}"
+        );
+        assert!(
+            !ids.contains(&paused_status),
+            "a paused domain must not reach the default page: {timeline}"
+        );
+        assert!(
+            !ids.contains(&silenced_status),
+            "a silenced account must not reach the default page: {timeline}"
         );
     })
     .await;

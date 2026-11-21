@@ -120,10 +120,15 @@ pub async fn public_timeline(
     Query(query): Query<PageQuery>,
 ) -> ApiResult<Response> {
     let params = query.params()?;
+    // Mastodon's default here is the federated view: the client that wants this
+    // instance's own posts sends `local=true`, and a caller that sends nothing is
+    // asking for everything the instance stores. The visibility rules (pause,
+    // silence, block, quarantine) live in `public_page`, so "everything" still
+    // never includes a post this instance has decided not to show.
     let page = nodus_server_store::statuses::public_page(
         state.store().pool(),
         params,
-        query.local.unwrap_or(true),
+        query.local.unwrap_or(false),
     )
     .await?;
     timeline_response(
