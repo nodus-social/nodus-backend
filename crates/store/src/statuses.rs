@@ -227,6 +227,9 @@ pub async fn upsert_remote(
             .bind(new.uri)
             .fetch_optional(&mut *tx)
             .await?;
+    // A row that already exists is a re-delivery, an edit, or a tombstone; only the first
+    // insert adds a status the account did not have before.
+    let inserted = previous.is_none();
     let sql = format!(
         "INSERT INTO status (id, account_id, uri, content, content_html, spoiler_text, \
              visibility, sensitive, in_reply_to_id, in_reply_to_account_id, local, created_at) \
@@ -267,6 +270,20 @@ pub async fn upsert_remote(
     }
     if let Some(parent_id) = new.in_reply_to_id {
         refresh_replies_count(&mut tx, parent_id).await?;
+    }
+    // The same one write `statuses::create` makes for a local author: the counter is the
+    // account's count of the statuses this instance holds for it, and a remote profile's
+    // Posts tab reads the same rows the number does. A re-delivered note is not a second
+    // post, so it must not count twice.
+    if inserted {
+        sqlx::query(
+            "UPDATE account SET statuses_count = statuses_count + 1, \
+                 last_status_at = GREATEST(COALESCE(last_status_at, $2), $2) WHERE id = $1",
+        )
+        .bind(new.account_id)
+        .bind(new.created_at)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(row)
@@ -375,6 +392,17 @@ pub async fn delete_remote(
         reblog_of_id.as_deref(),
     )
     .await?;
+    // The tombstone leaves the account's live set, so the count has to follow it, exactly
+    // as `delete_owned` does for a local author. Remote notes are never boosts, but the
+    // predicate is spelled out so a future remote reblog cannot start counting.
+    if reblog_of_id.is_none() {
+        sqlx::query(
+            "UPDATE account SET statuses_count = GREATEST(0, statuses_count - 1) WHERE id = $1",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok(true)
 }
@@ -400,6 +428,21 @@ pub async fn delete_remote_actor(pool: &PgPool, account_id: &str) -> Result<u64,
             in_reply_to_id.as_deref(),
             reblog_of_id.as_deref(),
         )
+        .await?;
+    }
+    // One write for the whole tombstone rather than one per status: the account lost
+    // exactly the rows that counted toward its count.
+    let counted = rows
+        .iter()
+        .filter(|(_, _, reblog)| reblog.is_none())
+        .count();
+    if counted > 0 {
+        sqlx::query(
+            "UPDATE account SET statuses_count = GREATEST(0, statuses_count - $2) WHERE id = $1",
+        )
+        .bind(account_id)
+        .bind(i64::try_from(counted).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
         .await?;
     }
     tx.commit().await?;
