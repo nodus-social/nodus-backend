@@ -1,5 +1,6 @@
 use nodus_server_store::accounts::{self, NewAccount};
 use nodus_server_store::social::{self, FollowOutcome};
+use nodus_server_store::Store;
 use sqlx::PgPool;
 
 async fn create_account(pool: &PgPool, username: &str, locked: bool) -> String {
@@ -19,7 +20,8 @@ async fn create_account(pool: &PgPool, username: &str, locked: bool) -> String {
 }
 
 async fn assert_counts_match_follow_table(pool: &PgPool, account_id: &str) {
-    let account = accounts::by_id(pool, account_id)
+    let account = Store::from_pool(pool.clone())
+        .account(account_id)
         .await
         .expect("fetch account")
         .expect("account exists");
@@ -146,8 +148,16 @@ async fn block_recomputes_follow_counts_on_accepted_and_mixed_follows(pool: PgPo
         .await
         .expect("alice blocks bob");
 
-    let alice_row = accounts::by_id(&pool, &alice).await.unwrap().unwrap();
-    let bob_row = accounts::by_id(&pool, &bob).await.unwrap().unwrap();
+    let alice_row = Store::from_pool(pool.clone())
+        .account(&alice)
+        .await
+        .unwrap()
+        .unwrap();
+    let bob_row = Store::from_pool(pool.clone())
+        .account(&bob)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(alice_row.followers_count, 1);
     assert_eq!(alice_row.following_count, 0);
     assert_eq!(bob_row.followers_count, 0);
@@ -180,7 +190,11 @@ async fn concurrent_follows_unfollows_accepts_and_blocks_keep_counters_in_sync(p
         handle.await.expect("join follow task");
     }
     assert_counts_match_follow_table(&pool, &target).await;
-    let target_row = accounts::by_id(&pool, &target).await.unwrap().unwrap();
+    let target_row = Store::from_pool(pool.clone())
+        .account(&target)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(target_row.followers_count, 16);
 
     // 2. Mix concurrent unfollows, new pending->accepted follows, and blocks on the same accounts.

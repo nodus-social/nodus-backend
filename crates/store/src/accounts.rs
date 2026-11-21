@@ -78,6 +78,23 @@ pub(crate) const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \
      lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, moved_to, also_known_as, deleted_at, purge_at, created_at";
 
+impl crate::Store {
+    /// One account by id, local or remote.
+    ///
+    /// This is for a *single subject*: the token's own account, the actor a request
+    /// addresses, an authorisation target. For a page, ask for its authors once:
+    /// [`Store::batch`] with [`Batch::accounts`](crate::Batch::accounts). Looping this
+    /// call over a page's rows is the per-row read the store no longer accepts — it
+    /// compiles only as a deliberate, visible exception.
+    ///
+    /// # Errors
+    ///
+    /// A database error, unchanged.
+    pub async fn account(&self, id: &str) -> Result<Option<AccountRow>, sqlx::Error> {
+        by_id(&self.pool, id).await
+    }
+}
+
 /// A token verified against an account.
 #[derive(Debug, Clone, FromRow)]
 pub struct Authenticated {
@@ -155,7 +172,12 @@ async fn resolve_token(
 }
 
 /// One account by id, local or remote.
-pub async fn by_id(pool: &PgPool, id: &str) -> Result<Option<AccountRow>, sqlx::Error> {
+///
+/// Deliberately not `pub`: a page's authors are one read ([`Store::batch`] with
+/// [`Batch::accounts`](crate::Batch::accounts)), and the only sanctioned way to read a
+/// single account from outside this crate is [`Store::account`]. A per-row loop over
+/// `account` ids is the shape this crate's read seam exists to make unrepresentable.
+pub(crate) async fn by_id(pool: &PgPool, id: &str) -> Result<Option<AccountRow>, sqlx::Error> {
     let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM account WHERE id = $1");
     sqlx::query_as::<_, AccountRow>(&sql)
         .bind(id)

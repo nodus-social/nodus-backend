@@ -67,7 +67,8 @@ async fn deliver(pool: &PgPool, account_id: &str, uri: &str, text: &str) {
 }
 
 async fn count(pool: &PgPool, account_id: &str) -> i64 {
-    accounts::by_id(pool, account_id)
+    nodus_server_store::Store::from_pool(pool.clone())
+        .account(account_id)
         .await
         .expect("read account")
         .expect("account exists")

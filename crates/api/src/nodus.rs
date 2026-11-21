@@ -126,7 +126,7 @@ async fn batch(
     let mut results = Vec::with_capacity(calls.len());
     for call in calls {
         let (value, error) = match call.call {
-            Verb::Account { id } => match accounts::by_id(state.store().pool(), &id).await? {
+            Verb::Account { id } => match state.store().account(&id).await? {
                 Some(account) => (
                     Some(
                         serde_json::to_value(crate::dto::AccountDto::from_row(
@@ -141,7 +141,7 @@ async fn batch(
             },
             Verb::Status { id } => match statuses::by_id(state.store().pool(), &id).await? {
                 Some(row) if crate::statuses::can_view(&state, Some(&auth), &row).await? => {
-                    match accounts::by_id(state.store().pool(), &row.account_id).await? {
+                    match state.store().account(&row.account_id).await? {
                         Some(account) => (
                             Some(
                                 serde_json::to_value(crate::dto::StatusDto::from_row(

@@ -121,7 +121,7 @@ async fn list_members_come_back_in_membership_order() {
         // `accounts::by_id` per member.
         log.0.lock().expect("log buffer").clear();
         for member in &members {
-            let _ = nodus_server_store::accounts::by_id(store.pool(), member)
+            let _ = store.account(member)
                 .await
                 .expect("by_id");
         }

@@ -151,8 +151,7 @@ pub async fn deliver_create(
 ) {
     // A direct post is delivered to the accounts it names and to nobody else; everything
     // else also reaches the followers the peer knows about.
-    let account = match nodus_server_store::accounts::by_id(state.store().pool(), account_id).await
-    {
+    let account = match state.store().account(account_id).await {
         Ok(Some(account)) => account,
         Ok(None) => return,
         Err(error) => {
@@ -197,7 +196,7 @@ pub async fn deliver_create(
 /// burst of saves leaves one activity per actor rather than one per field.
 pub async fn deliver_actor_update(state: &AppState, account_id: &str) {
     let pool = state.store().pool();
-    let Ok(Some(account)) = nodus_server_store::accounts::by_id(pool, account_id).await else {
+    let Ok(Some(account)) = state.store().account(account_id).await else {
         return;
     };
     let activity = crate::activitypub::actor_update(state, &account);
@@ -231,7 +230,7 @@ pub async fn deliver_actor_update(state: &AppState, account_id: &str) {
 /// to a post.
 pub async fn deliver_account_delete(state: &AppState, account_id: &str) {
     let pool = state.store().pool();
-    let Ok(Some(account)) = nodus_server_store::accounts::by_id(pool, account_id).await else {
+    let Ok(Some(account)) = state.store().account(account_id).await else {
         return;
     };
     let actor = crate::activitypub::actor_url(state, &account);
@@ -262,8 +261,7 @@ pub async fn deliver_update(
     account_id: &str,
     row: &nodus_server_store::statuses::StatusRow,
 ) {
-    let account = match nodus_server_store::accounts::by_id(state.store().pool(), account_id).await
-    {
+    let account = match state.store().account(account_id).await {
         Ok(Some(account)) => account,
         Ok(None) => return,
         Err(error) => {
@@ -309,9 +307,7 @@ pub async fn deliver_delete(
     if !matches!(row.visibility.as_str(), "public" | "unlisted") {
         return;
     }
-    let Ok(Some(account)) =
-        nodus_server_store::accounts::by_id(state.store().pool(), account_id).await
-    else {
+    let Ok(Some(account)) = state.store().account(account_id).await else {
         return;
     };
     let actor = crate::activitypub::actor_url(state, &account);
@@ -338,8 +334,8 @@ pub async fn deliver_delete(
 /// Tells an account that it was followed, or that the follow was withdrawn.
 pub async fn deliver_follow(state: &AppState, account_id: &str, target_id: &str, following: bool) {
     let (Ok(Some(actor_row)), Ok(Some(target))) = (
-        nodus_server_store::accounts::by_id(state.store().pool(), account_id).await,
-        nodus_server_store::accounts::by_id(state.store().pool(), target_id).await,
+        state.store().account(account_id).await,
+        state.store().account(target_id).await,
     ) else {
         return;
     };
@@ -374,7 +370,7 @@ pub async fn deliver_remote_block(
     blocking: bool,
 ) {
     let pool = state.store().pool();
-    let Ok(Some(sender)) = nodus_server_store::accounts::by_id(pool, sender_id).await else {
+    let Ok(Some(sender)) = state.store().account(sender_id).await else {
         return;
     };
     let actor = actor_of(state, sender_username, sender.uri.as_deref());
@@ -408,8 +404,8 @@ pub async fn deliver_follow_response(
     follow_id: Option<&str>,
 ) {
     let (Ok(Some(actor_row)), Ok(Some(requester))) = (
-        nodus_server_store::accounts::by_id(state.store().pool(), account_id).await,
-        nodus_server_store::accounts::by_id(state.store().pool(), requester_id).await,
+        state.store().account(account_id).await,
+        state.store().account(requester_id).await,
     ) else {
         return;
     };
@@ -464,8 +460,8 @@ pub async fn deliver_reaction(
     active: bool,
 ) {
     let (Ok(Some(actor_row)), Ok(Some(author))) = (
-        nodus_server_store::accounts::by_id(state.store().pool(), account_id).await,
-        nodus_server_store::accounts::by_id(state.store().pool(), &status.account_id).await,
+        state.store().account(account_id).await,
+        state.store().account(&status.account_id).await,
     ) else {
         return;
     };

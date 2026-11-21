@@ -622,7 +622,8 @@ async fn rejects_a_cross_actor_profile_update_or_actor_delete() {
             StatusCode::FORBIDDEN,
             "a cross-actor profile update must be forbidden: {resp}"
         );
-        let stored = accounts::by_id(pool, &alice.id)
+        let stored = store
+            .account(&alice.id)
             .await
             .expect("lookup")
             .expect("alice still exists");
@@ -668,7 +669,8 @@ async fn rejects_a_cross_actor_profile_update_or_actor_delete() {
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
         assert_eq!(
-            accounts::by_id(pool, &mallory.id)
+            store
+                .account(&mallory.id)
                 .await
                 .expect("lookup")
                 .expect("mallory is kept")

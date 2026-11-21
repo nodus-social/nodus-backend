@@ -133,13 +133,12 @@ async fn note_for(
             {
                 let inner_id =
                     page_dialect_id(state, "status", &inner.id, inner.created_at, reads).await?;
-                let inner_note =
-                    match accounts::by_id(state.store().pool(), &inner.account_id).await? {
-                        Some(author) => Some(Box::new(
-                            Box::pin(note_for(state, &inner, &author, viewer_id, None)).await?,
-                        )),
-                        None => None,
-                    };
+                let inner_note = match state.store().account(&inner.account_id).await? {
+                    Some(author) => Some(Box::new(
+                        Box::pin(note_for(state, &inner, &author, viewer_id, None)).await?,
+                    )),
+                    None => None,
+                };
                 (Some(inner_id), inner_note)
             }
             _ => (None, None),
@@ -240,7 +239,9 @@ async fn resolve_account(state: &AppState, external: &str) -> ApiResult<AccountR
     let local = external_ids::resolve(state.store().pool(), "account", external)
         .await?
         .unwrap_or_else(|| external.to_owned());
-    accounts::by_id(state.store().pool(), &local)
+    state
+        .store()
+        .account(&local)
         .await?
         .ok_or_else(|| ApiError::not_found("No such user"))
 }
@@ -319,7 +320,7 @@ async fn show_user(
             let local = external_ids::resolve(state.store().pool(), "account", user_id)
                 .await?
                 .unwrap_or_else(|| user_id.to_owned());
-            accounts::by_id(state.store().pool(), &local).await?
+            state.store().account(&local).await?
         }
         (None, Some(username)) => {
             accounts::local_by_username(state.store().pool(), username).await?
@@ -443,7 +444,9 @@ async fn favorite_note(
     let auth = authenticate(&state, body.i.as_deref()).await?;
     let row = resolve_visible_note(&state, &auth.account.id, &body.note_id).await?;
     social::favourite(state.store().pool(), &auth.account.id, &row.id).await?;
-    let account = accounts::by_id(state.store().pool(), &row.account_id)
+    let account = state
+        .store()
+        .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(
@@ -458,7 +461,9 @@ async fn unfavorite_note(
     let auth = authenticate(&state, body.i.as_deref()).await?;
     let row = resolve_visible_note(&state, &auth.account.id, &body.note_id).await?;
     social::unfavourite(state.store().pool(), &auth.account.id, &row.id).await?;
-    let account = accounts::by_id(state.store().pool(), &row.account_id)
+    let account = state
+        .store()
+        .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(
@@ -493,7 +498,7 @@ async fn notifications(
     .await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
-        let Some(from) = accounts::by_id(state.store().pool(), &row.from_account_id).await? else {
+        let Some(from) = state.store().account(&row.from_account_id).await? else {
             continue;
         };
         let user = user_for(&state, &from).await?;
@@ -507,7 +512,7 @@ async fn notifications(
                     )
                     .await? =>
                 {
-                    match accounts::by_id(state.store().pool(), &status.account_id).await? {
+                    match state.store().account(&status.account_id).await? {
                         Some(author) => Some(
                             note_for(&state, &status, &author, Some(&auth.account.id), None)
                                 .await?,
@@ -652,7 +657,9 @@ async fn show_note(
 ) -> ApiResult<Json<Note>> {
     let auth = authenticate(&state, body.i.as_deref()).await?;
     let row = resolve_visible_note(&state, &auth.account.id, &body.note_id).await?;
-    let account = accounts::by_id(state.store().pool(), &row.account_id)
+    let account = state
+        .store()
+        .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(
@@ -788,7 +795,9 @@ async fn create_note(
         )
         .await?;
     }
-    let account = accounts::by_id(state.store().pool(), &row.account_id)
+    let account = state
+        .store()
+        .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("No such note"))?;
     Ok(Json(

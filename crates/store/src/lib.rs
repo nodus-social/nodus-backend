@@ -75,9 +75,42 @@ impl Store {
         Ok(Self { pool })
     }
 
+    /// The raw pool, for the modules that have not been moved behind the read seam yet.
+    ///
+    /// **No new caller may be added.** A handler that takes this handle can write any
+    /// query it likes, which is exactly what `crates/store` exists to prevent: the API
+    /// names no table. Reach for a function in `crates/store` — a single subject, or, for
+    /// a page, [`Store::batch`] — before this.
+    ///
+    /// The callers that still hold it, and why each is not yet moved:
+    ///
+    /// - `crates/api/src` — every module whose reads are still per-row: `activitypub`,
+    ///   `misskey`/`misskey_page`, `statuses`, `admin/*`, `filters`, `notifications`,
+    ///   `outbox`, `drive`, `media`, `lists`, `highlights`, `nodus`, `streaming`,
+    ///   `client_metadata`. Each is the next module to take the three-stage move that
+    ///   `accounts` took (raw function private, curated `Store` op, page read batched).
+    /// - `crates/media/src/serve.rs` and `crates/prune/src/run.rs` — drive pooled reads
+    ///   for media refs and retention sweeps, not page reads.
+    /// - the integration tests in `crates/api/tests` and the `migrated_state` helper in
+    ///   `crates/api/tests/support/mod.rs` — they check what the server wrote, and a test
+    ///   asserting query counts has to reach the same pool the server used.
+    ///
+    /// When the last module is moved, this method goes away.
+    #[doc(hidden)]
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Wraps a pool this process already owns.
+    ///
+    /// This exists for the store's own integration tests, which are separate crates and
+    /// drive the raw, schema-scoped pool `sqlx::test` hands them. It is not an API entry
+    /// point: no handler may derive a `Store` from anything but [`Store::connect`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// The writer's own pool: one connection, built from this pool's connect options.

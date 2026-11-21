@@ -182,7 +182,9 @@ pub async fn show(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<AccountDto>> {
-    let account = nodus_server_store::accounts::by_id(state.store().pool(), &id)
+    let account = state
+        .store()
+        .account(&id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     if account.deleted_at.is_some() {
@@ -208,7 +210,9 @@ pub async fn delete(
     } else {
         auth.require_admin("admin:write")?;
     }
-    let account = nodus_server_store::accounts::by_id(state.store().pool(), &id)
+    let account = state
+        .store()
+        .account(&id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     if !account.local {
@@ -498,7 +502,9 @@ fn parse_id_list(raw: &str) -> Vec<String> {
 }
 
 async fn target(state: &AppState, id: &str) -> ApiResult<AccountRow> {
-    nodus_server_store::accounts::by_id(state.store().pool(), id)
+    state
+        .store()
+        .account(id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))
 }
@@ -558,7 +564,9 @@ pub async fn export(
     // Only local accounts have data here: a remote account's posts live on the instance
     // that minted them, and exporting the cached copy as though it were theirs would be a
     // worse answer than saying it is not ours to export.
-    let account = nodus_server_store::accounts::by_id(pool, &id)
+    let account = state
+        .store()
+        .account(&id)
         .await?
         .filter(|row| row.local)
         .ok_or_else(|| ApiError::not_found("Record not found"))?;

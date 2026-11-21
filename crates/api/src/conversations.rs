@@ -160,7 +160,7 @@ pub async fn read(
     )
     .await?
     {
-        if let Some(account) = nodus_server_store::accounts::by_id(pool, &account_id).await? {
+        if let Some(account) = state.store().account(&account_id).await? {
             accounts.push(AccountDto::from_row(&account, state.instance()));
         }
     }
@@ -235,7 +235,7 @@ async fn conversation_dto(
     )
     .await?
     {
-        if let Some(account) = nodus_server_store::accounts::by_id(pool, &account_id).await? {
+        if let Some(account) = state.store().account(&account_id).await? {
             accounts.push(AccountDto::from_row(&account, state.instance()));
         }
     }

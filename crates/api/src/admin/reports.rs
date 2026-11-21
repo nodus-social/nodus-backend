@@ -13,7 +13,7 @@ use serde_json::json;
 
 use nodus_server_store::moderation::{self, NewReport, ReportRow};
 use nodus_server_store::rules as store_rules;
-use nodus_server_store::{accounts, statuses};
+use nodus_server_store::statuses;
 
 use super::Body;
 use crate::auth::Auth;
@@ -70,16 +70,16 @@ pub(super) async fn report_dto(state: &AppState, row: ReportRow) -> ApiResult<Re
     // The instance files some reports itself (a content-set match), so a report may have
     // no reporter account; the console renders the field as optional either way.
     let reporter = match row.account_id.as_deref() {
-        Some(id) => accounts::by_id(pool, id).await?,
+        Some(id) => state.store().account(id).await?,
         None => None,
     };
-    let target = accounts::by_id(pool, &row.target_account_id).await?;
+    let target = state.store().account(&row.target_account_id).await?;
     let assigned = match row.assigned_account_id.as_deref() {
-        Some(id) => accounts::by_id(pool, id).await?,
+        Some(id) => state.store().account(id).await?,
         None => None,
     };
     let action_by = match row.action_taken_by_account_id.as_deref() {
-        Some(id) => accounts::by_id(pool, id).await?,
+        Some(id) => state.store().account(id).await?,
         None => None,
     };
     // A citation outlives the rule it names. Resolve what still exists and mark the rest
@@ -249,9 +249,7 @@ async fn assign(
 ) -> ApiResult<Json<ReportDto>> {
     auth.require_admin("admin:write")?;
     if let Some(account_id) = body.account_id.as_deref() {
-        let exists = accounts::by_id(state.store().pool(), account_id)
-            .await?
-            .is_some();
+        let exists = state.store().account(account_id).await?.is_some();
         if !exists {
             return Err(ApiError::unprocessable("that account does not exist"));
         }
@@ -320,7 +318,9 @@ async fn create(
     if form.account_id == auth.0.account.id {
         return Err(ApiError::unprocessable("you cannot report yourself"));
     }
-    let target = accounts::by_id(state.store().pool(), &form.account_id)
+    let target = state
+        .store()
+        .account(&form.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("that account does not exist"))?;
     let status_ids = split_ids(&form.status_ids);
@@ -473,9 +473,7 @@ async fn bulk_reports(
         .filter(|value| !value.is_empty());
     if action == "assign" {
         if let Some(assignee) = assignee {
-            let exists = accounts::by_id(state.store().pool(), assignee)
-                .await?
-                .is_some();
+            let exists = state.store().account(assignee).await?.is_some();
             if !exists {
                 return Err(ApiError::unprocessable("that account does not exist"));
             }

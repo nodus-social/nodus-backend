@@ -443,7 +443,8 @@ async fn activitypub_outbox_paginates_with_max_id() {
     run_serialized_db_test(|store, state| async move {
         let pool = store.pool();
         let author_id = create_account(pool, "apauthor").await;
-        let author = accounts::by_id(pool, &author_id)
+        let author = store
+            .account(&author_id)
             .await
             .expect("lookup")
             .expect("account");

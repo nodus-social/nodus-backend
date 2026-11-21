@@ -194,7 +194,7 @@ async fn misskey_create_note_fans_out_records_mentions_tags_and_counters() {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["id"], note_ext_id);
 
-        let alice_row = accounts::by_id(pool, &alice_id).await.unwrap().unwrap();
+        let alice_row = store.account(&alice_id).await.unwrap().unwrap();
         assert_eq!(alice_row.statuses_count, 1);
         assert!(alice_row.last_status_at.is_some());
 
@@ -298,7 +298,8 @@ async fn misskey_reply_and_delete_update_counters_and_dedupe_notifications() {
             0
         );
         assert_eq!(
-            accounts::by_id(pool, &bob_id)
+            store
+                .account(&bob_id)
                 .await
                 .unwrap()
                 .unwrap()
@@ -368,7 +369,8 @@ async fn misskey_renote_and_delete_update_reblogs_and_statuses_count() {
             0
         );
         assert_eq!(
-            accounts::by_id(pool, &bob_id)
+            store
+                .account(&bob_id)
                 .await
                 .unwrap()
                 .unwrap()

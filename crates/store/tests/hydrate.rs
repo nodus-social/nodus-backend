@@ -4,9 +4,10 @@
 mod support;
 
 use nodus_server_store::hydrate::{MentionRow, StatusDecorations, TransactionSettings};
+use nodus_server_store::media;
 use nodus_server_store::social::{self, Relationship};
 use nodus_server_store::statuses::{self, ReactionCount, StatusEmoji};
-use nodus_server_store::{accounts, media};
+use nodus_server_store::Store;
 use support::{account, attachment, cleanup, execute, setup, shorten_statement_timeout, status};
 
 /// A requested account or status with no row is absent, not padded; a relationship is keyed for every target, exactly as the scalar call answers. The transaction is asked, from inside it, what isolation it runs under.
@@ -100,7 +101,10 @@ async fn a_mixed_batch_matches_the_per_row_calls() {
         .expect("run the batch");
 
     for id in &targets {
-        let per_row = accounts::by_id(&pool, id).await.expect("per-row");
+        let per_row = Store::from_pool(pool.clone())
+            .account(id)
+            .await
+            .expect("per-row");
         assert_eq!(outcome.accounts.get(id), per_row.as_ref(), "account {id}");
     }
     let per_row = media::by_status(&pool, &post).await.expect("per-row media");

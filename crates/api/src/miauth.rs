@@ -17,8 +17,8 @@ use serde_json::json;
 use nodus_auth::domain::{is_admin_scope, is_safe_http_url, opaque_token, token_hash};
 use nodus_auth::store::{AuthStore, PgAuthStore};
 use nodus_auth::{ensure_csrf, has_valid_csrf, SESSION_COOKIE};
+use nodus_server_store::miauth;
 use nodus_server_store::miauth::{ApproveStatus, SessionCheck};
-use nodus_server_store::{accounts, miauth};
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -214,7 +214,9 @@ async fn check(State(state): State<AppState>, Path(session): Path<String>) -> Re
         return Json(json!({"ok": false})).into_response();
     }
     let user = match session_row.account_id.as_deref() {
-        Some(id) => accounts::by_id(state.store().pool(), id)
+        Some(id) => state
+            .store()
+            .account(id)
             .await
             .ok()
             .flatten()

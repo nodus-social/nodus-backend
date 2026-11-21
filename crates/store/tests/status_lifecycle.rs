@@ -3,6 +3,7 @@ use nodus_server_core::Id;
 use nodus_server_store::accounts::{self, NewAccount, RemoteAccount};
 use nodus_server_store::social;
 use nodus_server_store::statuses::{self, NewRemoteStatus, NewStatus};
+use nodus_server_store::Store;
 use sqlx::PgPool;
 
 async fn seed_account(pool: &PgPool, username: &str) -> String {
@@ -219,7 +220,11 @@ async fn delete_owned_cleans_timeline_entries_and_all_counters(pool: PgPool) {
             .unwrap();
     assert_eq!(remaining_entries, 0);
 
-    let bob_row = accounts::by_id(&pool, &bob).await.unwrap().unwrap();
+    let bob_row = Store::from_pool(pool.clone())
+        .account(&bob)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(bob_row.statuses_count, 0);
 
     let root_row = statuses::by_id(&pool, &root_id).await.unwrap().unwrap();
@@ -241,7 +246,11 @@ async fn delete_owned_cleans_timeline_entries_and_all_counters(pool: PgPool) {
     let root_row = statuses::by_id(&pool, &root_id).await.unwrap().unwrap();
     assert_eq!(root_row.reblogs_count, 0);
 
-    let bob_row = accounts::by_id(&pool, &bob).await.unwrap().unwrap();
+    let bob_row = Store::from_pool(pool.clone())
+        .account(&bob)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(bob_row.statuses_count, 0);
 }
 

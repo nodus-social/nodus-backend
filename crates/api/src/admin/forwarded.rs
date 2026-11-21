@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use nodus_server_core::Id;
-use nodus_server_store::accounts::{self, AccountRow};
+use nodus_server_store::accounts::AccountRow;
 use nodus_server_store::forwarded::{self, ForwardRow};
 use nodus_server_store::rules as store_rules;
 use nodus_server_store::{delivery, moderation, pauses, statuses};
@@ -212,7 +212,9 @@ pub(super) async fn forward_report(
         return Ok((false, row));
     }
 
-    let target = accounts::by_id(pool, &report.target_account_id)
+    let target = state
+        .store()
+        .account(&report.target_account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("the reported account no longer exists"))?;
     let (domain, inbox) = sendable_domain(state, &target).await?;

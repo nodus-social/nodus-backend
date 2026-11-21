@@ -291,7 +291,9 @@ async fn note(State(state): State<AppState>, Path(id): Path<String>) -> ApiResul
     if !matches!(row.visibility.as_str(), "public" | "unlisted") {
         return Err(ApiError::not_found("Record not found"));
     }
-    let account = accounts::by_id(state.store().pool(), &row.account_id)
+    let account = state
+        .store()
+        .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     let (value, _) = status_object(&state, &row, &account).await?;
@@ -1783,7 +1785,7 @@ async fn mentioned_actors(state: &AppState, row: &StatusRow) -> Vec<String> {
         .await
         .unwrap_or_default()
     {
-        match nodus_server_store::accounts::by_id(pool, &id).await {
+        match state.store().account(&id).await {
             Ok(Some(account)) => actors.push(actor_url(state, &account)),
             Ok(None) => {}
             Err(error) => {

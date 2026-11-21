@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use nodus_server_api::home::{self as home_timeline, HomeCache, HomeShards, MemoryHomeCache};
 use nodus_server_core::pagination::PageParams;
 use nodus_server_core::Id;
-use nodus_server_store::{accounts, media, polls, social, statuses, Store};
+use nodus_server_store::{media, polls, social, statuses, Store};
 
 use support::{
     create_account, create_status, create_token, expect_ok, follow, json_of, run_db_test, send,
@@ -187,9 +187,7 @@ async fn old_path_statements(store: &Store, page_ids: &[String], log: &CapturedL
         .await
         .expect("poll scan");
     for author in &authors {
-        let _ = accounts::by_id(store.pool(), author)
-            .await
-            .expect("author lookup");
+        let _ = store.account(author).await.expect("author lookup");
     }
     statements(log)
 }

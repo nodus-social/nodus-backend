@@ -957,7 +957,9 @@ async fn write_pause(
     .await?;
     let listed = pauses::ListedDomainPause {
         row,
-        created_by_handle: accounts::by_id(state.store().pool(), auth.0.account.id.as_str())
+        created_by_handle: state
+            .store()
+            .account(auth.0.account.id.as_str())
             .await?
             .map(|account| account.username),
     };

@@ -316,7 +316,8 @@ async fn staff_report_of_a_remote_account_queues_one_flag() {
                 .any(|item| item == "https://remote.test/notes/1"),
             "the reported post travels with the account: {object:?}"
         );
-        let moderator_name = accounts::by_id(pool, &moderator)
+        let moderator_name = store
+            .account(&moderator)
             .await
             .expect("read the moderator")
             .expect("moderator exists")
@@ -526,7 +527,8 @@ async fn forwarded_content_carries_rules_but_not_the_reporter() {
         );
         assert!(content.contains("we warned them last week"), "{content}");
 
-        let reporter_row = accounts::by_id(pool, &reporter)
+        let reporter_row = store
+            .account(&reporter)
             .await
             .expect("read the reporter")
             .expect("reporter exists");

@@ -6,6 +6,7 @@ use nodus_server_store::delivery;
 use nodus_server_store::media::{self, RemoteAttachment};
 use nodus_server_store::polls::{self, NewRemotePoll};
 use nodus_server_store::statuses::{self, NewRemoteStatus, NewStatus, StatusEmoji};
+use nodus_server_store::Store;
 use sqlx::PgPool;
 
 async fn seed_account(pool: &PgPool, username: &str) -> String {
@@ -227,7 +228,8 @@ async fn deleting_a_remote_actor_soft_deletes_every_note_it_posted(pool: PgPool)
         .await
         .expect("lookup")
         .is_some());
-    assert!(accounts::by_id(&pool, &eve)
+    assert!(Store::from_pool(pool.clone())
+        .account(&eve)
         .await
         .expect("lookup")
         .is_some());

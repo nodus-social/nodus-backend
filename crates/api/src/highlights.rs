@@ -53,7 +53,9 @@ pub async fn for_account(
     MaybeAuth(_auth): MaybeAuth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<FeaturedTagDto>>> {
-    let account = nodus_server_store::accounts::by_id(state.store().pool(), &id)
+    let account = state
+        .store()
+        .account(&id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     Ok(Json(tags(&state, &account.id).await?))

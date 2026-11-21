@@ -455,7 +455,9 @@ pub async fn history(
 ) -> ApiResult<Json<Vec<HistoryEntryDto>>> {
     auth.require_scope("read:statuses")?;
     let row = visible_status(&state, Some(&auth), &id).await?;
-    let author = nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id)
+    let author = state
+        .store()
+        .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     let account = AccountDto::from_row(&author, state.instance());
@@ -731,7 +733,9 @@ pub async fn account_statuses(
     Path(id): Path<String>,
     Query(query): Query<PageQuery>,
 ) -> ApiResult<Response> {
-    let account = nodus_server_store::accounts::by_id(state.store().pool(), &id)
+    let account = state
+        .store()
+        .account(&id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     let params = query.params()?;
@@ -766,7 +770,9 @@ pub(crate) async fn dto(
     row: &StatusRow,
     viewer: Option<&Auth>,
 ) -> ApiResult<StatusDto> {
-    let account = nodus_server_store::accounts::by_id(state.store().pool(), &row.account_id)
+    let account = state
+        .store()
+        .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
     let media = nodus_server_store::media::by_status(state.store().pool(), &row.id).await?;
@@ -777,10 +783,11 @@ pub(crate) async fn dto(
         if let Some(original) =
             nodus_server_store::statuses::by_id(state.store().pool(), original_id).await?
         {
-            let original_account =
-                nodus_server_store::accounts::by_id(state.store().pool(), &original.account_id)
-                    .await?
-                    .ok_or_else(|| ApiError::not_found("Record not found"))?;
+            let original_account = state
+                .store()
+                .account(&original.account_id)
+                .await?
+                .ok_or_else(|| ApiError::not_found("Record not found"))?;
             let original_media =
                 nodus_server_store::media::by_status(state.store().pool(), &original.id).await?;
             let mut boost = StatusDto::from_row_with_media(
@@ -837,7 +844,7 @@ async fn decorate(
     let emojis = nodus_server_store::statuses::emojis_of(pool, status_id).await?;
     let mut mentions = Vec::new();
     for account_id in nodus_server_store::statuses::mentions_of(pool, status_id).await? {
-        let Some(account) = nodus_server_store::accounts::by_id(pool, &account_id).await? else {
+        let Some(account) = state.store().account(&account_id).await? else {
             continue;
         };
         mentions.push(nodus_server_store::MentionRow {

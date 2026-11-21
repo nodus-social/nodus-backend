@@ -278,11 +278,7 @@ async fn conversation(state: &AppState, auth: &Auth, status_id: &str) -> Option<
             .await
             .ok()?
     {
-        if let Some(account) = nodus_server_store::accounts::by_id(pool, &account_id)
-            .await
-            .ok()
-            .flatten()
-        {
+        if let Some(account) = state.store().account(&account_id).await.ok().flatten() {
             accounts.push(AccountDto::from_row(&account, state.instance()));
         }
     }
