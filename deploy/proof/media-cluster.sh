@@ -15,7 +15,9 @@
 #   3. Delete A's file; require A still answers, and require the file is back on disk —
 #      the read miss fetched it from B and wrote what it fetched.
 #   4. Read bytes 0-3 of the original through A's public route and require a 206 carrying
-#      `Content-Range` and exactly those four bytes — the API is not in this path.
+#      `Content-Range` and exactly those four bytes — the API is not in this path. Then read
+#      the same four bytes of a variant through `/media/{id}/{layer}`, which reads a
+#      different file through the same slicing code.
 #   5. Delete both files; require 404. PUT to A again, wait for the replica, delete B's
 #      copy, and require the repair walk puts it back (nothing wrote to B this time).
 #   6. Kill A; require B still answers, and require a miss on B is a 404 that arrives
@@ -45,6 +47,12 @@ TOKEN=${CLUSTER_TOKEN:-proof}
 # script waits, long enough that a replicate-on-write cannot be mistaken for a repair.
 REPAIR_SECS=${REPAIR_SECS:-2}
 MEDIA_ID=proof-media-0001
+# The variant hangs off a second id. `/media/{id}` answers with a variant when its own file
+# is gone (the route falls back down the layer ladder), so a variant on the id above would
+# make section 4's "both copies gone still answers" check read 200 and mean nothing. The
+# second row names the same blob: deduplication is a thing the schema allows, and it keeps
+# the repair walk with one digest to think about.
+VARIANT_ID=proof-variant-0001
 
 now_ms() { date +%s%3N; }
 say() { printf '\n== %s\n' "$*"; }
@@ -188,6 +196,17 @@ DIGEST=$(sha256sum "$BLOB" | cut -d' ' -f1)
 SIZE=$(wc -c <"$BLOB")
 note "digest $DIGEST ($SIZE bytes)"
 
+# A variant is a second file with its own digest and its own row, so the range section needs
+# one of each. The bytes deliberately do not start with the original's
+# (`nodu`) and are a different length: an answer taken from the original instead of the
+# variant is still a 206 and still carries a `Content-Range`, so only its bytes and its total
+# give it away.
+VARIANT_BLOB=$WORK/variant
+printf 'preview bytes for the media cluster proof\n' >"$VARIANT_BLOB"
+VARIANT_DIGEST=$(sha256sum "$VARIANT_BLOB" | cut -d' ' -f1)
+VARIANT_SIZE=$(wc -c <"$VARIANT_BLOB")
+note "variant digest $VARIANT_DIGEST ($VARIANT_SIZE bytes)"
+
 # ---------------------------------------------------------------- two nodes, one host
 
 # Each node is a file of environment, so what it was told is on disk if a run goes wrong.
@@ -252,6 +271,14 @@ wait_until "both nodes are cluster members" 30 both_members
 # The helper takes the database from DATABASE_URL, and the proof inserted into a named
 # database: name it here rather than relying on the inherited value, which is the caller's
 # own database and must never be written to.
+#
+# The variant needs a row on a second id and a file of its own: `/media/{id}/{layer}` answers
+# from `media_variant` and silently falls back to the original when the row is absent, so the
+# file goes where the processor would have written it on A and the row is seeded beside the
+# original's. The database outlives a run, so any variant row left on the original's id goes
+# first: `/media/{id}` falls back to a variant when its own file is gone, and a leftover row
+# would answer the check in section 4 with a 200 it does not deserve.
+cp "$VARIANT_BLOB" "$STORE_A/variants/$VARIANT_DIGEST"
 DATABASE_URL="$PROOF_URL" cargo run -q --manifest-path "$ROOT/Cargo.toml" \
     -p nodus-server-store --example proofdb -- sql \
     "INSERT INTO account (id, username) VALUES ('proof-account', 'proof')
@@ -259,7 +286,15 @@ DATABASE_URL="$PROOF_URL" cargo run -q --manifest-path "$ROOT/Cargo.toml" \
      INSERT INTO media_attachment (id, account_id, digest, content_type, size, processing_state)
        VALUES ('$MEDIA_ID', 'proof-account', '$DIGEST', 'image/png', $SIZE, 'ready')
        ON CONFLICT (id) DO UPDATE
-         SET digest = EXCLUDED.digest, size = EXCLUDED.size, original_pruned = false;" >/dev/null
+         SET digest = EXCLUDED.digest, size = EXCLUDED.size, original_pruned = false;
+     INSERT INTO media_attachment (id, account_id, digest, content_type, size, processing_state)
+       VALUES ('$VARIANT_ID', 'proof-account', '$DIGEST', 'image/png', $SIZE, 'ready')
+       ON CONFLICT (id) DO UPDATE
+         SET digest = EXCLUDED.digest, size = EXCLUDED.size, original_pruned = false;
+     DELETE FROM media_variant WHERE media_id IN ('$MEDIA_ID', '$VARIANT_ID');
+     INSERT INTO media_variant (media_id, layer, max_edge, object_key, content_type, digest, size)
+       VALUES ('$VARIANT_ID', 'preview', 512, 'variants/$VARIANT_DIGEST', 'image/png',
+               '$VARIANT_DIGEST', $VARIANT_SIZE);" >/dev/null
 
 # ---------------------------------------------------------------- 1. replicate on write
 
@@ -313,6 +348,26 @@ if cmp -s "$WORK/range-body" "$WORK/first-four"; then
     pass "the ranged answer is exactly the first four bytes of the original"
 else
     fail "the ranged answer is exactly the first four bytes of the original"
+fi
+
+# The variant route slices with the same helpers but reads a different file, so it carries
+# the same three assertions against its own bytes. The total in `Content-Range` is part of
+# the check because it is the variant's length, not the original's: an answer that fell back
+# to the original would otherwise look like a ranged read that worked.
+head -c 4 "$VARIANT_BLOB" >"$WORK/variant-first-four"
+code=$(curl -s -D "$WORK/variant-range-headers" -o "$WORK/variant-range-body" \
+    -w '%{http_code}' --max-time 10 -r 0-3 \
+    "http://127.0.0.1:$PORT_A/media/$VARIANT_ID/preview")
+expect "a ranged variant read is a 206" 206 "$code"
+if grep -qai "^content-range: bytes 0-3/$VARIANT_SIZE" "$WORK/variant-range-headers"; then
+    pass "the ranged variant answer says which bytes of the variant it carries"
+else
+    fail "the ranged variant answer says which bytes of the variant it carries"
+fi
+if cmp -s "$WORK/variant-range-body" "$WORK/variant-first-four"; then
+    pass "the ranged variant answer is exactly the first four bytes of the variant"
+else
+    fail "the ranged variant answer is exactly the first four bytes of the variant"
 fi
 
 # ---------------------------------------------------------------- 4. repair pushes
