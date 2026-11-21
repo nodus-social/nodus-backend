@@ -27,13 +27,35 @@ use sqlx::PgPool;
 async fn setup(config: WriterConfig) -> Option<(DbWriterHandle, PgPool, String)> {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://nodus:nodus@localhost:5432/nodus".to_owned());
-    let read = match PgPoolOptions::new().max_connections(4).connect(&url).await {
+    let admin = match PgPoolOptions::new().max_connections(1).connect(&url).await {
         Ok(pool) => pool,
         Err(error) => {
             eprintln!("skipping the writer tests: {error}");
             return None;
         }
     };
+
+    // A schema of this test's own, for the reason every other database suite here takes
+    // one: `migrate()` compares the rows in `_sqlx_migrations` against the files and
+    // refuses to run when a row was applied from different bytes. `public` on a long-lived
+    // development database carries rows from an older migration set, which made every test
+    // in this file fail with `VersionMismatch(1)` for a reason that has nothing to do with
+    // the writer. `public` stays last in the path so extensions and helper tables already
+    // installed there are still reachable.
+    let schema = format!("pgtest_{}", nodus_server_core::Id::new()).to_lowercase();
+    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&admin)
+        .await
+        .expect("create the test schema");
+    drop(admin);
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let schema_url = format!("{url}{separator}options=-csearch_path%3D{schema}%2Cpublic");
+
+    let read = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&schema_url)
+        .await
+        .expect("connect the isolated read pool");
     sqlx::migrate!("./migrations")
         .run(&read)
         .await
@@ -57,7 +79,7 @@ async fn setup(config: WriterConfig) -> Option<(DbWriterHandle, PgPool, String)>
     // The writer's pool is its own: one connection, never shared with the readers.
     let write = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&url)
+        .connect(&schema_url)
         .await
         .expect("connect the write pool");
     let (writer, task) = DbWriter::start(write, config);
@@ -66,13 +88,24 @@ async fn setup(config: WriterConfig) -> Option<(DbWriterHandle, PgPool, String)>
     Some((writer, read, account))
 }
 
-/// Removes everything the test wrote: the drive rows cascade from the account.
+/// Removes everything the test wrote, then the schema it ran in.
+///
+/// The schema is read back with `current_schema()`, so this can only ever drop the
+/// `pgtest_…` schema the pool was connected to — `public` is not this function's to drop.
 async fn cleanup(pool: &PgPool, account: &str) {
     sqlx::query("DELETE FROM account WHERE id = $1")
         .bind(account)
         .execute(pool)
         .await
         .expect("delete the test account");
+    let schema: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(pool)
+        .await
+        .expect("read the test schema name");
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(pool)
+        .await
+        .expect("drop the test schema");
 }
 
 /// Forty writes posted at once all apply, and every `oneshot` resolves.
