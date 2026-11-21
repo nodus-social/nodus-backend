@@ -23,7 +23,7 @@ use super::{Batch, EssentialOp, RowMap};
 use crate::statuses::StatusEmoji;
 
 /// What a status carries beside its own columns.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatusDecorations {
     /// Hashtags without the leading `#`, in the order a single-status read returns them.
     pub tags: Vec<String>,
@@ -34,7 +34,7 @@ pub struct StatusDecorations {
 }
 
 /// A mentioned account, reduced to what a mention payload is built from.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MentionRow {
     pub id: String,
     pub username: String,

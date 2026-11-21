@@ -19,7 +19,7 @@ use nodus_server_core::{Id, PageOrder, PageParams, PageSize};
 ///
 /// The cast is not cosmetic: sqlx has no codec for `citext`, and a `String` column
 /// read through a `citext` OID fails at runtime rather than at compile time.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, PartialEq, FromRow)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct AccountRow {
     pub id: String,

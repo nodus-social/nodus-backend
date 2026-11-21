@@ -1,92 +1,17 @@
-//! The batched read seam, against a live database. Four properties carry this module and are what these tests prove: results are keyed by the id asked for (a missing row is absent, not padded), the batched shape answers exactly what the per-row calls it replaces answer, the essential ops share one snapshot, and an optional op may fail without taking the page down. Each test takes a schema of its own, the same isolation every other database suite here uses.
+//! The batched read seam, against a live database. Four properties carry this module: results are keyed by the id asked for (a missing row is absent, not padded), the batched shape returns the same values the per-row calls return, the essentials run in one transaction Postgres itself reports as `repeatable read`/`read only`, and an optional op runs after that transaction commits, so its failure cannot take the page down.
 
-use nodus_server_core::Id;
-use nodus_server_store::accounts;
-use nodus_server_store::media;
-use nodus_server_store::social;
-use nodus_server_store::statuses;
-use nodus_server_store::Store;
-use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+#[path = "hydrate/support.rs"]
+mod support;
 
-async fn setup() -> Option<(Store, PgPool, String)> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("connect to postgres");
+use nodus_server_store::hydrate::{MentionRow, StatusDecorations, TransactionSettings};
+use nodus_server_store::social::{self, Relationship};
+use nodus_server_store::statuses::{self, ReactionCount, StatusEmoji};
+use nodus_server_store::{accounts, media};
+use support::{account, attachment, cleanup, execute, setup, shorten_statement_timeout, status};
 
-    // Lower case, because `search_path` folds unquoted identifiers: a name with capitals would land in `public` instead.
-    let schema = format!("pgtest_hydrate_{}", Id::new()).to_lowercase();
-    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-        .execute(&admin)
-        .await
-        .expect("create the test schema");
-    let separator = if url.contains('?') { '&' } else { '?' };
-    let schema_url = format!("{url}{separator}options=-csearch_path%3D{schema}%2Cpublic");
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&schema_url)
-        .await
-        .expect("connect the isolated pool");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("run migrations");
-    let store = Store::connect(&schema_url, 4)
-        .await
-        .expect("connect the store");
-    Some((store, pool, schema))
-}
-
-async fn cleanup(pool: &PgPool, schema: &str) {
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
-        .execute(pool)
-        .await
-        .expect("drop the test schema");
-}
-
-/// Seeds through raw SQL: the hydration ops only read accounts by id, so the fixture needs the required columns (id, username) and nothing else.
-async fn account(pool: &PgPool, username: &str) -> String {
-    let id = Id::new().to_string();
-    sqlx::query("INSERT INTO account (id, username) VALUES ($1, $2)")
-        .bind(&id)
-        .bind(username)
-        .execute(pool)
-        .await
-        .expect("seed account");
-    id
-}
-
-/// The hydration ops only read a status by id, so the fixture needs the required columns and nothing else; going through `statuses::insert` would derive columns no assertion here touches.
-async fn status(pool: &PgPool, author: &str, content: &str) -> String {
-    let id = Id::new().to_string();
-    sqlx::query("INSERT INTO status (id, account_id, content, content_html, visibility) VALUES ($1, $2, $3, $3, 'public')")
-    .bind(&id)
-    .bind(author)
-    .bind(content)
-    .execute(pool)
-    .await
-    .expect("seed status");
-    id
-}
-
-/// Same reasoning as `status`: the reader only needs the attachment row, so seed the required columns (the rest default like `media::insert` leaves them).
-async fn attachment(pool: &PgPool, author: &str, status_id: &str) {
-    sqlx::query("INSERT INTO media_attachment (id, account_id, status_id, digest, content_type, size) VALUES ($1, $2, $3, $4, 'image/png', 128)")
-    .bind(Id::new().to_string())
-    .bind(author)
-    .bind(status_id)
-    .bind(Id::new().to_string())
-    .execute(pool)
-    .await
-    .expect("seed attachment");
-}
-
-/// A requested account or status with no row is absent, not padded (a relationship is keyed for every target, as the scalar call answers). A page of three essential ops still reads one snapshot.
+/// A requested account or status with no row is absent, not padded; a relationship is keyed for every target, exactly as the scalar call answers. The transaction is asked, from inside it, what isolation it runs under.
 #[tokio::test]
-async fn maps_are_keyed_by_input_and_the_page_reads_one_snapshot() {
+async fn reads_one_repeatable_read_transaction_and_keys_by_input() {
     let Some((store, pool, schema)) = setup().await else {
         return;
     };
@@ -96,17 +21,16 @@ async fn maps_are_keyed_by_input_and_the_page_reads_one_snapshot() {
     let without_media = status(&pool, &alice, "without media").await;
     attachment(&pool, &alice, &with_media).await;
 
-    let accounts = vec![alice.clone(), "no-such-account".to_owned()];
-    let statuses = vec![
-        with_media.clone(),
-        without_media.clone(),
-        "no-such-id".to_owned(),
-    ];
     let outcome = store
         .batch()
-        .accounts(&accounts)
-        .media_by_status(&statuses)
+        .accounts(&[alice.clone(), "no-such-account".to_owned()])
+        .media_by_status(&[
+            with_media.clone(),
+            without_media.clone(),
+            "no-such-id".to_owned(),
+        ])
         .relationships(&alice, &[bob.clone(), "no-such-account".to_owned()])
+        .transaction_settings()
         .run()
         .await
         .expect("run the batch");
@@ -117,23 +41,25 @@ async fn maps_are_keyed_by_input_and_the_page_reads_one_snapshot() {
         outcome.media_by_status.get(&with_media).map(Vec::len),
         Some(1)
     );
-    assert_eq!(outcome.media_by_status.len(), 1, "an empty group is absent");
     assert!(!outcome.media_by_status.contains_key(&without_media));
+    assert_eq!(outcome.relationships.len(), 2, "every target is keyed");
+    let unflagged = Some(&Relationship::default());
+    for target in [&bob, &"no-such-account".to_owned()] {
+        assert_eq!(outcome.relationships.get(target), unflagged, "never absent");
+    }
     assert_eq!(
-        outcome.relationships.len(),
-        2,
-        "every requested target gets a relationship"
-    );
-    assert!(outcome.relationships.contains_key(&bob));
-    assert_eq!(
-        outcome.snapshots_opened, 1,
-        "a page comes from one point in time"
+        outcome.transaction_settings,
+        Some(TransactionSettings {
+            isolation: "repeatable read".to_owned(),
+            read_only: "on".to_owned(),
+        }),
+        "Postgres, not the seam's bookkeeping, says which transaction this page ran in"
     );
 
     cleanup(&pool, &schema).await;
 }
 
-/// The batched shape answers exactly what the per-row calls it replaces answer.
+/// The batched shape answers exactly what the per-row calls it replaces answer, compared as values rather than as formatted strings. Both follow directions plus a mute and a block set every flag the relationship query builds.
 #[tokio::test]
 async fn a_mixed_batch_matches_the_per_row_calls() {
     let Some((store, pool, schema)) = setup().await else {
@@ -141,8 +67,7 @@ async fn a_mixed_batch_matches_the_per_row_calls() {
     };
     let alice = account(&pool, "alice").await;
     let bob = account(&pool, "bob").await;
-    // Both directions plus a mute and a block set every flag the relationship query builds.
-    social::follow(&pool, &alice, &bob, false, true)
+    social::follow(&pool, &alice, &bob, true, true)
         .await
         .expect("follow");
     social::follow(&pool, &bob, &alice, true, false)
@@ -158,88 +83,165 @@ async fn a_mixed_batch_matches_the_per_row_calls() {
     statuses::set_reaction(&pool, &post, &alice, "⭐")
         .await
         .expect("react");
-    statuses::set_reaction(&pool, &post, &bob, "⭐")
-        .await
-        .expect("react");
     statuses::set_reaction(&pool, &post, &bob, "👍")
         .await
         .expect("react");
 
-    let accounts = vec![alice.clone(), bob.clone()];
+    let targets = vec![alice.clone(), bob.clone()];
     let ids = vec![post.clone()];
     let outcome = store
         .batch()
-        .accounts(&accounts)
+        .accounts(&targets)
         .media_by_status(&ids)
         .reactions(&ids)
-        .relationships(&alice, &accounts)
+        .relationships(&alice, &targets)
         .run()
         .await
         .expect("run the batch");
 
-    for id in &accounts {
-        let per_row = accounts::by_id(&pool, id)
-            .await
-            .expect("per-row")
-            .expect("exists");
-        assert_eq!(
-            format!("{:?}", outcome.accounts.get(id)),
-            format!("{:?}", Some(per_row)),
-            "account {id} differs"
-        );
+    for id in &targets {
+        let per_row = accounts::by_id(&pool, id).await.expect("per-row");
+        assert_eq!(outcome.accounts.get(id), per_row.as_ref(), "account {id}");
     }
     let per_row = media::by_status(&pool, &post).await.expect("per-row media");
-    let batched = format!("{:?}", outcome.media_by_status.get(&post));
-    assert_eq!(
-        batched,
-        format!("{:?}", Some(&per_row)),
-        "attachments differ"
-    );
+    assert_eq!(outcome.media_by_status.get(&post), Some(&per_row));
     let per_row = statuses::reactions(&pool, &post)
         .await
         .expect("per-row reactions");
-    let batched = format!("{:?}", outcome.reactions.expect("reactions op").get(&post));
-    assert_eq!(batched, format!("{:?}", Some(&per_row)), "reactions differ");
+    let reactions = outcome.reactions.expect("reactions op");
+    assert_eq!(reactions.get(&post), Some(&per_row));
     let per_row = social::relationship(&pool, &alice, &bob)
         .await
         .expect("per-row relationship");
-    let batched = format!("{:?}", outcome.relationships.get(&bob));
     assert_eq!(
-        batched,
-        format!("{:?}", Some(&per_row)),
-        "relationship differs"
+        outcome.relationships.get(&bob),
+        Some(&per_row),
+        "follow, reblogs, notify, mute, block and followed-by all agree"
     );
 
     cleanup(&pool, &schema).await;
 }
 
-/// A failing optional op is reported in its slot, and the essential page survives.
+/// A decorated status comes back with the rows that were inserted, and a bare one is absent rather than an empty entry.
 #[tokio::test]
-async fn an_optional_op_failure_leaves_the_essential_results_intact() {
+async fn decorations_carry_the_values_that_were_inserted() {
     let Some((store, pool, schema)) = setup().await else {
         return;
     };
     let alice = account(&pool, "alice").await;
-    // A deterministic error for the optional op: its table is gone, the account table is not.
-    sqlx::query("DROP TABLE status_reaction CASCADE")
-        .execute(&pool)
+    let bob = account(&pool, "bob").await;
+    let decorated = status(&pool, &alice, "decorated").await;
+    let bare = status(&pool, &alice, "bare").await;
+    execute(
+        &pool,
+        "INSERT INTO status_tag (status_id, tag) VALUES ($1, 'rust')",
+        &[&decorated],
+    )
+    .await;
+    execute(
+        &pool,
+        "INSERT INTO status_emoji (status_id, shortcode, url, position) VALUES ($1, 'blob', 'https://cdn.example/blob.png', 0)",
+        &[&decorated],
+    )
+    .await;
+    execute(
+        &pool,
+        "INSERT INTO status_mention (status_id, account_id) VALUES ($1, $2)",
+        &[&decorated, &bob],
+    )
+    .await;
+
+    let outcome = store
+        .batch()
+        .decorations(&[decorated.clone(), bare.clone()])
+        .run()
         .await
-        .expect("drop table");
+        .expect("run the batch");
+
+    assert_eq!(
+        outcome.decorations.get(&decorated),
+        Some(&StatusDecorations {
+            tags: vec!["rust".to_owned()],
+            emojis: vec![StatusEmoji {
+                shortcode: "blob".to_owned(),
+                url: "https://cdn.example/blob.png".to_owned(),
+            }],
+            mentions: vec![MentionRow {
+                id: bob.clone(),
+                username: "bob".to_owned(),
+                domain: None,
+            }],
+        }),
+        "exactly the tag, emoji and mention that were inserted"
+    );
+    assert_eq!(
+        outcome.decorations.get(&bare),
+        None,
+        "a bare status is absent, not padded with empty vectors"
+    );
+
+    cleanup(&pool, &schema).await;
+}
+
+/// The optional op runs after the essential transaction has committed: the essentials come back while the reactions table is still locked, and only the reactions slot fails. Were the ordering reversed — reactions first, or inside the essential transaction — the cancelled statement would abort that transaction and `run` would return `Err` with no page at all.
+#[tokio::test]
+async fn optional_ops_run_after_the_essential_transaction_commits() {
+    let Some((store, pool, schema)) = setup().await else {
+        return;
+    };
+    let alice = account(&pool, "alice").await;
+    let post = status(&pool, &alice, "post").await;
+    statuses::set_reaction(&pool, &post, &alice, "⭐")
+        .await
+        .expect("react");
+    shorten_statement_timeout(store.pool()).await;
+
+    // A separate connection holds the reactions table; the batch's own connections are short on statement_timeout, so its reaction query is cancelled rather than left waiting.
+    let mut locker = pool.acquire().await.expect("hold the locker");
+    execute(&mut *locker, "BEGIN", &[]).await;
+    execute(
+        &mut *locker,
+        "LOCK TABLE status_reaction IN ACCESS EXCLUSIVE MODE",
+        &[],
+    )
+    .await;
 
     let outcome = store
         .batch()
         .accounts(std::slice::from_ref(&alice))
-        .reactions(std::slice::from_ref(&alice))
+        .reactions(std::slice::from_ref(&post))
         .run()
         .await
-        .expect("an optional failure must not fail the page");
-
-    assert!(outcome.accounts.contains_key(&alice));
-    let error = outcome.reactions.expect_err("the reaction op failed");
+        .expect("the essentials still commit");
+    // Both assertions run while the lock is held: the page's authors are readable, so the essential transaction committed before the blocked statement was attempted.
+    assert!(outcome.accounts.contains_key(&alice), "the page survived");
+    let error = outcome.reactions.expect_err("the locked query failed");
     assert_eq!(
         error.code(),
-        Some("42P01"),
-        "the failure is reported, not hidden"
+        Some("57014"),
+        "cancelled, not silently skipped"
+    );
+
+    execute(&mut *locker, "COMMIT", &[]).await;
+    let outcome = store
+        .batch()
+        .accounts(std::slice::from_ref(&alice))
+        .reactions(std::slice::from_ref(&post))
+        .run()
+        .await
+        .expect("re-run after the release");
+    assert_eq!(
+        outcome.reactions.expect("reactions after the release"),
+        [(
+            post.clone(),
+            vec![ReactionCount {
+                reaction: "⭐".to_owned(),
+                count: 1,
+            }],
+        )]
+        .into_iter()
+        .collect(),
+        "the same op answers once the table is free"
     );
 
     cleanup(&pool, &schema).await;

@@ -15,7 +15,7 @@ use sqlx::{FromRow, PgPool};
     clippy::struct_excessive_bools,
     reason = "a database row, not an option struct"
 )]
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub struct MediaRow {
     pub id: String,
     pub account_id: String,

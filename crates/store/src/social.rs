@@ -9,7 +9,7 @@ use sqlx::{FromRow, PgPool};
 
 use nodus_server_core::Id;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Relationship {
     pub following: bool,

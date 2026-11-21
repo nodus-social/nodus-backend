@@ -120,7 +120,7 @@ pub async fn replace_mentions(
 }
 
 /// A custom emoji a status uses, without the surrounding colons.
-#[derive(Debug, Clone, FromRow, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, FromRow, serde::Deserialize)]
 pub struct StatusEmoji {
     pub shortcode: String,
     pub url: String,

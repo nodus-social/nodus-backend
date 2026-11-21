@@ -13,7 +13,7 @@
 use super::{Batch, EssentialOp, RowMap};
 
 /// Dialect ids for one page, keyed by the local id that was asked for.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExternalIds {
     /// Status id → dialect id.
     pub statuses: RowMap<String>,

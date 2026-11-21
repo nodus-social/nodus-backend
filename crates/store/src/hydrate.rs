@@ -2,7 +2,7 @@
 //!
 //! A feed handler knows what a page needs — authors, attachments, reaction chips, the viewer's relationship to each author — and asks for them one row at a time today, because the free functions take one id. One [`Batch`] expresses the whole page, so the query count is a property of the page, not of its length.
 //!
-//! A page assembled from separate snapshots can show a status whose author row is already gone: the media query sees the attachments, the account query misses the author, and the handler renders a row with attachments and no author (or drops it silently, advancing the client's cursor past a row it never saw). One `REPEATABLE READ READ ONLY` transaction fixes the page to a single point in time. Read-only also means a mistake such as an `UPDATE` inside a batch fails loudly instead of polluting the snapshot.
+//! A page assembled from separate snapshots can show a status whose author row is already gone: the media query sees the attachments, the account query misses the author, and the handler renders a row with attachments and no author (or drops it silently, advancing the client's cursor past a row it never saw). One `REPEATABLE READ READ ONLY` transaction fixes the page to a single point in time, so "one snapshot" means "one transaction, opened at repeatable read" — and `tests/hydrate.rs` proves it by asking Postgres inside the transaction what isolation it is in, not by counting the seam's own bookkeeping. Read-only also means a mistake such as an `UPDATE` inside a batch fails loudly instead of polluting the snapshot.
 //!
 //! Inside a transaction one failed statement aborts the whole transaction, so an op cannot be "allowed to fail" there. Optional ops therefore run after the essential transaction commits, as their own implicit transactions: a reaction aggregate that errors is reported in [`BatchOutcome::reactions`], and the page still renders without reaction chips. Reads do not fsync, so the extra statement is cheaper than a page that 500s over a decoration.
 //!
@@ -10,10 +10,13 @@
 
 mod decorations;
 mod external_ids;
+mod probe;
 mod relationships;
 
 pub use decorations::{MentionRow, StatusDecorations};
 pub use external_ids::ExternalIds;
+#[doc(hidden)]
+pub use probe::TransactionSettings;
 
 use std::collections::BTreeMap;
 
@@ -43,6 +46,7 @@ enum EssentialOp {
         statuses: Vec<String>,
         accounts: Vec<String>,
     },
+    TransactionSettings,
 }
 
 enum OptionalOp {
@@ -97,9 +101,6 @@ impl Batch<'_> {
     ///
     /// Returns the first essential op's failure; optional failures are reported per slot in the outcome instead.
     pub async fn run(self) -> Result<BatchOutcome, StoreError> {
-        // Counted next to the `begin_with`, not assumed: a refactor that opens a second transaction in here must bump this to keep the test honest.
-        let mut snapshots_opened = 0;
-        snapshots_opened += 1;
         // `begin_with` so the isolation level is part of the transaction's first statement; `SET TRANSACTION` after a query would be rejected by Postgres.
         let mut tx = self
             .store
@@ -113,7 +114,7 @@ impl Batch<'_> {
             decorations: RowMap::new(),
             external_ids: ExternalIds::default(),
             reactions: Ok(RowMap::new()),
-            snapshots_opened: 0,
+            transaction_settings: None,
         };
         for op in &self.essential {
             match op {
@@ -134,10 +135,13 @@ impl Batch<'_> {
                     outcome.external_ids =
                         external_ids::fetch_external_ids(&mut *tx, statuses, accounts).await?;
                 }
+                EssentialOp::TransactionSettings => {
+                    outcome.transaction_settings =
+                        Some(probe::fetch_transaction_settings(&mut *tx).await?);
+                }
             }
         }
         tx.commit().await?;
-        outcome.snapshots_opened = snapshots_opened;
         for op in &self.optional {
             let OptionalOp::Reactions(ids) = op;
             outcome.reactions = fetch_reactions(self.store.pool(), ids)
@@ -162,8 +166,10 @@ pub struct BatchOutcome {
     pub external_ids: ExternalIds,
     /// Reaction counts, keyed by status id, or the optional op's failure.
     pub reactions: Result<RowMap<Vec<ReactionCount>>, StoreError>,
-    /// How many snapshot transactions this batch opened: a test asserts a four-op page costs one.
-    pub snapshots_opened: usize,
+    /// What Postgres reported about the essential transaction, when the test-only
+    /// [`Batch::transaction_settings`] op ran. `None` otherwise.
+    #[doc(hidden)]
+    pub transaction_settings: Option<TransactionSettings>,
 }
 
 async fn fetch_accounts<'e>(
