@@ -77,3 +77,7 @@ cargo run -p nodus-server-worker   # job runner, one process per replica
 | `docs/11-service-boundaries.md` | service crates, gRPC contracts, monolith/strict/split modes |
 | `docs/15-home-timelines.md` | home-timeline Valkey fan-out, fallback, provisioning and runbook |
 | `docs/media-cluster.md` | media placement and replication, range answers, the two-node proof |
+| `docs/16-capabilities.md` | what `/api/v1/meta` publishes, how the SDK baselines a protocol, which doors the shell draws |
+
+Capabilities are the contract between those three vocabularies: read `docs/16-capabilities.md`
+before adding a route, a `Feature` variant or a `Surface`.
