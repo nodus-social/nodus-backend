@@ -38,6 +38,7 @@ pub mod media_nodes;
 pub mod miauth;
 pub mod moderation;
 pub mod moderation_rules;
+pub mod nodeinfo;
 pub mod pauses;
 pub mod polls;
 pub mod remote_moderation;

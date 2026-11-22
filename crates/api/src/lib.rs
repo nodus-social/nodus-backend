@@ -37,6 +37,7 @@ pub mod meta;
 pub mod miauth;
 pub mod misskey;
 mod misskey_page;
+pub mod nodeinfo;
 pub mod nodus;
 pub mod notifications;
 pub mod outbox;
@@ -193,6 +194,7 @@ pub fn router(state: AppState) -> axum::Router {
 /// resolves from the domain root.
 pub fn root_router(state: AppState) -> axum::Router {
     router(state.clone())
+        .merge(nodeinfo::router(state.clone()))
         .merge(activitypub::router(state.clone()))
         // Secure mode wraps the whole root surface rather than each ActivityPub
         // handler: a read can arrive as `/users/alice`, as `/actor`, or as an

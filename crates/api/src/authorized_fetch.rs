@@ -92,7 +92,13 @@ fn needs_signature(request: &Request) -> bool {
         return false;
     }
     let path = request.uri().path();
-    if path.starts_with("/.well-known/") || path.starts_with("/api/") || path.starts_with("/media/")
+    // Discovery stays public in both spellings: WebFinger because a peer cannot sign a
+    // lookup it does not yet know the key for, and NodeInfo because a directory reads it
+    // before it has any relationship with this instance. Neither is content.
+    if path.starts_with("/.well-known/")
+        || path.starts_with("/nodeinfo/")
+        || path.starts_with("/api/")
+        || path.starts_with("/media/")
     {
         return false;
     }
@@ -437,6 +443,7 @@ mod tests {
             "/api/v1/statuses/1",
             Some("application/json")
         )));
+        assert!(!needs_signature(&read("/nodeinfo/2.0", None)));
         assert!(!needs_signature(&read("/@alice/1", Some("text/html"))));
         let post = Request::builder()
             .method("POST")
