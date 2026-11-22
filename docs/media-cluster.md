@@ -305,6 +305,68 @@ Uploads do not go through this: the API writes an original with its own `PUT` to
 `NODUS_MEDIA_CLUSTER_URL`, and that name may be this same site vhost because the hash sends
 it to the owner anyway.
 
+### Two nodes on CT 118
+
+The production instance runs both media nodes on one container, because that is where its
+storage is:
+
+| unit | port | `NODUS_MEDIA_NODE` | `NODUS_MEDIA_DIR` | telemetry socket |
+| --- | --- | --- | --- | --- |
+| `nodus-media` | 3003 | `media1` | `/mnt/nodus-media` (Storage Box mount) | `media-telemetry.sock` |
+| `nodus-media2` | 3005 | `media2` | `/var/lib/nodus/media-b` | `media2-telemetry.sock` |
+
+`nodus-media` takes everything from `/etc/nodus-backend.env` and adds only a name, through
+`/etc/systemd/system/nodus-media.service.d/10-node.conf`: the heartbeat is an upsert on the
+name, so two unnamed nodes would keep overwriting one row and the cluster would be one
+member pretending to be two.
+
+`nodus-media2.service` reads two environment files: the shared one, then
+`/etc/nodus-media2.env`. That order is the mechanism, not a detail. systemd lets a later
+`EnvironmentFile=` override an earlier one, while values from those files override
+`Environment=` — so a `NODUS_MEDIA_DIR=` written in the unit would lose to the shared
+file's `/mnt/nodus-media`, and node 2 would quietly serve node 1's directory. The name, the
+directory and the telemetry socket therefore live in the second file, which is read last.
+
+**The storage is a trade-off, not a posture.** Node 1 is the Storage Box mount; node 2 is
+local disk on CT 118 (8 GB, and not durable across a rebuild). That is enough to prove the
+mechanism — placement, replicate-on-write, peer fetch, repair — and it is not two replicas
+in any useful sense: the same host, its power and its kernel are still a single point of
+failure, and neither copy is a backup. Two directories on the same FUSE mount would prove
+less still, because a "replica" there is the same bytes behind the same mount.
+
+The cluster token is one line in the shared env file — `openssl rand -hex 32` into
+`NODUS_MEDIA_CLUSTER_TOKEN`, file `0640 root:nodus` — so both media units and both API
+units see it. The API pair write originals through `NODUS_MEDIA_CLUSTER_URL`
+(`http://10.0.1.18:3003` in production); that node answers, replicates to the placement
+peer, and the front door serves the digest from whichever node Caddy hashes it to.
+
+The Caddy block above is the one in `/etc/caddy/nodus.caddy` on CT 100, with two changes
+forced by the installed version: the policy is spelled `lb_policy uri_hash` (this build of
+Caddy 2.6 names the request-URI hash that way; upstream 2.7 spells it
+`hash {http.request.uri}`) and the upstreams are `10.0.1.18:3003 10.0.1.18:3005`. The
+intent is unchanged: one blob resolves to one node, and `lb_try_duration 2s` lets the other
+answer while that node restarts.
+
+To run the proof against the running pair, from inside CT 118:
+
+```sh
+set -a; . /etc/nodus-backend.env; set +a
+MODE=external PORT_A=3003 PORT_B=3005 NODE_A=media1 NODE_B=media2 \
+  STORE_A=/mnt/nodus-media STORE_B=/var/lib/nodus/media-b \
+  CLUSTER_TOKEN="$NODUS_MEDIA_CLUSTER_TOKEN" \
+  PUBLIC_URL=https://nodus.luxuride.eu STOP_UNIT_A=nodus-media \
+  DATABASE_URL="$NODUS_DATABASE_URL" REPAIR_WAIT=420 \
+  ./deploy/proof/media-cluster.sh
+```
+
+`MODE=external` starts nothing and creates no database: it seeds one throwaway catalogue
+row and one throwaway variant, removes both rows and both files on the way out, and stops
+`nodus-media` for the dead-peer check and starts it again. Every file it deletes it created
+itself, under a digest computed from its own payload; the instance's data is never touched.
+`PUBLIC_URL` is the front door, so the range and read-repair checks go through Caddy rather
+than around it. `REPAIR_WAIT` is longer than the lab's because a production node keeps the
+ten-minute cadence and its first pass lands about a minute after it starts.
+
 ## Two limits, in plain words
 
 **R=2 on one host buys nothing against that host.** Two processes with two storage

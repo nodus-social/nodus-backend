@@ -34,18 +34,53 @@
 # Both nodes run from the workspace's own debug binaries against fresh storage directories
 # in a temporary root, and both are killed on the way out. `KEEP=1` leaves that root in
 # place for a post-mortem.
+#
+# MODE=external points the same assertions at nodes that are already running, which is how
+# this was proved on CT 118:
+#
+#   MODE=external PORT_A=3003 PORT_B=3005 NODE_A=media1 NODE_B=media2 \
+#     STORE_A=/mnt/nodus-media STORE_B=/var/lib/nodus/media-b \
+#     CLUSTER_TOKEN=<from /etc/nodus-backend.env> PUBLIC_URL=https://nodus.luxuride.eu \
+#     STOP_UNIT_A=nodus-media DATABASE_URL=<the instance's own database> \
+#     REPAIR_WAIT=420 ./deploy/proof/media-cluster.sh
+#
+# In that mode the script starts nothing and creates no database: it seeds one throwaway
+# catalogue row (and one throwaway variant), removes both rows and both files on the way
+# out, and stops the unit named by STOP_UNIT_A for the dead-peer check and starts it again.
+# Every file it deletes is one it created itself, under a digest computed from its own
+# payload — nothing that was there before a run is touched. REPAIR_WAIT is the patience for
+# the repair walk, which is a ten-minute cadence on a running node (about a minute for its
+# first pass); the lab can be impatient, production cannot.
 
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+# lab: build two nodes and a throwaway database here. external: use running nodes and the
+# database they already use, and leave both exactly as they were apart from one throwaway
+# digest, removed at the end.
+MODE=${MODE:-lab}
+if [[ $MODE != lab && $MODE != external ]]; then
+    echo "MODE must be lab or external, not '$MODE'" >&2
+    exit 2
+fi
 PORT_A=${PORT_A:-3901}
 PORT_B=${PORT_B:-3902}
 NODE_A=${NODE_A:-a}
 NODE_B=${NODE_B:-b}
 TOKEN=${CLUSTER_TOKEN:-proof}
+# The public base whose `/media/*` route is under test: the front door in external mode,
+# node A directly in the lab.
+PUBLIC_URL=${PUBLIC_URL:-http://127.0.0.1:$PORT_A}
+# A systemd unit to stop for the dead-peer check, when this script does not own the node's
+# process. Empty means "kill the process this script started".
+STOP_UNIT_A=${STOP_UNIT_A:-}
 # The repair cadence the two nodes are given. Short enough that a pass happens while the
 # script waits, long enough that a replicate-on-write cannot be mistaken for a repair.
 REPAIR_SECS=${REPAIR_SECS:-2}
+# How long to wait for a repair pass to put a lost replica back. The lab runs a pass every
+# REPAIR_SECS; a production node keeps the default cadence and its first pass lands about a
+# minute after it started.
+REPAIR_WAIT=${REPAIR_WAIT:-30}
 MEDIA_ID=proof-media-0001
 # The variant hangs off a second id. `/media/{id}` answers with a variant when its own file
 # is gone (the route falls back down the layer ladder), so a variant on the id above would
@@ -118,8 +153,8 @@ has_digest() { [[ "$(head_status "$(internal "$1")")" == 200 ]]; }
 # load the workspace, the proof runs itself in the image the deploy builds in, with the whole
 # superproject mounted at the paths cargo already has fingerprints for. The nodes still bind
 # loopback, and `--network host` keeps `localhost:5432` meaning the database the caller named.
-if [[ ${PROOF_IN_CONTAINER:-0} != 1 ]] && ! cargo metadata --no-deps --format-version 1 \
-    --manifest-path "$ROOT/Cargo.toml" >/dev/null 2>&1; then
+if [[ $MODE == lab && ${PROOF_IN_CONTAINER:-0} != 1 ]] && ! cargo metadata --no-deps \
+    --format-version 1 --manifest-path "$ROOT/Cargo.toml" >/dev/null 2>&1; then
     if ! command -v docker >/dev/null 2>&1; then
         echo "cargo cannot load this workspace here and docker is not available" >&2
         echo "run the proof from the superproject checkout instead" >&2
@@ -137,24 +172,51 @@ if [[ ${PROOF_IN_CONTAINER:-0} != 1 ]] && ! cargo metadata --no-deps --format-ve
         -e "PORT_A=$PORT_A" -e "PORT_B=$PORT_B" -e "REPAIR_SECS=$REPAIR_SECS" \
         rust:1-bookworm ./deploy/proof/media-cluster.sh
 fi
-base=${DATABASE_URL%%\?*}
-query=""
-[[ $DATABASE_URL == *\?* ]] && query="?${DATABASE_URL#*\?}"
-db=${base##*/}
-if [[ $db == *_proof ]]; then
-    PROOF_DB=$db
-elif [[ ${DATABASE_URL_ALLOW:-0} == 1 ]]; then
-    PROOF_DB=$db
-    note "DATABASE_URL_ALLOW=1: using $PROOF_DB as given"
+if [[ $MODE == external ]]; then
+    # The nodes are already running against this database, so it cannot be derived or
+    # created: it is whatever the instance uses, and the proof only inserts its own rows.
+    PROOF_URL=$DATABASE_URL
+    PSQL=${PSQL:-psql}
 else
-    PROOF_DB=${db}_proof
+    base=${DATABASE_URL%%\?*}
+    query=""
+    [[ $DATABASE_URL == *\?* ]] && query="?${DATABASE_URL#*\?}"
+    db=${base##*/}
+    if [[ $db == *_proof ]]; then
+        PROOF_DB=$db
+    elif [[ ${DATABASE_URL_ALLOW:-0} == 1 ]]; then
+        PROOF_DB=$db
+        note "DATABASE_URL_ALLOW=1: using $PROOF_DB as given"
+    else
+        PROOF_DB=${db}_proof
+    fi
+    PROOF_URL="${base%/*}/$PROOF_DB$query"
 fi
-PROOF_URL="${base%/*}/$PROOF_DB$query"
+
+# `/media/{id}` answers from the catalogue, so every check that reads a public route needs
+# a row. The lab seeds it with the workspace's own sqlx example (the dev container has no
+# psql); external mode uses the psql that is installed beside the database.
+sql() {
+    if [[ $MODE == external ]]; then
+        "$PSQL" "$PROOF_URL" -v ON_ERROR_STOP=1 -qAtc "$1"
+    else
+        DATABASE_URL="$PROOF_URL" cargo run -q --manifest-path "$ROOT/Cargo.toml" \
+            -p nodus-server-store --example proofdb -- sql "$1"
+    fi
+}
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/media-cluster-proof.XXXXXX")
-STORE_A=$WORK/storage-a
-STORE_B=$WORK/storage-b
-mkdir -p "$STORE_A/variants" "$STORE_B/variants"
+if [[ $MODE == external ]]; then
+    # The storage directories are the nodes': they are named by the caller and they must
+    # not be inside the scratch root, or the check that deletes a copy would delete nothing
+    # the node reads.
+    : "${STORE_A:?set STORE_A to node A's NODUS_MEDIA_DIR in external mode}"
+    : "${STORE_B:?set STORE_B to node B's NODUS_MEDIA_DIR in external mode}"
+else
+    STORE_A=$WORK/storage-a
+    STORE_B=$WORK/storage-b
+    mkdir -p "$STORE_A/variants" "$STORE_B/variants"
+fi
 
 pids=()
 cleanup() {
@@ -164,6 +226,22 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null || true
+    if [[ $MODE == external ]]; then
+        # The unit stopped for the dead-peer check comes back even when a check failed:
+        # a proof may not leave a media node down behind it.
+        if [[ -n $STOP_UNIT_A ]]; then
+            systemctl start "$STOP_UNIT_A" 2>/dev/null || true
+        fi
+        # Only this run's own bytes and rows: the digest and the variant digest were made
+        # here from a random payload, so no file of the instance's can match either name.
+        rm -f "$STORE_A/${DIGEST:-}" "$STORE_B/${DIGEST:-}" \
+            "$STORE_A/variants/${VARIANT_DIGEST:-}" "$STORE_B/variants/${VARIANT_DIGEST:-}" \
+            2>/dev/null || true
+        sql "DELETE FROM media_variant WHERE media_id IN ('$MEDIA_ID', '$VARIANT_ID');
+             DELETE FROM media_attachment WHERE id IN ('$MEDIA_ID', '$VARIANT_ID');
+             DELETE FROM account WHERE id = 'proof-account';" \
+            >/dev/null 2>&1 || true
+    fi
     if [[ ${KEEP:-0} == 1 ]]; then
         printf '\nkept %s\n' "$WORK"
     else
@@ -175,17 +253,23 @@ trap cleanup EXIT INT TERM
 
 say "database"
 note "server $PROOF_URL"
-# The development container has no psql, so the workspace lends the proof its own sqlx.
-cargo run -q --manifest-path "$ROOT/Cargo.toml" -p nodus-server-store --example proofdb -- \
-    create "$PROOF_DB"
-
-say "binaries"
-if [[ ! -x $ROOT/target/debug/nodus-media ]]; then
-    note "building nodus-media"
-    cargo build -q --manifest-path "$ROOT/Cargo.toml" -p nodus-media
+if [[ $MODE == external ]]; then
+    note "external mode: the database is the instance's own; only this run's rows are written"
+else
+    # The development container has no psql, so the workspace lends the proof its own sqlx.
+    cargo run -q --manifest-path "$ROOT/Cargo.toml" -p nodus-server-store \
+        --example proofdb -- create "$PROOF_DB"
 fi
-BIN=$ROOT/target/debug/nodus-media
-note "$BIN"
+
+if [[ $MODE == lab ]]; then
+    say "binaries"
+    if [[ ! -x $ROOT/target/debug/nodus-media ]]; then
+        note "building nodus-media"
+        cargo build -q --manifest-path "$ROOT/Cargo.toml" -p nodus-media
+    fi
+    BIN=$ROOT/target/debug/nodus-media
+    note "$BIN"
+fi
 
 # The blob the whole proof moves around. It is fixed rather than random so the digest is
 # stable across runs: the catalogue row and the file on disk then agree on the second run
@@ -244,11 +328,16 @@ start_node() {
 }
 
 say "start"
-write_env "$WORK/node-a.env" "$PORT_A" "$NODE_A" "$STORE_A"
-write_env "$WORK/node-b.env" "$PORT_B" "$NODE_B" "$STORE_B"
-start_node "$WORK/node-a.env" "$WORK/node-a.log"
-start_node "$WORK/node-b.env" "$WORK/node-b.log"
-note "a on 127.0.0.1:$PORT_A (pid ${pids[0]}), b on 127.0.0.1:$PORT_B (pid ${pids[1]})"
+if [[ $MODE == lab ]]; then
+    write_env "$WORK/node-a.env" "$PORT_A" "$NODE_A" "$STORE_A"
+    write_env "$WORK/node-b.env" "$PORT_B" "$NODE_B" "$STORE_B"
+    start_node "$WORK/node-a.env" "$WORK/node-a.log"
+    start_node "$WORK/node-b.env" "$WORK/node-b.log"
+    note "a on 127.0.0.1:$PORT_A (pid ${pids[0]}), b on 127.0.0.1:$PORT_B (pid ${pids[1]})"
+else
+    note "external mode: a on 127.0.0.1:$PORT_A ($NODE_A), b on 127.0.0.1:$PORT_B ($NODE_B)"
+    note "public route under test: $PUBLIC_URL/media"
+fi
 
 wait_until "node a is listening" 60 is_status 200 "http://127.0.0.1:$PORT_A/media/default-avatar.png"
 wait_until "node b is listening" 60 is_status 200 "http://127.0.0.1:$PORT_B/media/default-avatar.png"
@@ -279,9 +368,7 @@ wait_until "both nodes are cluster members" 30 both_members
 # first: `/media/{id}` falls back to a variant when its own file is gone, and a leftover row
 # would answer the check in section 4 with a 200 it does not deserve.
 cp "$VARIANT_BLOB" "$STORE_A/variants/$VARIANT_DIGEST"
-DATABASE_URL="$PROOF_URL" cargo run -q --manifest-path "$ROOT/Cargo.toml" \
-    -p nodus-server-store --example proofdb -- sql \
-    "INSERT INTO account (id, username) VALUES ('proof-account', 'proof')
+sql "INSERT INTO account (id, username) VALUES ('proof-account', 'proof')
        ON CONFLICT DO NOTHING;
      INSERT INTO media_attachment (id, account_id, digest, content_type, size, processing_state)
        VALUES ('$MEDIA_ID', 'proof-account', '$DIGEST', 'image/png', $SIZE, 'ready')
@@ -295,10 +382,12 @@ DATABASE_URL="$PROOF_URL" cargo run -q --manifest-path "$ROOT/Cargo.toml" \
      INSERT INTO media_variant (media_id, layer, max_edge, object_key, content_type, digest, size)
        VALUES ('$VARIANT_ID', 'preview', 512, 'variants/$VARIANT_DIGEST', 'image/png',
                '$VARIANT_DIGEST', $VARIANT_SIZE);" >/dev/null
-
 # ---------------------------------------------------------------- 1. replicate on write
 
 say "replicate on write"
+# A run that was interrupted may have left its own files behind; this digest was made here,
+# so removing it is safe, and it is what lets the first PUT be a 201 every time.
+rm -f "$STORE_A/$DIGEST" "$STORE_B/$DIGEST"
 expect "put to a is created" 201 \
     "$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X PUT \
         -H "x-nodus-cluster: $TOKEN" --data-binary "@$BLOB" "$(internal "$PORT_A")")"
@@ -327,6 +416,11 @@ else
     fail "a serves the bytes it fetched from b"
 fi
 wait_until "a wrote the fetched bytes back to disk" 10 test -f "$STORE_A/$DIGEST"
+# The same bytes through the front door: the hash picks a node, and whichever node it
+# picks either holds the digest or fetches it. A door that only worked on one node would
+# already have failed here.
+expect "the front door serves the blob" 200 \
+    "$(status_of "$PUBLIC_URL/media/$MEDIA_ID")"
 
 # ---------------------------------------------------------------- 3. the public range
 
@@ -337,7 +431,7 @@ say "range on the public route"
 # three parts of the answer — the status, the header that places the slice, and the bytes.
 head -c 4 "$BLOB" >"$WORK/first-four"
 code=$(curl -s -D "$WORK/range-headers" -o "$WORK/range-body" -w '%{http_code}' \
-    --max-time 10 -r 0-3 "http://127.0.0.1:$PORT_A/media/$MEDIA_ID")
+    --max-time 10 -r 0-3 "$PUBLIC_URL/media/$MEDIA_ID")
 expect "a ranged public read is a 206" 206 "$code"
 if grep -qai '^content-range: bytes 0-3/' "$WORK/range-headers"; then
     pass "the ranged answer says which bytes it carries"
@@ -385,14 +479,21 @@ wait_until "b receives the re-put" 20 has_digest "$PORT_B"
 # Nothing writes to B from here on: only the repair walk can put the file back, which is
 # exactly the case it exists for — a replica lost to a disk or a crashed upload.
 rm -f "$STORE_B/$DIGEST"
-wait_until "a repair pass puts b's lost replica back" 30 has_digest "$PORT_B"
+wait_until "a repair pass puts b's lost replica back" "$REPAIR_WAIT" has_digest "$PORT_B"
 
 # ---------------------------------------------------------------- 5. a dead peer
 
 say "dead peer"
-kill "${pids[0]}" 2>/dev/null || true
-wait "${pids[0]}" 2>/dev/null || true
-pids=("${pids[1]}")
+if [[ -n $STOP_UNIT_A ]]; then
+    # A node this script did not start: stop the unit instead of a pid, and start it again
+    # below. The membership window keeps it a placement target either way, which is exactly
+    # the case being checked.
+    systemctl stop "$STOP_UNIT_A"
+else
+    kill "${pids[0]}" 2>/dev/null || true
+    wait "${pids[0]}" 2>/dev/null || true
+    pids=("${pids[1]}")
+fi
 
 expect "b still serves after a dies" 200 \
     "$(status_of "http://127.0.0.1:$PORT_B/media/$MEDIA_ID")"
@@ -411,18 +512,36 @@ else
     fail "b's miss came back in ${took}ms (peer budget 6s)"
 fi
 
+if [[ -n $STOP_UNIT_A ]]; then
+    # Never leave a media node down behind a proof.
+    systemctl start "$STOP_UNIT_A"
+    wait_until "$STOP_UNIT_A is serving again" 30 is_status 200 \
+        "http://127.0.0.1:$PORT_A/media/default-avatar.png"
+fi
+
 # ---------------------------------------------------------------- verdict
 
 say "repair log"
-note "a: $(grep -c 'media repair pass' "$WORK/node-a.log" || true) pass(es), last: $(grep 'media repair pass' "$WORK/node-a.log" | tail -1 || true)"
-note "b: $(grep -c 'media repair pass' "$WORK/node-b.log" || true) pass(es), last: $(grep 'media repair pass' "$WORK/node-b.log" | tail -1 || true)"
+if [[ $MODE == lab ]]; then
+    note "a: $(grep -c 'media repair pass' "$WORK/node-a.log" || true) pass(es), last: $(grep 'media repair pass' "$WORK/node-a.log" | tail -1 || true)"
+    note "b: $(grep -c 'media repair pass' "$WORK/node-b.log" || true) pass(es), last: $(grep 'media repair pass' "$WORK/node-b.log" | tail -1 || true)"
+else
+    for unit in "${STOP_UNIT_A:-}" nodus-media2; do
+        [[ -z $unit ]] && continue
+        last=$(journalctl -u "$unit" --since '-20min' -o cat 2>/dev/null \
+            | grep 'media repair pass' | tail -1 || true)
+        note "$unit: ${last:-no pass seen in the last 20 minutes}"
+    done
+fi
 
 if ((bad > 0)); then
     printf '\n%d ok, %d failed\n' "$ok" "$bad"
-    printf '\n-- node a log (tail) --\n'
-    tail -n 20 "$WORK/node-a.log" || true
-    printf '\n-- node b log (tail) --\n'
-    tail -n 20 "$WORK/node-b.log" || true
+    if [[ $MODE == lab ]]; then
+        printf '\n-- node a log (tail) --\n'
+        tail -n 20 "$WORK/node-a.log" || true
+        printf '\n-- node b log (tail) --\n'
+        tail -n 20 "$WORK/node-b.log" || true
+    fi
     exit 1
 fi
 
