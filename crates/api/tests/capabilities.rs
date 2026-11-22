@@ -289,6 +289,112 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/tags/{name}/follow",
         owner: Owner::Api,
     },
+    // The administration pages. `admin` above is the door; these are the rooms behind it.
+    // Each probe is the first route the page calls; the split and its handler family are
+    // stated in `ADMIN_PAGES` below, where `every_admin_page_capability_is_backed` holds
+    // this list to it.
+    Capability {
+        name: "admin_overview",
+        path: "/api/v1/admin/overview",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_announcements",
+        path: "/api/v1/admin/announcements",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_audit",
+        path: "/api/v1/admin/audit",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_domains",
+        path: "/api/v1/admin/domain_allows",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_email",
+        path: "/api/v1/admin/email_domain_blocks",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_escalation",
+        path: "/api/v1/admin/escalation",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_federation",
+        path: "/api/v1/admin/federation/deliveries",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_protocol",
+        path: "/api/v1/nodus/capabilities",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_replies",
+        path: "/api/v1/admin/warning_presets",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_rules",
+        path: "/api/v1/admin/rules",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_scanners",
+        path: "/api/v1/admin/scanners",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_settings",
+        path: "/api/v1/admin/settings/export",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "admin_topology",
+        path: "/api/v1/admin/topology",
+        owner: Owner::Api,
+    },
+    // `moderation_rules` is not repeated: the name already below stands for this page, and
+    // one page published twice is the duplication the handshake test rejects.
+    Capability {
+        name: "moderation_accounts",
+        path: "/api/v1/admin/accounts",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "moderation_appeals",
+        path: "/api/v1/admin/appeals",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "moderation_federation",
+        path: "/api/v1/admin/federation/remote-accounts",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "moderation_flags",
+        path: "/api/v1/admin/flags",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "moderation_media",
+        path: "/api/v1/admin/media/quarantined",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "moderation_registrations",
+        path: "/api/v1/admin/accounts/{id}/approve",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "moderation_reports",
+        path: "/api/v1/admin/reports",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -678,9 +784,25 @@ async fn every_advertised_feature_answers_for_itself() {
 
 #[tokio::test]
 async fn the_published_list_and_the_capability_table_are_the_same_set() {
-    let published: BTreeSet<String> = advertised(&document("/api/v1/meta").await)
-        .into_iter()
-        .collect();
+    let advertised_names = advertised(&document("/api/v1/meta").await);
+    assert_eq!(
+        advertised_names.len(),
+        62,
+        "/api/v1/meta must answer 62 unique names: {advertised_names:?}"
+    );
+    let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
+    assert_eq!(
+        advertised_names.len(),
+        unique.len(),
+        "/api/v1/meta publishes a name more than once; one page has one name: {advertised_names:?}"
+    );
+    assert_eq!(
+        nodus_server_api::meta::FEATURES.len(),
+        62,
+        "the published vocabulary is 62 unique names: 42 before the page split plus the 20 \
+         page names (21 pages, `moderation_rules` already present, so no duplicate)"
+    );
+    let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
         .iter()
         .map(|capability| capability.name.to_owned())
@@ -761,6 +883,87 @@ async fn drive_share_is_published_only_when_share_links_are_configured() {
              {share_links}"
         );
     }
+}
+
+#[tokio::test]
+async fn every_admin_page_capability_is_backed_by_a_route_or_a_declared_module() {
+    let published: BTreeSet<&str> = nodus_server_api::meta::FEATURES.iter().copied().collect();
+    let tabled: BTreeSet<&str> = CAPABILITIES
+        .iter()
+        .map(|capability| capability.name)
+        .collect();
+    let sources: BTreeSet<&str> = ROUTE_SOURCES.iter().map(|(file, _)| *file).collect();
+
+    let mut names = BTreeSet::new();
+    let mut failures = Vec::new();
+    for page in ADMIN_PAGES {
+        if !names.insert(page.name) {
+            failures.push(format!("`{}` is listed twice in ADMIN_PAGES", page.name));
+        }
+        if !published.contains(page.name) {
+            failures.push(format!("`{}` is a page but not in FEATURES", page.name));
+        }
+        if !tabled.contains(page.name) {
+            failures.push(format!("`{}` is a page but not in CAPABILITIES", page.name));
+        }
+        if page.modules.is_empty() {
+            failures.push(format!("`{}` names no handler module", page.name));
+        }
+        for module in page.modules {
+            if !sources.contains(module) {
+                failures.push(format!(
+                    "`{}` names {module}, which is not one of the router sources",
+                    page.name
+                ));
+            }
+        }
+        if page.note.len() <= 20 {
+            failures.push(format!("`{}` has no note about its route split", page.name));
+        }
+        match page.prefix {
+            // Route-visible: a group must claim the prefix and the router must serve it.
+            Some(prefix) => {
+                let claimed = SURFACE_GROUPS
+                    .iter()
+                    .any(|group| group.prefix == prefix && group.features.contains(&page.name));
+                if !claimed {
+                    failures.push(format!(
+                        "`{}` claims prefix {prefix}, but no SURFACE_GROUPS entry names it there",
+                        page.name
+                    ));
+                }
+                let served = ROUTE_SOURCES.iter().any(|(_, source)| {
+                    registered_routes(source)
+                        .iter()
+                        .any(|route| covers(prefix, route))
+                });
+                if !served {
+                    failures.push(format!(
+                        "`{}` claims prefix {prefix}, which the router does not serve",
+                        page.name
+                    ));
+                }
+            }
+            // Not route-visible: the declared module and note are the only evidence, so
+            // they must be there and must be specific enough to be checked.
+            None if page.modules.is_empty() || page.note.len() <= 20 => failures.push(format!(
+                "`{}` has neither a page-only prefix nor a declared module with a reason",
+                page.name
+            )),
+            None => {}
+        }
+    }
+
+    assert_eq!(
+        ADMIN_PAGES.len(),
+        21,
+        "the console draws thirteen administration pages and eight moderation sections"
+    );
+    assert!(
+        failures.is_empty(),
+        "administration page capabilities with no provable surface:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 #[tokio::test]
@@ -951,6 +1154,27 @@ const ADMIN_FEATURES: &[&str] = &[
     "domain_pauses",
     "settings_transfer",
     "report_forwarding",
+    // The administration pages, named separately from the areas that contain them.
+    "admin_overview",
+    "admin_announcements",
+    "admin_audit",
+    "admin_domains",
+    "admin_email",
+    "admin_escalation",
+    "admin_federation",
+    "admin_protocol",
+    "admin_replies",
+    "admin_rules",
+    "admin_scanners",
+    "admin_settings",
+    "admin_topology",
+    "moderation_accounts",
+    "moderation_appeals",
+    "moderation_federation",
+    "moderation_flags",
+    "moderation_media",
+    "moderation_registrations",
+    "moderation_reports",
 ];
 
 /// One prefix of the router's route table and the capability names that stand behind it.
@@ -981,6 +1205,69 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
     SurfaceGroup {
         prefix: "/api/v2/admin",
         features: ADMIN_FEATURES,
+        reason: "",
+    },
+    // The page-specific prefixes. These are the admin pages whose page-defining family is a
+    // path only that page opens; the umbrella group above covers everything else. A page
+    // whose routes are shared with another page is not listed here — `ADMIN_PAGES` says why.
+    SurfaceGroup {
+        prefix: "/api/v1/admin/overview",
+        features: &["admin_overview"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/announcements",
+        features: &["admin_announcements"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/audit",
+        features: &["admin_audit"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/email_domain_blocks",
+        features: &["admin_email"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/warning_presets",
+        features: &["warnings", "admin_replies"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/scanners",
+        features: &["scanners", "admin_scanners"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/topology",
+        features: &["topology", "admin_topology"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/flags",
+        features: &["moderation_flags"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/media",
+        features: &["media_quarantine", "moderation_media"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/moderation-rules",
+        features: &["moderation_rules"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/reports",
+        features: &["moderation", "moderation_reports"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/admin/appeals",
+        features: &["appeals", "moderation_appeals"],
         reason: "",
     },
     SurfaceGroup {
@@ -1274,6 +1561,169 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
         prefix: "/api/miauth",
         features: &[],
         reason: "MiAuth compatibility dialect; a token exchange, not a capability",
+    },
+];
+
+/// One administration page published as a capability.
+///
+/// A page is a console screen, not necessarily one route family: `admin_overview` is drawn
+/// from four paths, and `moderation_accounts` shares `/api/v1/admin/accounts` with the
+/// registrations page. So the page names need a second kind of evidence beside
+/// `SURFACE_GROUPS`. `prefix` is that evidence when the page's defining family is a path no
+/// other page opens. When it is not, the name is declared here with the router module that
+/// mounts its routes and a note saying why the path cannot carry the split; the test then
+/// has something to check instead of a name nobody backs.
+struct AdminPage {
+    name: &'static str,
+    /// A prefix that only this page opens, already named in `SURFACE_GROUPS`.
+    prefix: Option<&'static str>,
+    /// The source module(s) that mount this page's routes. Always named, so a reader can
+    /// verify the page against the code; required when `prefix` is `None`.
+    modules: &'static [&'static str],
+    /// Why the path cannot distinguish this page, or which routes it shares.
+    note: &'static str,
+}
+
+/// Every page the console draws, and the handler family that serves it.
+///
+/// Twenty-one entries for twenty unique names: `moderation_rules` is the eighth moderation
+/// section and was already published for the rules engine, so it appears once only.
+const ADMIN_PAGES: &[AdminPage] = &[
+    AdminPage {
+        name: "admin_overview",
+        prefix: Some("/api/v1/admin/overview"),
+        modules: &["admin/mod.rs", "admin/stats.rs"],
+        note: "overview plus stats/measures/alerts; only /overview is this page's alone",
+    },
+    AdminPage {
+        name: "admin_announcements",
+        prefix: Some("/api/v1/admin/announcements"),
+        modules: &["announcements.rs"],
+        note: "the staff half of announcements.rs; the public strip is the `announcements` name",
+    },
+    AdminPage {
+        name: "admin_audit",
+        prefix: Some("/api/v1/admin/audit"),
+        modules: &["admin/mod.rs"],
+        note: "audit and audit.csv; no other page reads the trail",
+    },
+    AdminPage {
+        name: "admin_domains",
+        prefix: None,
+        modules: &["admin/federation.rs", "admin/blocklist.rs"],
+        note: "composed of domain_allows, domain_blocks and the block-list transfer; \
+               moderation_federation reads domain_blocks too, so no one prefix is the page",
+    },
+    AdminPage {
+        name: "admin_email",
+        prefix: Some("/api/v1/admin/email_domain_blocks"),
+        modules: &["admin/federation.rs"],
+        note: "the email-domain blocklist family; the domains page reads its own families",
+    },
+    AdminPage {
+        name: "admin_escalation",
+        prefix: None,
+        modules: &["admin/escalation.rs"],
+        note: "the same /admin/escalation route the `escalation` capability names; this is \
+               the page view of that policy, not a second family",
+    },
+    AdminPage {
+        name: "admin_federation",
+        prefix: None,
+        modules: &["admin/federation.rs", "admin/forwarded.rs"],
+        note: "deliveries, domain pauses, remote blocks and forwarded reports; domain_blocks \
+               and remote accounts belong to moderation_federation, so a prefix would overclaim",
+    },
+    AdminPage {
+        name: "admin_protocol",
+        prefix: None,
+        modules: &["nodus.rs"],
+        note: "renders /api/v1/nodus/capabilities, the same document `protocol` names; there \
+               is no admin-prefixed route to tell the two names apart",
+    },
+    AdminPage {
+        name: "admin_replies",
+        prefix: Some("/api/v1/admin/warning_presets"),
+        modules: &["admin/mod.rs"],
+        note: "warning presets are the replies page's canned responses; the name `warnings` \
+               covers the same route for API clients",
+    },
+    AdminPage {
+        name: "admin_rules",
+        prefix: None,
+        modules: &["admin/rules.rs"],
+        note: "the same /admin/rules route `instance_rules` names; the page edits those rules",
+    },
+    AdminPage {
+        name: "admin_scanners",
+        prefix: Some("/api/v1/admin/scanners"),
+        modules: &["admin/scanners.rs"],
+        note: "scanner CRUD; flags and the open scan queue are shared with moderation_flags \
+               and the overview page",
+    },
+    AdminPage {
+        name: "admin_settings",
+        prefix: None,
+        modules: &["admin/settings_transfer.rs"],
+        note: "the same /admin/settings/{export,import} route `settings_transfer` names; the \
+               page is the transfer UI",
+    },
+    AdminPage {
+        name: "admin_topology",
+        prefix: Some("/api/v1/admin/topology"),
+        modules: &["admin/topology.rs"],
+        note: "nodes, logs and triggers; the whole family belongs to this page",
+    },
+    AdminPage {
+        name: "moderation_accounts",
+        prefix: None,
+        modules: &["admin/accounts.rs", "admin/escalation.rs"],
+        note: "accounts CRUD, notes, roles and strikes; /admin/accounts/{id}/approve|reject \
+               are the registrations page, so the path cannot separate the two pages",
+    },
+    AdminPage {
+        name: "moderation_appeals",
+        prefix: Some("/api/v1/admin/appeals"),
+        modules: &["admin/appeals.rs"],
+        note: "the appeals queue and its decisions; `appeals` is the API-facing name",
+    },
+    AdminPage {
+        name: "moderation_federation",
+        prefix: None,
+        modules: &["admin/federation.rs"],
+        note: "remote accounts and domain blocks; domain_blocks are shared with admin_domains \
+               and remote accounts sit under the admin_federation prefix",
+    },
+    AdminPage {
+        name: "moderation_flags",
+        prefix: Some("/api/v1/admin/flags"),
+        modules: &["admin/scanners.rs"],
+        note: "scan flags and their resolution; the scanners page owns scanner CRUD",
+    },
+    AdminPage {
+        name: "moderation_media",
+        prefix: Some("/api/v1/admin/media"),
+        modules: &["admin/media.rs"],
+        note: "the quarantine queue and its decisions; the whole family belongs to this page",
+    },
+    AdminPage {
+        name: "moderation_registrations",
+        prefix: None,
+        modules: &["admin/accounts.rs"],
+        note: "pending accounts are a filter on /admin/accounts and approval is \
+               /{id}/approve|reject inside the account directory page's family",
+    },
+    AdminPage {
+        name: "moderation_reports",
+        prefix: Some("/api/v1/admin/reports"),
+        modules: &["admin/reports.rs", "admin/forwarded.rs"],
+        note: "the report queue and its forward; the federation page reads the forwarded list",
+    },
+    AdminPage {
+        name: "moderation_rules",
+        prefix: Some("/api/v1/admin/moderation-rules"),
+        modules: &["admin/moderation_rules.rs"],
+        note: "the rules engine and its dry run; already published before the page split",
     },
 ];
 

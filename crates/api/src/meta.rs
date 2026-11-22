@@ -29,7 +29,14 @@ use crate::state::AppState;
 /// this instance's `nodus-feed` process on the same origin. The rest are answered by this
 /// API. `tests/capabilities.rs` holds the feature-to-path table and fails when a name here
 /// stops answering or a route appears that no name covers.
-pub const FEATURES: [&str; 42] = [
+///
+/// `admin` and `moderation` stay: they mean "this instance has an administration (or
+/// moderation) area at all". The pages inside those areas are named separately at the end
+/// of the list, because a peer that serves a smaller console must hide the pages it does not
+/// have without losing the area's door — and a peer that serves them all must draw every
+/// one. New names are appended rather than sorted: clients compare the array, so a reorder
+/// is churn with no meaning.
+pub const FEATURES: [&str; 62] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -101,6 +108,32 @@ pub const FEATURES: [&str; 42] = [
     "preferences",        // GET /api/v1/preferences
     "streaming",          // GET /api/v1/streaming (the SSE tail of the events table)
     "tags",               // GET /api/v1/tags/{name}, /{name}/follow, /{name}/unfollow
+    // The administration pages the console draws. `admin` above says the area exists; these
+    // say which page inside it is served, so a peer with a smaller console can omit a page
+    // without omitting the area. The test table beside `tests/capabilities.rs` names the
+    // handler family behind each and whether the route path alone distinguishes it.
+    "admin_overview",      // GET /api/v1/admin/overview, /stats, /measures, /alerts
+    "admin_announcements", // GET|POST /api/v1/admin/announcements
+    "admin_audit",         // GET /api/v1/admin/audit, /audit.csv
+    "admin_domains",       // /api/v1/admin/domain_allows, /domain_blocks
+    "admin_email",         // /api/v1/admin/email_domain_blocks
+    "admin_escalation",    // GET|PUT /api/v1/admin/escalation
+    "admin_federation",    // /api/v1/admin/federation/{deliveries,domain-pauses,forwarded}
+    "admin_protocol",      // GET /api/v1/nodus/capabilities
+    "admin_replies",       // /api/v1/admin/warning_presets
+    "admin_rules",         // /api/v1/admin/rules
+    "admin_scanners",      // /api/v1/admin/scanners, /scanner_assets, /scans
+    "admin_settings",      // /api/v1/admin/settings/{export,import}
+    "admin_topology",      // /api/v1/admin/topology, /topology/{name}/logs
+    // The moderation sections. `moderation_rules` above already names the rules section;
+    // adding the string a second time would publish one page twice, so it is reused.
+    "moderation_accounts",   // /api/v1/admin/accounts, /{id}/notes, /{id}/role
+    "moderation_appeals",    // /api/v1/admin/appeals, /{id}/decide
+    "moderation_federation", // /api/v1/admin/federation/remote-accounts, /domain_blocks
+    "moderation_flags",      // /api/v1/admin/flags, /{id}/resolve
+    "moderation_media",      // /api/v1/admin/media/quarantined
+    "moderation_registrations", // /api/v1/admin/accounts/{id}/approve, /reject
+    "moderation_reports",    // /api/v1/admin/reports, /bulk, /{id}/forward
 ];
 
 /// The capability names this deployment can actually honour, as owned strings.
