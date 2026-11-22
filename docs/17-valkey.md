@@ -129,8 +129,61 @@ valkey-cli -a "$(cat /root/valkey.pass)" --no-auth-warning info stats \
   | grep -E 'total_commands_processed|keyspace_hits|keyspace_misses'
 ```
 
-`pubsub numsub nodus:invalidate` answers at least `1` while `nodus-api` is up: that number is
-the subscriber that makes two-process invalidation work.
+`pubsub numsub nodus:invalidate` answers `2` while both API replicas are up: each process is
+a subscriber, and that is what makes cross-process invalidation work.
+
+## Two API replicas behind Caddy
+
+CT 118 runs `nodus-api2` beside `nodus-api`: the same binary and the same
+`/etc/nodus-backend.env`, with only its own bind and telemetry socket.
+
+| Unit | Bind | Telemetry socket |
+| --- | --- | --- |
+| `nodus-api.service` | `0.0.0.0:3001` | `/var/lib/nodus/run/api-telemetry.sock` |
+| `nodus-api2.service` | `0.0.0.0:3004` | `/var/lib/nodus/run/api2-telemetry.sock` |
+
+The separate telemetry socket is required: both units would otherwise bind the same path and
+the second process fails to start. Install the replica from the repository:
+
+```bash
+install -m0644 deploy/systemd/nodus-api2.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now nodus-api2
+```
+
+Caddy on CT 100 load-balances `/api/*` over both replicas in the same block:
+
+```
+	handle /api/* {
+		reverse_proxy 10.0.1.18:3001 10.0.1.18:3004 {
+			lb_policy round_robin
+			lb_try_duration 2s
+		}
+	}
+```
+
+Back up `/etc/caddy/nodus.caddy` first, then `caddy validate --config /etc/caddy/Caddyfile
+--adapter caddyfile` and `systemctl reload caddy`; never restart the front door for this.
+
+Proof commands, on CT 118:
+
+```bash
+for p in 3001 3004; do
+  curl -s -o /dev/null -w "$p healthz=%{http_code}\n" http://127.0.0.1:$p/healthz
+done
+systemctl show -p MainPID --value nodus-api nodus-api2      # two distinct PIDs
+valkey-cli -a "$(cat /root/valkey.pass)" --no-auth-warning \
+  pubsub numsub nodus:invalidate                            # 2
+```
+
+Both journals must carry `home timelines are cached in valkey` and `listening for home
+timeline invalidations`. Cross-process invalidation is proved by deleting a status through
+`:3001` and seeing the id disappear from `GET /api/v1/timelines/home` on `:3004`. The delete
+removes the id from the shared shard ZSET, and `hide` publishes the affected `home:{id}` keys
+so the replica that did not handle the delete applies the same removal to its own view before
+it can serve a stale page. On 2026-11-22 two probe accounts (B follows A) showed the post on
+both ports, and after a delete answered by `:3001` the `:3004` page dropped it on the first
+poll.
 
 ## Outages
 
@@ -147,22 +200,45 @@ status. The strings to grep for, by failure:
 Stopping `valkey-server` therefore costs latency, not availability. Restarting it costs the
 whole keyspace only if AOF is off — with `appendonly yes` the sets come back.
 
+Measured on 2026-11-22 with the broker stopped: a home read answered `200` in 41 ms from the
+SQL fallback, a status create answered `200`, and the delete path logged exactly one
+`valkey publish failed; reconnecting` warning while the backoff grew. After
+`systemctl start valkey-server`, `pubsub numsub nodus:invalidate` was back to `2` within
+8 s, the journal carried `valkey reconnected`, and a post/read/delete cycle worked on both
+ports again.
+
+## Fan-out cost at 20 followers
+
+Five `POST /api/v1/statuses` runs each, same 20 follower accounts, `curl -w %{time_total}`
+against `:3001`:
+
+| Valkey | runs (ms) | median | p95 |
+| --- | --- | --- | --- |
+| on | 63.4, 79.5, 84.2, 89.8, 95.4 | 84.2 ms | 95.4 ms |
+| off (env line commented, API restarted) | 31.9, 52.4, 54.1, 55.5, 99.4 | 54.1 ms | 99.4 ms |
+
+The difference is one pipeline round trip for a 20-follower batch; the 1000-follower number
+was **not** measured. `NODUS_HOME_SHARDS` is the scaling knob: shards are chosen per account,
+so raising it spreads keys over upstreams, but `push` walks shards sequentially — one pipeline
+per populated shard — so it does not shorten a single status write.
+
 ## Rollback
 
 ```bash
 sed -i '/^NODUS_VALKEY_URL=/d' /etc/nodus-backend.env   # or restore the .bak-valkey-* copy
-systemctl restart nodus-api
+systemctl restart nodus-api nodus-api2
 ```
 
 The API then logs the pull-path line again and serves home timelines from Postgres. The
 broker can be left running (unused) or stopped with `systemctl disable --now valkey-server`;
 the env line is the switch, so stop it only after the restart has been verified.
 
-## Not yet proven in production
+## Proven in production, and what is not
 
-`crates/api/tests/home_fanout.rs` proves two replicas over one Valkey in the lab. On this host
-there is still one `nodus-api`, so what remains for #43 is: a second replica sharing this URL
-and channel, an invalidation published by one replica observed by the other
-(`pubsub numsub nodus:invalidate` → 2), and outage/timing numbers under a real failure —
-how long a read takes when the broker is stopped, and how far the invalidator's backoff
-stretches before it reconnects.
+On 2026-11-22 CT 118 ran two API replicas over this broker: distinct PIDs on `:3001` and
+`:3004`, `pubsub numsub nodus:invalidate` = 2, and an invalidation published by the replica
+that answered a delete removed the status from the other replica's home page. A broker
+outage cost latency, not availability, and one warning per outage. Fan-out was measured at
+20 followers; **the 1000-follower number remains extrapolated, not measured**, and raising
+`NODUS_HOME_SHARDS` spreads keys across upstreams without reducing the sequential per-shard
+round trips of one fan-out.
