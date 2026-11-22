@@ -124,6 +124,7 @@ where
         %node,
         %endpoint,
         cluster = serving.cluster_enabled(),
+        codec = config.video_codec.as_str(),
         domain = %config.instance.domain,
         "media listening"
     );

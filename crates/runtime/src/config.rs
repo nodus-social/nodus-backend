@@ -15,6 +15,61 @@ pub const DEFAULT_DATABASE_URL: &str = "postgres://nodus:nodus@localhost/nodus";
 /// balances a mistaken deletion against keeping a leaver's data longer than they asked.
 pub const DEFAULT_ACCOUNT_DELETE_GRACE_DAYS: i64 = 30;
 
+/// The software video encoder behind every `WebM` rendition (`NODUS_MEDIA_VIDEO_CODEC`).
+///
+/// VP8 is the default because this host has no hardware encoder: VP8 encodes several
+/// times faster in software than VP9, and at the renditions we publish the quality and
+/// size difference is small. VP9 is the opt-in for a host that can spend the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    Vp8,
+    Vp9,
+}
+
+/// The codec used when `NODUS_MEDIA_VIDEO_CODEC` says nothing.
+pub const DEFAULT_VIDEO_CODEC: VideoCodec = VideoCodec::Vp8;
+
+impl VideoCodec {
+    /// Parse one `NODUS_MEDIA_VIDEO_CODEC` value.
+    ///
+    /// The error names both accepted values and the default: a typo must stop the
+    /// process, not quietly pick a codec the operator did not ask for.
+    ///
+    /// # Errors
+    ///
+    /// Fails for anything but `vp8` or `vp9`, case-insensitively.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "vp8" => Ok(Self::Vp8),
+            "vp9" => Ok(Self::Vp9),
+            other => Err(format!(
+                "NODUS_MEDIA_VIDEO_CODEC must be vp8 or vp9 (default vp8), not {other:?}"
+            )),
+        }
+    }
+
+    /// Read `NODUS_MEDIA_VIDEO_CODEC`, falling back to [`DEFAULT_VIDEO_CODEC`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the variable is set to a value [`Self::parse`] refuses.
+    pub fn from_env() -> Result<Self, String> {
+        match env::var("NODUS_MEDIA_VIDEO_CODEC") {
+            Ok(value) => Self::parse(&value),
+            Err(_) => Ok(DEFAULT_VIDEO_CODEC),
+        }
+    }
+
+    /// Stable spelling, used in logs and in the error message.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vp8 => "vp8",
+            Self::Vp9 => "vp9",
+        }
+    }
+}
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each switch is an independent deployment decision, not a state"
@@ -34,6 +89,9 @@ pub struct Config {
     /// Days between an account deletion request and the purge of its profile and keys
     /// (`NODUS_ACCOUNT_DELETE_GRACE_DAYS`, default 30).
     pub account_delete_grace_days: i64,
+    /// Encoder for `WebM` renditions (`NODUS_MEDIA_VIDEO_CODEC`, default VP8). Read once
+    /// here so a typo fails startup instead of the first uploaded video.
+    pub video_codec: VideoCodec,
     pub migrate_only: bool,
     pub bootstrap: Option<Bootstrap>,
     /// Where this process answers questions about itself, if anywhere.
@@ -95,6 +153,7 @@ pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
         .map(|value| value.parse())
         .transpose()?
         .unwrap_or(DEFAULT_ACCOUNT_DELETE_GRACE_DAYS);
+    let video_codec = VideoCodec::from_env()?;
     let bootstrap = match (
         env::var("NODUS_BOOTSTRAP_EMAIL"),
         env::var("NODUS_BOOTSTRAP_USERNAME"),
@@ -143,8 +202,29 @@ pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
         registrations_open,
         authorized_fetch,
         account_delete_grace_days,
+        video_codec,
         migrate_only: env::args().any(|argument| argument == "--migrate-only"),
         bootstrap,
         telemetry,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_video_codec_names_every_accepted_value_and_the_default() {
+        let error = VideoCodec::parse("vp10").expect_err("a typo must be refused");
+        assert_eq!(
+            error,
+            "NODUS_MEDIA_VIDEO_CODEC must be vp8 or vp9 (default vp8), not \"vp10\""
+        );
+    }
+
+    #[test]
+    fn the_video_codec_parser_accepts_both_names_case_insensitively() {
+        assert_eq!(VideoCodec::parse("VP8"), Ok(VideoCodec::Vp8));
+        assert_eq!(VideoCodec::parse("vp9\n"), Ok(VideoCodec::Vp9));
+    }
 }

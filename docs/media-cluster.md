@@ -172,6 +172,19 @@ whose size cannot be measured is rendered still. The upload itself never fails o
 bounds. A machine-readable record on the variant row is the follow-up; today the note is the
 log line.
 
+## Video renditions
+
+Videos are rendered to WebM at the preview and compressed edges. The encoder is the one
+`NODUS_MEDIA_VIDEO_CODEC` names — `vp8` (the default) or `vp9` — and the container and
+content type (`video/webm`) are the same for both. The value is read once at startup; an
+unknown one stops the process with a message naming both accepted values and the default.
+
+VP8 is the default because this host has no hardware encoder. In software, VP8 encodes
+several times faster than VP9, and at the renditions we publish the quality and size
+difference is small — a qualitative trade-off, not a measured promise about every clip.
+Encode settings are constant quality for both (`-crf` with `-b:v 0`); VP9 additionally
+gets `-row-mt 1`, which is a VP9-only option and is not passed to `libvpx` (VP8).
+
 ## Range requests
 
 A client that seeks sends `Range: bytes=…`, and the media node answers it, because the bytes

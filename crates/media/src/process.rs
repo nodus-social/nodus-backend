@@ -8,7 +8,9 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 
+use nodus_server_runtime::{VideoCodec, DEFAULT_VIDEO_CODEC};
 use tokio::process::Command;
 
 use crate::{Error, Format, Kind, Layer, VariantSpec};
@@ -43,6 +45,14 @@ impl StillReason {
     }
 }
 
+/// The encoder this process was started with, resolved once rather than per render.
+///
+/// [`nodus_server_runtime::read`] rejects a bad `NODUS_MEDIA_VIDEO_CODEC` at startup, so
+/// the fallback below only covers a caller that renders without reading the process
+/// configuration first — a test, or a library use. A render must not fail on a setting
+/// the process already accepted.
+static VIDEO_CODEC: OnceLock<VideoCodec> = OnceLock::new();
+
 /// One encoded variant, ready to be written to the object store.
 #[derive(Debug, Clone)]
 pub struct Rendered {
@@ -61,6 +71,22 @@ pub struct Rendered {
 /// encoder exits non-zero, and [`Error::Unsupported`] for a layer/format combination
 /// that has no encoder.
 pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result<Rendered, Error> {
+    render_one_with(source, kind, spec, video_codec()).await
+}
+
+/// The codec configured for this process, read from the environment on first use.
+fn video_codec() -> VideoCodec {
+    *VIDEO_CODEC.get_or_init(|| VideoCodec::from_env().unwrap_or(DEFAULT_VIDEO_CODEC))
+}
+
+/// [`render_one`] with the video encoder named explicitly, so a test can encode one clip
+/// with each codec in the same process.
+async fn render_one_with(
+    source: &Path,
+    kind: Kind,
+    spec: &VariantSpec,
+    codec: VideoCodec,
+) -> Result<Rendered, Error> {
     if spec.layer == Layer::Lossless {
         let bytes = tokio::fs::read(source).await.map_err(io)?;
         return Ok(Rendered {
@@ -106,22 +132,12 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
             command.arg("-frames:v").arg("1");
         }
     } else {
-        command
-            .arg("-vf")
-            .arg(if spec.layer == Layer::Preview {
-                scale_filter(spec.max_edge)
-            } else {
-                height_filter(spec.max_edge)
-            })
-            .arg("-c:v")
-            .arg("libvpx-vp9")
-            .arg("-crf")
-            .arg((100_u8.saturating_sub(spec.quality)).to_string())
-            .arg("-b:v")
-            .arg("0")
-            .arg("-row-mt")
-            .arg("1")
-            .arg("-an");
+        command.arg("-vf").arg(if spec.layer == Layer::Preview {
+            scale_filter(spec.max_edge)
+        } else {
+            height_filter(spec.max_edge)
+        });
+        add_video_encoder(&mut command, spec.quality, codec);
     }
     command.arg("-f").arg(extension).arg(&output);
     let bytes = run_ffmpeg(command, &output).await?;
@@ -131,6 +147,45 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
         content_type: content_type(spec.format),
         still_reason,
     })
+}
+
+/// The libvpx invocation for `codec`, at the quality the variant asked for.
+///
+/// Constant quality is `-crf` with `-b:v 0` for both encoders. `-row-mt` is a VP9-only
+/// option — `libvpx` has no row threads, so passing it to VP8 would be silently ignored.
+/// VP8's CRF scale is 4–63 while VP9's reaches 100, so the same quality number clamps
+/// rather than asking the encoder for a level it rejects.
+fn add_video_encoder(command: &mut Command, quality: u8, codec: VideoCodec) {
+    let crf = 100_u8.saturating_sub(quality);
+    command.arg("-c:v");
+    match codec {
+        VideoCodec::Vp9 => {
+            command
+                .arg("libvpx-vp9")
+                .arg("-crf")
+                .arg(crf.to_string())
+                .arg("-b:v")
+                .arg("0")
+                .arg("-row-mt")
+                .arg("1");
+        }
+        VideoCodec::Vp8 => {
+            // `good` with a small `-cpu-used` is the software-speed setting libvpx
+            // documents; raising it trades a little quality for fewer seconds, which is
+            // the point of choosing VP8 on a host without a hardware encoder.
+            command
+                .arg("libvpx")
+                .arg("-crf")
+                .arg(crf.clamp(4, 63).to_string())
+                .arg("-b:v")
+                .arg("0")
+                .arg("-deadline")
+                .arg("good")
+                .arg("-cpu-used")
+                .arg("2");
+        }
+    }
+    command.arg("-an");
 }
 
 /// Whether this variant animates, and why it does not when it was expected to.
@@ -496,6 +551,83 @@ mod tests {
         assert!(filter.contains("min(iw,1280)"));
         assert!(filter.contains("min(ih,1280)"));
         assert!(filter.contains("force_original_aspect_ratio=decrease"));
+    }
+
+    /// A one-second clip from ffmpeg itself, or `None` when the machine has no encoder.
+    async fn synthesised_clip() -> Option<PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "nodus-media-clip-{}-{}.webm",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let status = Command::new(ffmpeg())
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=320x240:rate=10")
+            .args(["-t", "1", "-c:v", "libvpx", "-b:v", "200k"])
+            .arg(&path)
+            .status()
+            .await
+            .ok()?;
+        status.success().then_some(path)
+    }
+
+    /// The codec ffprobe reads back out of a `WebM`, not a guess from the bytes.
+    async fn probe_codec_name(bytes: &[u8]) -> Option<String> {
+        let path = std::env::temp_dir().join(format!(
+            "nodus-media-probe-{}-{}.webm",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        tokio::fs::write(&path, bytes).await.ok()?;
+        let output = Command::new(ffprobe())
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=nw=1:nk=1",
+            ])
+            .arg(&path)
+            .output()
+            .await
+            .ok();
+        let _ = tokio::fs::remove_file(&path).await;
+        let output = output?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    #[tokio::test]
+    async fn each_video_codec_writes_a_webm_with_that_codec() {
+        let Some(source) = synthesised_clip().await else {
+            return;
+        };
+        let spec = VariantSpec {
+            layer: Layer::Preview,
+            format: Format::Webm,
+            max_edge: 320,
+            quality: 76,
+            lossless: false,
+            retain: true,
+        };
+        for (codec, expected) in [(VideoCodec::Vp8, "vp8"), (VideoCodec::Vp9, "vp9")] {
+            let rendered = render_one_with(&source, Kind::Video, &spec, codec)
+                .await
+                .expect("render");
+            let probed = probe_codec_name(&rendered.bytes).await;
+            assert_eq!(
+                probed.as_deref(),
+                Some(expected),
+                "configured {codec:?} but ffprobe read {probed:?}"
+            );
+            assert_eq!(rendered.content_type, "video/webm");
+        }
+        let _ = tokio::fs::remove_file(&source).await;
     }
 
     fn has_webp_chunk(bytes: &[u8], chunk: [u8; 4]) -> bool {

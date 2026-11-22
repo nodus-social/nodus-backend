@@ -104,7 +104,16 @@ videos):
 - upload writes a `media_attachment` row, generates blurhash, and starts the
   processor;
 - the monolith processes variants in-process; every API replica needs its own
-  `ffmpeg`/`ffprobe` today (`NODUS_FFMPEG`, `NODUS_FFPROBE`);
+  `ffmpeg`/`ffprobe` today (`NODUS_FFMPEG`, `NODUS_FFPROBE`), with both libvpx
+  encoders present (`ffmpeg -encoders | grep libvpx` lists `libvpx` and
+  `libvpx-vp9`);
+- video renditions are encoded by `NODUS_MEDIA_VIDEO_CODEC`, `vp8` or `vp9`,
+  **default `vp8`**; the container is WebM and the content type `video/webm`
+  either way. VP8 is the default because this host has no hardware encoder: VP8
+  encodes several times faster in software than VP9, and at the renditions we
+  publish the quality and size difference is small. `vp9` is the opt-in for a
+  host that can spend the time. Any other value fails startup with both accepted
+  values and the default in the message;
 - variant files live under `NODUS_MEDIA_VARIANTS_DIR` (default
   `NODUS_MEDIA_DIR/variants`), keyed by SHA-256;
 - `GET /api/v1/media/{id}` reports `pending|processing|ready|failed` and progress;
