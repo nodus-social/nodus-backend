@@ -31,7 +31,9 @@ use nodus_server_store::media;
 use nodus_server_store::polls;
 use nodus_server_store::statuses::{self, StatusRow};
 
+use crate::dto::profile_picture_url;
 use crate::error::{ApiError, ApiResult};
+use crate::media::ProfileSlot;
 use crate::state::AppState;
 
 /// A protocol document with its media type.
@@ -1934,11 +1936,11 @@ fn actor_document(state: &AppState, account: &AccountRow) -> Actor {
         avatar: account
             .avatar_ref
             .as_ref()
-            .map(|name| state.instance().url(&format!("/media/{name}"))),
+            .map(|reference| profile_picture_url(reference, ProfileSlot::Avatar, state.instance())),
         header: account
             .header_ref
             .as_ref()
-            .map(|name| state.instance().url(&format!("/media/{name}"))),
+            .map(|reference| profile_picture_url(reference, ProfileSlot::Header, state.instance())),
         followers: Some(format!("{actor}/followers")),
         following: Some(format!("{actor}/following")),
         outbox: Some(format!("{actor}/outbox")),

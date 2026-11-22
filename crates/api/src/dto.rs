@@ -10,10 +10,12 @@ use serde::Serialize;
 use nodus_server_core::limits::{
     IMAGE_SIZE_LIMIT, MEDIA_MAX_ATTACHMENTS, STATUS_MAX_CHARS, URL_RESERVED_CHARS, VIDEO_SIZE_LIMIT,
 };
+use nodus_server_core::Id;
 use nodus_server_store::accounts::AccountRow;
 use nodus_server_store::media::MediaRow;
 use nodus_server_store::statuses::StatusRow;
 
+use crate::media::ProfileSlot;
 use crate::state::InstanceConfig;
 
 /// The page a reader should open for an account, in the place that actually holds it.
@@ -149,6 +151,28 @@ pub struct AccountDto {
     pub staff_role: Option<&'static str>,
 }
 
+/// The asset every account without a picture points at.
+const DEFAULT_AVATAR: &str = "default-avatar.png";
+
+/// The URL a local profile picture is served at.
+///
+/// `reference` is what the account row stores: a bare media id, the `<id>/<layer>` pair
+/// written since profile layers existed, or an asset name such as `default-avatar.png`.
+/// Only a bare id gains the layer: naming it is what asks the media service for the size
+/// the profile draws, and what gives [`still_url`] a suffix to find the still twin by. A
+/// reference that already names its file is published as stored, so an old `{id}/preview`
+/// keeps rendering and no reference is given a second layer.
+pub(crate) fn profile_picture_url(
+    reference: &str,
+    slot: ProfileSlot,
+    instance: &InstanceConfig,
+) -> String {
+    if reference.parse::<Id>().is_ok() {
+        return instance.url(&format!("/media/{reference}/{}", slot.reference()));
+    }
+    instance.url(&format!("/media/{reference}"))
+}
+
 /// The still twin of an animated profile URL.
 ///
 /// Mastodon's `*_static` fields exist for clients that cannot or must not animate, so
@@ -173,10 +197,11 @@ impl AccountDto {
             None => row.username.clone(),
         };
         let avatar = row.avatar_url.clone().unwrap_or_else(|| {
-            instance.url(&format!(
-                "/media/{}",
-                row.avatar_ref.as_deref().unwrap_or("default-avatar.png")
-            ))
+            profile_picture_url(
+                row.avatar_ref.as_deref().unwrap_or(DEFAULT_AVATAR),
+                ProfileSlot::Avatar,
+                instance,
+            )
         });
         let header = row
             .header_url
@@ -184,7 +209,7 @@ impl AccountDto {
             .or_else(|| {
                 row.header_ref
                     .as_ref()
-                    .map(|reference| instance.url(&format!("/media/{reference}")))
+                    .map(|reference| profile_picture_url(reference, ProfileSlot::Header, instance))
             })
             .unwrap_or_default();
         Self {
