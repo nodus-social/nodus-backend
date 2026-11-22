@@ -33,6 +33,14 @@ pub enum Layer {
     Compressed,
     /// Original bytes, only for media marked lossless.
     Lossless,
+    /// Profile picture. Generated when a media id is set as an avatar.
+    Avatar,
+    /// Profile banner. Generated when a media id is set as a header.
+    Header,
+    /// First frame of [`Layer::Avatar`], for clients that must not animate.
+    AvatarStatic,
+    /// First frame of [`Layer::Header`], for clients that must not animate.
+    HeaderStatic,
 }
 
 impl Layer {
@@ -43,6 +51,10 @@ impl Layer {
             Self::Preview => "preview",
             Self::Compressed => "compressed",
             Self::Lossless => "lossless",
+            Self::Avatar => "avatar",
+            Self::Header => "header",
+            Self::AvatarStatic => "avatar_static",
+            Self::HeaderStatic => "header_static",
         }
     }
 
@@ -50,6 +62,23 @@ impl Layer {
     #[must_use]
     pub const fn is_long_lived(self) -> bool {
         !matches!(self, Self::Compressed)
+    }
+
+    /// Whether this layer is a single frame even when the source animates. This is the
+    /// whole point of Mastodon's `*_static` fields: a client that cannot animate asks
+    /// for these, and an animated answer would defeat it.
+    #[must_use]
+    pub const fn is_still(self) -> bool {
+        matches!(self, Self::AvatarStatic | Self::HeaderStatic)
+    }
+
+    /// Whether this layer exists for a profile rather than a post.
+    #[must_use]
+    pub const fn is_profile(self) -> bool {
+        matches!(
+            self,
+            Self::Avatar | Self::Header | Self::AvatarStatic | Self::HeaderStatic
+        )
     }
 }
 
@@ -86,7 +115,11 @@ impl CachePolicy {
     #[must_use]
     pub const fn ttl(self, layer: Layer) -> Duration {
         match layer {
-            Layer::Preview => self.preview,
+            Layer::Preview
+            | Layer::Avatar
+            | Layer::Header
+            | Layer::AvatarStatic
+            | Layer::HeaderStatic => self.preview,
             Layer::Compressed => self.compressed,
             Layer::Lossless => self.lossless,
         }
@@ -219,6 +252,24 @@ impl LosslessPermissions {
 pub const PREVIEW_EDGE: u32 = 1280;
 /// Compressed full-size longest edge. This is a cache cap, not an upscale.
 pub const COMPRESSED_EDGE: u32 = 4096;
+/// Avatar longest edge. A profile page draws the avatar at roughly 400 px and the rail
+/// at roughly 48 px, so 400 is the largest size the UI ever shows. `PREVIEW_EDGE` cost a
+/// 1280×1280 GIF 1,084,396 B as an avatar for a picture that renders at 48 px.
+pub const AVATAR_EDGE: u32 = 400;
+/// Header longest edge. The profile banner is drawn full-width at about 1500 px.
+pub const HEADER_EDGE: u32 = 1500;
+
+/// Frame bound for an animated profile picture or post.
+///
+/// Past any of the animation bounds the variant is rendered as its first frame instead
+/// of being refused: a GIF that big is still a picture the author wanted to show. The
+/// numbers bound work, not taste — 500 frames at 15 s is a 30 fps GIF, and 40 MP is
+/// larger than any camera or phone output.
+pub const MAX_ANIMATION_FRAMES: u64 = 500;
+/// Duration bound for an animated image, in seconds. See [`MAX_ANIMATION_FRAMES`].
+pub const MAX_ANIMATION_SECONDS: f64 = 15.0;
+/// Source pixel bound for an animated image. See [`MAX_ANIMATION_FRAMES`].
+pub const MAX_ANIMATION_PIXELS: u64 = 40_000_000;
 
 /// Plan the variants for one attachment.
 ///
@@ -226,6 +277,33 @@ pub const COMPRESSED_EDGE: u32 = 4096;
 /// retained beyond the short compressed window.
 pub fn plan(width: u32, height: u32, lossless: bool) -> Result<Vec<VariantSpec>, Error> {
     plan_for(Kind::Image, width, height, lossless)
+}
+
+/// Plan the variants a profile picture or banner needs.
+///
+/// The upload is planned once when it arrives (at preview sizes, for a post that may
+/// never exist); these four are added only when an account actually points its profile
+/// at the media. `Avatar`/`Header` keep the animation, `*Static` are the first frame at
+/// the same edge.
+pub fn plan_profile(kind: Kind, width: u32, height: u32) -> Result<Vec<VariantSpec>, Error> {
+    if width == 0 || height == 0 {
+        return Err(Error::EmptyDimensions);
+    }
+    let format = kind.format();
+    let variant = |layer, max_edge| VariantSpec {
+        layer,
+        format,
+        max_edge,
+        quality: 82,
+        lossless: false,
+        retain: true,
+    };
+    Ok(vec![
+        variant(Layer::Avatar, AVATAR_EDGE),
+        variant(Layer::AvatarStatic, AVATAR_EDGE),
+        variant(Layer::Header, HEADER_EDGE),
+        variant(Layer::HeaderStatic, HEADER_EDGE),
+    ])
 }
 
 /// Content-addressed object key. The digest is the source bytes; the variant
@@ -325,7 +403,11 @@ pub fn plan_with_permissions(
 #[must_use]
 pub fn expires_in(policy: CachePolicy, variant: &VariantSpec) -> Option<Duration> {
     match variant.layer {
-        Layer::Preview => None,
+        Layer::Preview
+        | Layer::Avatar
+        | Layer::Header
+        | Layer::AvatarStatic
+        | Layer::HeaderStatic => None,
         Layer::Compressed => Some(policy.compressed),
         Layer::Lossless if variant.retain => None,
         Layer::Lossless => Some(policy.lossless_pending),
@@ -447,6 +529,64 @@ mod tests {
     #[test]
     fn empty_dimensions_are_rejected() {
         assert_eq!(plan(0, 10, false), Err(Error::EmptyDimensions));
+    }
+
+    #[test]
+    fn a_profile_gets_an_avatar_and_header_plus_a_still_of_each() {
+        let variants = plan_profile(Kind::AnimatedImage, 1280, 1280).expect("plan");
+        let edges: Vec<(Layer, u32)> = variants
+            .iter()
+            .map(|variant| (variant.layer, variant.max_edge))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![
+                (Layer::Avatar, AVATAR_EDGE),
+                (Layer::AvatarStatic, AVATAR_EDGE),
+                (Layer::Header, HEADER_EDGE),
+                (Layer::HeaderStatic, HEADER_EDGE),
+            ]
+        );
+        assert!(variants
+            .iter()
+            .all(|variant| variant.format == Format::Webp));
+        assert!(
+            AVATAR_EDGE < PREVIEW_EDGE,
+            "an avatar must be smaller than a post preview"
+        );
+        assert!(HEADER_EDGE < COMPRESSED_EDGE);
+    }
+
+    #[test]
+    fn the_static_layers_are_the_only_stills_and_they_live_with_the_media() {
+        assert!(Layer::AvatarStatic.is_still());
+        assert!(Layer::HeaderStatic.is_still());
+        assert!(!Layer::Avatar.is_still());
+        assert!(!Layer::Header.is_still());
+        assert_eq!(Layer::AvatarStatic.as_str(), "avatar_static");
+        for layer in [
+            Layer::Avatar,
+            Layer::Header,
+            Layer::AvatarStatic,
+            Layer::HeaderStatic,
+        ] {
+            assert!(layer.is_profile());
+            assert!(layer.is_long_lived());
+            let spec = plan_profile(Kind::Image, 800, 600)
+                .expect("plan")
+                .into_iter()
+                .find(|spec| spec.layer == layer)
+                .expect("planned");
+            assert_eq!(expires_in(CachePolicy::default(), &spec), None);
+        }
+    }
+
+    #[test]
+    fn a_profile_with_no_dimensions_is_rejected() {
+        assert_eq!(
+            plan_profile(Kind::Image, 0, 10),
+            Err(Error::EmptyDimensions)
+        );
     }
 }
 

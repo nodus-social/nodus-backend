@@ -310,6 +310,36 @@ pub async fn replace_variants(
     tx.commit().await
 }
 
+/// Inserts or replaces one variant without touching the attachment's other layers.
+///
+/// Profile variants are rendered after the upload pipeline has already replaced the
+/// post variants, so [`replace_variants`] would delete them the next time it runs.
+pub async fn upsert_variant(pool: &PgPool, variant: &VariantRow) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO media_variant (media_id, layer, max_edge, object_key, content_type, \
+         digest, size, width, height, expires_at, created_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+         ON CONFLICT (media_id, layer, max_edge) DO UPDATE SET \
+         object_key = EXCLUDED.object_key, content_type = EXCLUDED.content_type, \
+         digest = EXCLUDED.digest, size = EXCLUDED.size, width = EXCLUDED.width, \
+         height = EXCLUDED.height, expires_at = EXCLUDED.expires_at",
+    )
+    .bind(&variant.media_id)
+    .bind(&variant.layer)
+    .bind(variant.max_edge)
+    .bind(&variant.object_key)
+    .bind(&variant.content_type)
+    .bind(&variant.digest)
+    .bind(variant.size)
+    .bind(variant.width)
+    .bind(variant.height)
+    .bind(variant.expires_at)
+    .bind(variant.created_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// One variant by layer (picking the highest-resolution rendition when a layer has several).
 pub async fn variant(
     pool: &PgPool,

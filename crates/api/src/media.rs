@@ -707,6 +707,164 @@ async fn process_upload_in(
     UploadOutcome::Ready
 }
 
+/// Which profile picture a media id was chosen for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileSlot {
+    Avatar,
+    Header,
+}
+
+impl ProfileSlot {
+    /// The layer that keeps the animation, and the name stored in the account row.
+    pub(crate) const fn layer(self) -> Layer {
+        match self {
+            Self::Avatar => Layer::Avatar,
+            Self::Header => Layer::Header,
+        }
+    }
+
+    /// The first-frame layer served to clients that must not animate.
+    pub(crate) const fn static_layer(self) -> Layer {
+        match self {
+            Self::Avatar => Layer::AvatarStatic,
+            Self::Header => Layer::HeaderStatic,
+        }
+    }
+
+    /// The layer name a profile reference ends in.
+    pub(crate) const fn reference(self) -> &'static str {
+        match self {
+            Self::Avatar => "avatar",
+            Self::Header => "header",
+        }
+    }
+}
+
+/// Renders a profile picture's variants behind the profile update.
+///
+/// The request stores the reference and answers; a picture already at the preview size
+/// keeps working through the preview fallback until these land on the next request.
+pub(crate) fn spawn_profile_render(state: &AppState, media_id: &str, slot: ProfileSlot) {
+    let state = state.clone();
+    let media_id = media_id.to_owned();
+    tokio::spawn(async move {
+        if let Err(error) = render_profile_variants(&state, &media_id, slot).await {
+            tracing::warn!(
+                %error,
+                %media_id,
+                slot = slot.reference(),
+                "could not render a profile picture's variants"
+            );
+        }
+    });
+}
+
+async fn render_profile_variants(
+    state: &AppState,
+    media_id: &str,
+    slot: ProfileSlot,
+) -> Result<(), String> {
+    let row = media::by_id(state.store().pool(), media_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the media row is gone".to_owned())?;
+    let kind = Kind::from_content_type(&row.content_type);
+    let width = u32::try_from(row.width.unwrap_or(1)).unwrap_or(1).max(1);
+    let height = u32::try_from(row.height.unwrap_or(1)).unwrap_or(1).max(1);
+    let plan =
+        nodus_server_media::plan_profile(kind, width, height).map_err(|error| error.to_string())?;
+    let (source, scratch) = profile_source(&row).await?;
+    let result = write_profile_variants(state, &row, kind, &source, &plan, slot).await;
+    if scratch {
+        let _ = tokio::fs::remove_file(&source).await;
+    }
+    result
+}
+
+async fn write_profile_variants(
+    state: &AppState,
+    row: &MediaRow,
+    kind: Kind,
+    source: &std::path::Path,
+    plan: &[VariantSpec],
+    slot: ProfileSlot,
+) -> Result<(), String> {
+    let policy = CachePolicy::default();
+    for spec in plan
+        .iter()
+        .filter(|spec| spec.layer == slot.layer() || spec.layer == slot.static_layer())
+    {
+        let rendered = nodus_server_media::process::render_one(source, kind, spec)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(reason) = rendered.still_reason {
+            tracing::info!(
+                reason = reason.as_str(),
+                media = %row.id,
+                "a profile picture was rendered still"
+            );
+        }
+        let digest = hex(&Sha256::digest(&rendered.bytes));
+        let dir = variants_dir();
+        tokio::fs::write(dir.join(&digest), &rendered.bytes)
+            .await
+            .map_err(|error| error.to_string())?;
+        media::upsert_variant(
+            state.store().pool(),
+            &VariantRow {
+                media_id: row.id.clone(),
+                layer: spec.layer.as_str().to_owned(),
+                max_edge: i64::from(spec.max_edge),
+                object_key: nodus_server_media::object_key(&row.digest, &digest, spec.layer),
+                content_type: rendered.content_type.to_owned(),
+                digest,
+                size: i64::try_from(rendered.bytes.len()).unwrap_or(i64::MAX),
+                width: None,
+                height: None,
+                expires_at: expires_in(policy, spec).and_then(|ttl| {
+                    chrono::Duration::from_std(ttl)
+                        .ok()
+                        .map(|ttl| Utc::now() + ttl)
+                }),
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// A local path to the original, fetching it from the media cluster when this host does
+/// not hold it. The bool says the file is a scratch copy to remove afterwards.
+async fn profile_source(row: &MediaRow) -> Result<(PathBuf, bool), String> {
+    let local = storage_dir().join(&row.digest);
+    if tokio::fs::metadata(&local).await.is_ok() {
+        return Ok((local, false));
+    }
+    let Some(cluster) = ClusterUpload::from_env() else {
+        return Err(
+            "the original is not on this host and no media cluster is configured".to_owned(),
+        );
+    };
+    let url = format!("{}/media/{}", cluster.base, row.id);
+    let response = cluster_client()
+        .get(&url)
+        .timeout(CLUSTER_PUT_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("the media service answered {}", response.status()));
+    }
+    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+    let scratch = std::env::temp_dir().join(format!("nodus-profile-{}", Id::new()));
+    tokio::fs::write(&scratch, &bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((scratch, true))
+}
+
 /// Writes the render's verdict to the media row — the last write of the pipeline.
 async fn publish_outcome(pool: &PgPool, id: &str, outcome: &UploadOutcome) {
     match outcome {

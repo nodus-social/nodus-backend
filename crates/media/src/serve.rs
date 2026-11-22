@@ -454,6 +454,10 @@ pub async fn serve_variant(
         "preview" => Layer::Preview,
         "compressed" => Layer::Compressed,
         "lossless" => Layer::Lossless,
+        "avatar" => Layer::Avatar,
+        "header" => Layer::Header,
+        "avatar_static" => Layer::AvatarStatic,
+        "header_static" => Layer::HeaderStatic,
         _ => return not_found(),
     };
     // A variant is the same picture as its original, so a suspended account's media is
@@ -463,10 +467,33 @@ pub async fn serve_variant(
         Some(_) => {}
         None => return not_found(),
     }
-    if let Some(variant) = variant(&serving, &id, layer.as_str()).await {
-        return variant_response(&serving, variant, layer, headers.get(header::RANGE)).await;
+    if let Some(response) =
+        variant_or_preview(&serving, &id, layer, headers.get(header::RANGE)).await
+    {
+        return response;
     }
     original(&serving, &id, headers.get(header::RANGE)).await
+}
+
+/// The variant for `layer`, or the preview when a profile variant is still rendering.
+///
+/// A picture someone just set as their avatar has its profile variant rendered behind
+/// the update request, which may still be running. The preview is already the picture;
+/// answering with it keeps the profile working and the next request finds the variant.
+async fn variant_or_preview(
+    serving: &Arc<Serving>,
+    id: &str,
+    layer: Layer,
+    range: Option<&HeaderValue>,
+) -> Option<Response> {
+    if let Some(variant) = variant(serving, id, layer.as_str()).await {
+        return Some(variant_response(serving, variant, layer, range).await);
+    }
+    if layer.is_profile() {
+        let preview = variant(serving, id, Layer::Preview.as_str()).await?;
+        return Some(variant_response(serving, preview, Layer::Preview, range).await);
+    }
+    None
 }
 
 async fn catalogue(serving: &Serving, id: &str) -> Option<media::MediaRow> {

@@ -128,6 +128,50 @@ nodes cannot bounce one delete back and forth.
 If all three are empty the answer is 404. A suspended or deleted account is a 404 before any
 of this, at every layer.
 
+## Profile pictures and banners
+
+A profile picture is not a post attachment: it is drawn small and long-lived, so it gets its
+own ladder rather than `preview` at 1280 px.
+
+| layer | edge | animation |
+| --- | --- | --- |
+| `avatar` | 400 px | yes, when the source animates |
+| `avatar_static` | 400 px | no — first frame |
+| `header` | 1500 px | yes, when the source animates |
+| `header_static` | 1500 px | no — first frame |
+
+400 px is the largest the profile page draws an avatar (the rail draws it at about 48 px);
+1500 px is the profile banner's drawn width. Measured on a 1280×1280, 20-frame GIF: the
+preview was 1,084,396 B, the 400 px animated avatar 162,296 B, and its still 7,106 B. A
+source smaller than the edge is not upscaled, so a 320×320 GIF keeps one size at every layer.
+
+These four layers are rendered when an account points its profile at a media id, not when the
+media is uploaded: `PATCH /api/v1/accounts/update_credentials` stores `<id>/avatar` or
+`<id>/header` and queues the render behind the request. Until the render lands the media
+service answers a profile layer with `preview`, so a picture that is still encoding never
+breaks the profile; the next request finds the finished variant.
+
+`avatar_static` and `header_static` are what a client that must not animate asks for, and
+they are a real still: the first frame at the same edge, encoded as a WebP still. An
+account's `avatar`/`header` keep the animation.
+
+### Animation bounds
+
+Animation is bounded at render time, and a source past a bound is degraded, never refused: it
+renders as its first frame and the reason is logged (`animation degraded to its first frame`
+with `reason` = too many frames, too long, frames too large, or unmeasured).
+
+| bound | value | why |
+| --- | --- | --- |
+| frames | 500 | 500 frames at 15 s is a 30 fps GIF; more is a video |
+| duration | 15 s | beyond this a profile picture is a clip |
+| source pixels | 40 MP | larger than any camera or phone output |
+
+The probe is one `ffprobe -count_frames` per animated render, and it fails closed: a source
+whose size cannot be measured is rendered still. The upload itself never fails on these
+bounds. A machine-readable record on the variant row is the follow-up; today the note is the
+log line.
+
 ## Range requests
 
 A client that seeks sends `Range: bytes=…`, and the media node answers it, because the bytes
@@ -143,7 +187,9 @@ slice, so the rules cannot drift between the API-facing and peer-facing answers:
 `Accept-Ranges: bytes` is on every byte answer, and `Content-Length` is the length actually
 sent: a 206 declares the slice, not the object, and a 416 carries no body at all — its
 `Content-Range` is the only part a client can act on. `/media/{id}/{layer}` falls back to the
-original when the layer is absent, and the range is applied to whichever bytes the answer
+original when the layer is absent — except `avatar`, `header`, `avatar_static` and
+`header_static`, which fall back to `preview` so a profile picture never resolves to the
+multi-megabyte upload it came from — and the range is applied to whichever bytes the answer
 carries, so a client never receives a slice of one representation with the length of another.
 A variant is only ever served from local disk, so ranged variant reads never ask a peer.
 

@@ -13,12 +13,44 @@ use tokio::process::Command;
 
 use crate::{Error, Format, Kind, Layer, VariantSpec};
 
+/// Why an animated image was rendered as its first frame instead.
+///
+/// The note is logged and carried back on the render, so an operator can tell a still
+/// avatar from a GIF that was deliberately degraded rather than from one that lost its
+/// animation by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StillReason {
+    /// More than [`crate::MAX_ANIMATION_FRAMES`] frames.
+    Frames,
+    /// Longer than [`crate::MAX_ANIMATION_SECONDS`] seconds.
+    Duration,
+    /// More than [`crate::MAX_ANIMATION_PIXELS`] source pixels.
+    Pixels,
+    /// The probe could not say how big the animation is, so it was not animated unbounded.
+    Unmeasured,
+}
+
+impl StillReason {
+    /// Stable phrase used in the log line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Frames => "animation has too many frames",
+            Self::Duration => "animation is too long",
+            Self::Pixels => "animation frames are too large",
+            Self::Unmeasured => "animation size could not be measured",
+        }
+    }
+}
+
 /// One encoded variant, ready to be written to the object store.
 #[derive(Debug, Clone)]
 pub struct Rendered {
     pub spec: VariantSpec,
     pub bytes: Vec<u8>,
     pub content_type: &'static str,
+    /// Set when an animated source was rendered as a still because it exceeded a bound.
+    pub still_reason: Option<StillReason>,
 }
 
 /// Encodes one planned variant from `source`.
@@ -35,12 +67,16 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
             spec: *spec,
             bytes,
             content_type: content_type(spec.format),
+            still_reason: None,
         });
     }
 
     if spec.format == Format::Webp && kind == Kind::Image {
         return render_still(source, spec).await;
     }
+    // A `*_static` layer is a still by definition; an animated layer is a still when the
+    // source is past the bounds. Either way the encoder writes one frame.
+    let (animate, still_reason) = animated_or_still(source, kind, spec).await;
     let extension = match spec.format {
         Format::Webp => "webp",
         Format::Webm => "webm",
@@ -59,16 +95,12 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
             .arg("-vf")
             .arg(webp_scale_filter(spec.max_edge))
             .arg("-c:v")
-            .arg(if kind == Kind::AnimatedImage {
-                "libwebp_anim"
-            } else {
-                "libwebp"
-            })
+            .arg(if animate { "libwebp_anim" } else { "libwebp" })
             .arg("-lossless")
             .arg(if spec.lossless { "1" } else { "0" })
             .arg("-quality")
             .arg(spec.quality.to_string());
-        if kind == Kind::AnimatedImage {
+        if animate {
             command.arg("-loop").arg("0");
         } else {
             command.arg("-frames:v").arg("1");
@@ -97,7 +129,90 @@ pub async fn render_one(source: &Path, kind: Kind, spec: &VariantSpec) -> Result
         spec: *spec,
         bytes,
         content_type: content_type(spec.format),
+        still_reason,
     })
+}
+
+/// Whether this variant animates, and why it does not when it was expected to.
+///
+/// A degradation is logged here, once, at the point where the encoder is about to write
+/// the first frame instead of every frame.
+async fn animated_or_still(
+    source: &Path,
+    kind: Kind,
+    spec: &VariantSpec,
+) -> (bool, Option<StillReason>) {
+    if kind != Kind::AnimatedImage || spec.layer.is_still() {
+        return (false, None);
+    }
+    match animation_within_bounds(source).await {
+        Ok(()) => (true, None),
+        Err(reason) => {
+            tracing::warn!(
+                path = %source.display(),
+                reason = reason.as_str(),
+                "animation degraded to its first frame"
+            );
+            (false, Some(reason))
+        }
+    }
+}
+
+/// Whether an animated source is inside the documented bounds.
+///
+/// A probe that cannot answer counts as over the bound: failing to measure is not a
+/// licence to animate without one, and a still is still the picture. The upload itself
+/// never fails on this path.
+async fn animation_within_bounds(source: &Path) -> Result<(), StillReason> {
+    let output = Command::new(ffprobe())
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-count_frames")
+        .arg("-show_entries")
+        .arg("stream=nb_read_frames,width,height:format=duration")
+        .arg("-of")
+        .arg("default=nw=1")
+        .arg(source)
+        .output()
+        .await
+        .map_err(|_| StillReason::Unmeasured)?;
+    if !output.status.success() {
+        return Err(StillReason::Unmeasured);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut frames = None;
+    let mut seconds = None;
+    let mut width = None;
+    let mut height = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "nb_read_frames" => frames = value.trim().parse::<u64>().ok(),
+            "duration" => seconds = value.trim().parse::<f64>().ok(),
+            "width" => width = value.trim().parse::<u64>().ok(),
+            "height" => height = value.trim().parse::<u64>().ok(),
+            _ => {}
+        }
+    }
+    if frames.is_none() && seconds.is_none() {
+        return Err(StillReason::Unmeasured);
+    }
+    if frames.is_some_and(|frames| frames > crate::MAX_ANIMATION_FRAMES) {
+        return Err(StillReason::Frames);
+    }
+    if seconds.is_some_and(|seconds| seconds > crate::MAX_ANIMATION_SECONDS) {
+        return Err(StillReason::Duration);
+    }
+    if let (Some(width), Some(height)) = (width, height) {
+        if width.saturating_mul(height) > crate::MAX_ANIMATION_PIXELS {
+            return Err(StillReason::Pixels);
+        }
+    }
+    Ok(())
 }
 
 async fn run_ffmpeg(mut command: Command, output: &Path) -> Result<Vec<u8>, Error> {
@@ -156,6 +271,7 @@ async fn render_still(source: &Path, spec: &VariantSpec) -> Result<Rendered, Err
             spec: *spec,
             bytes,
             content_type: "image/webp",
+            still_reason: None,
         });
     }
 
@@ -199,6 +315,7 @@ async fn render_still(source: &Path, spec: &VariantSpec) -> Result<Rendered, Err
         spec: *spec,
         bytes: output,
         content_type: "image/webp",
+        still_reason: None,
     })
 }
 
@@ -293,6 +410,79 @@ mod tests {
         let _ = tokio::fs::remove_file(&path).await;
         let decoded = image::load_from_memory(&rendered.bytes).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (8, 4));
+    }
+
+    /// A real GIF from the test machine's ffmpeg, or `None` when it has none.
+    async fn animated_gif(rate: u32, seconds: u32) -> Option<std::path::PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "nodus-media-anim-{}-{}.gif",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let status = Command::new(ffmpeg())
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("testsrc=size=64x64:rate={rate}"))
+            .args(["-t", &seconds.to_string(), "-loop", "0"])
+            .arg(&path)
+            .status()
+            .await
+            .ok()?;
+        status.success().then_some(path)
+    }
+
+    fn profile_spec(layer: Layer) -> VariantSpec {
+        VariantSpec {
+            layer,
+            format: Format::Webp,
+            max_edge: crate::AVATAR_EDGE,
+            quality: 82,
+            lossless: false,
+            retain: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_short_gif_keeps_its_animation_in_the_avatar_layer() {
+        let Some(path) = animated_gif(10, 2).await else {
+            return;
+        };
+        let rendered = render_one(&path, Kind::AnimatedImage, &profile_spec(Layer::Avatar))
+            .await
+            .expect("render");
+        let _ = tokio::fs::remove_file(&path).await;
+        assert!(has_webp_chunk(&rendered.bytes, *b"ANMF"));
+        assert_eq!(rendered.still_reason, None);
+    }
+
+    #[tokio::test]
+    async fn a_gif_past_the_duration_bound_comes_back_still_with_a_reason() {
+        // 16 frames over 16 seconds: few frames, too long. The bounds are independent.
+        let Some(path) = animated_gif(1, 16).await else {
+            return;
+        };
+        let rendered = render_one(&path, Kind::AnimatedImage, &profile_spec(Layer::Avatar))
+            .await
+            .expect("render");
+        let _ = tokio::fs::remove_file(&path).await;
+        assert!(!has_webp_chunk(&rendered.bytes, *b"ANMF"));
+        assert_eq!(rendered.still_reason, Some(StillReason::Duration));
+    }
+
+    #[tokio::test]
+    async fn a_static_layer_of_a_gif_is_a_still_without_a_reason() {
+        let Some(path) = animated_gif(10, 2).await else {
+            return;
+        };
+        let rendered = render_one(
+            &path,
+            Kind::AnimatedImage,
+            &profile_spec(Layer::AvatarStatic),
+        )
+        .await
+        .expect("render");
+        let _ = tokio::fs::remove_file(&path).await;
+        assert!(!has_webp_chunk(&rendered.bytes, *b"ANMF"));
+        assert_eq!(rendered.still_reason, None);
     }
 
     #[test]

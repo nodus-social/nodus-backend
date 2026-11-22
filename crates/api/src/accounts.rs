@@ -17,6 +17,7 @@ use crate::body::JsonOrForm;
 use crate::dto::AccountDto;
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
+use crate::media::ProfileSlot;
 use crate::profile_fields::ProfileFieldInput;
 use crate::state::{AppState, InstanceConfig};
 
@@ -74,8 +75,20 @@ pub async fn update_credentials(
             ));
         }
     }
-    let avatar_ref = attachment_ref(&state, &auth, request.avatar.as_deref()).await?;
-    let header_ref = attachment_ref(&state, &auth, request.header.as_deref()).await?;
+    let avatar_ref = attachment_ref(
+        &state,
+        &auth,
+        request.avatar.as_deref(),
+        ProfileSlot::Avatar,
+    )
+    .await?;
+    let header_ref = attachment_ref(
+        &state,
+        &auth,
+        request.header.as_deref(),
+        ProfileSlot::Header,
+    )
+    .await?;
     let fields = request
         .fields
         .as_deref()
@@ -109,13 +122,17 @@ pub async fn update_credentials(
 
 /// Turns an uploaded picture into the reference a profile stores.
 ///
-/// The preview variant is the one sized for a profile, so that is what the avatar points
-/// at; the media has to be the reader's own, or one account could point its profile at
-/// another's upload.
+/// The reference names the layer sized for the profile, and choosing one is also the
+/// moment that layer is rendered: the variants are queued behind this request rather
+/// than generated for every upload that might never become a profile picture. Until they
+/// land, the media service answers the reference with the preview, so a profile is never
+/// broken by a picture that is still encoding. The media has to be the reader's own, or
+/// one account could point its profile at another's upload.
 async fn attachment_ref(
     state: &AppState,
     auth: &Auth,
     media_id: Option<&str>,
+    slot: ProfileSlot,
 ) -> ApiResult<Option<String>> {
     let Some(media_id) = media_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return Ok(None);
@@ -132,7 +149,8 @@ async fn attachment_ref(
             "an avatar or header must be an image",
         ));
     }
-    Ok(Some(format!("{media_id}/preview")))
+    crate::media::spawn_profile_render(state, media_id, slot);
+    Ok(Some(format!("{media_id}/{}", slot.reference())))
 }
 
 #[derive(Debug, Serialize)]

@@ -149,6 +149,22 @@ pub struct AccountDto {
     pub staff_role: Option<&'static str>,
 }
 
+/// The still twin of an animated profile URL.
+///
+/// Mastodon's `*_static` fields exist for clients that cannot or must not animate, so
+/// returning the animation there defeats them. A remote account's URL or an older
+/// `{id}/preview` reference has no still twin: it is returned unchanged and the profile
+/// gets one the next time the picture is set.
+fn still_url(url: &str) -> String {
+    if let Some(base) = url.strip_suffix("/avatar") {
+        return format!("{base}/avatar_static");
+    }
+    if let Some(base) = url.strip_suffix("/header") {
+        return format!("{base}/header_static");
+    }
+    url.to_owned()
+}
+
 impl AccountDto {
     #[must_use]
     pub fn from_row(row: &AccountRow, instance: &InstanceConfig) -> Self {
@@ -184,9 +200,9 @@ impl AccountDto {
             note: row.note.clone(),
             url: account_url(row, instance),
             avatar: avatar.clone(),
-            avatar_static: avatar,
+            avatar_static: still_url(&avatar),
             header: header.clone(),
-            header_static: header,
+            header_static: still_url(&header),
             followers_count: row.followers_count,
             following_count: row.following_count,
             statuses_count: row.statuses_count,
@@ -565,5 +581,33 @@ impl RuleDto {
             ordinal: row.ordinal,
             hint: row.hint,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::still_url;
+
+    #[test]
+    fn a_profile_url_gets_a_still_twin() {
+        assert_eq!(
+            still_url("https://social.test/media/abc/avatar"),
+            "https://social.test/media/abc/avatar_static"
+        );
+        assert_eq!(
+            still_url("https://social.test/media/abc/header"),
+            "https://social.test/media/abc/header_static"
+        );
+    }
+
+    #[test]
+    fn a_reference_without_a_still_twin_is_unchanged() {
+        assert_eq!(
+            still_url("https://remote.test/a.png"),
+            "https://remote.test/a.png"
+        );
+        assert_eq!(still_url(""), "");
+        // Legacy rows point at the preview; they get a still on the next profile save.
+        assert_eq!(still_url("abc/preview"), "abc/preview");
     }
 }
