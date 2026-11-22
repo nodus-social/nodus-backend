@@ -29,7 +29,7 @@ use crate::state::AppState;
 /// this instance's `nodus-feed` process on the same origin. The rest are answered by this
 /// API. `tests/capabilities.rs` holds the feature-to-path table and fails when a name here
 /// stops answering or a route appears that no name covers.
-pub const FEATURES: [&str; 28] = [
+pub const FEATURES: [&str; 42] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -82,6 +82,25 @@ pub const FEATURES: [&str; 28] = [
     "drive",        // GET /api/v1/drive, /drive/folders, /drive/files and the {id} forms
     "drive_share",  // POST /api/v1/drive/files/{id}/share; GET /media/share/{token}
     "drive_attach", // POST /api/v1/drive/files/{id}/attach; POST /api/v1/media {stored_object_id}
+    // The client-facing Mastodon surfaces this API has always served and never named. A
+    // console that hides a panel because its name is absent hides a working route: these
+    // are the collections, the composer's scheduled queue, the notification inbox and the
+    // discovery pages the frontend draws. None of them varies by instance, so every one is
+    // published unconditionally.
+    "favourites",         // GET /api/v1/favourites
+    "bookmarks",          // GET /api/v1/bookmarks
+    "conversations",      // GET /api/v1/conversations, POST /{id}/read, POST /{id}/mute
+    "lists",              // GET|POST /api/v1/lists, /lists/{id}, /lists/{id}/accounts
+    "filters",            // GET|POST /api/v2/filters and /api/v1/filters, both with /{id}/keywords
+    "scheduled_statuses", // GET /api/v1/scheduled_statuses; DELETE /{id}
+    "notifications",      // GET /api/v1/notifications, /clear, /{id}, POST /{id}/dismiss
+    "announcements",      // GET /api/v1/announcements; POST /{id}/dismiss
+    "search",             // GET /api/v1/search and /api/v2/search
+    "directory",          // GET /api/v1/directory
+    "markers",            // GET|POST /api/v1/markers
+    "preferences",        // GET /api/v1/preferences
+    "streaming",          // GET /api/v1/streaming (the SSE tail of the events table)
+    "tags",               // GET /api/v1/tags/{name}, /{name}/follow, /{name}/unfollow
 ];
 
 /// The capability names this deployment can actually honour, as owned strings.

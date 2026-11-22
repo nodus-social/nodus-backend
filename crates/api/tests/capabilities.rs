@@ -214,6 +214,81 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/drive/files/{id}/attach",
         owner: Owner::Api,
     },
+    // The client surfaces the handshake used to omit while the API answered them. Each
+    // path is a door behind a grant (401) or a route that only takes another method (405),
+    // so the probe proves the route exists without a database.
+    Capability {
+        name: "favourites",
+        path: "/api/v1/favourites",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "bookmarks",
+        path: "/api/v1/bookmarks",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "conversations",
+        path: "/api/v1/conversations",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "lists",
+        path: "/api/v1/lists",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "filters",
+        path: "/api/v2/filters",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "scheduled_statuses",
+        path: "/api/v1/scheduled_statuses",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "notifications",
+        path: "/api/v1/notifications",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "announcements",
+        path: "/api/v1/announcements",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "search",
+        path: "/api/v1/search",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "directory",
+        path: "/api/v1/directory",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "markers",
+        path: "/api/v1/markers",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "preferences",
+        path: "/api/v1/preferences",
+        owner: Owner::Api,
+    },
+    // An SSE stream never returns a body to this probe, which `probe` treats as present at
+    // its budget; a route that was deleted would answer 404 at once instead.
+    Capability {
+        name: "streaming",
+        path: "/api/v1/streaming",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "tags",
+        path: "/api/v1/tags/{name}/follow",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -799,4 +874,540 @@ async fn every_registered_admin_route_still_answers() {
         "an admin route is registered but not served:\n  {}",
         failures.join("\n  ")
     );
+}
+
+/// Every route source `router()` mounts, read at compile time so a renamed module is a
+/// build error rather than a silently narrower test.
+macro_rules! route_sources {
+    ($($file:literal),* $(,)?) => {
+        &[$(($file, include_str!(concat!("../src/", $file)))),*]
+    };
+}
+
+const ROUTE_SOURCES: &[(&str, &str)] = route_sources![
+    "lib.rs",
+    "announcements.rs",
+    "appeals.rs",
+    "assets.rs",
+    "client_metadata.rs",
+    "collections.rs",
+    "conversations.rs",
+    "discovery.rs",
+    "drive.rs",
+    "filters.rs",
+    "follow_requests.rs",
+    "highlights.rs",
+    "lists.rs",
+    "markers.rs",
+    "media.rs",
+    "miauth.rs",
+    "misskey.rs",
+    "nodus.rs",
+    "notifications.rs",
+    "polls.rs",
+    "preferences.rs",
+    "schedules.rs",
+    "streaming.rs",
+    "suggestions.rs",
+    "tags.rs",
+    "admin/accounts.rs",
+    "admin/appeals.rs",
+    "admin/blocklist.rs",
+    "admin/escalation.rs",
+    "admin/federation.rs",
+    "admin/forwarded.rs",
+    "admin/media.rs",
+    "admin/mod.rs",
+    "admin/moderation_rules.rs",
+    "admin/reports.rs",
+    "admin/rules.rs",
+    "admin/scanners.rs",
+    "admin/settings_transfer.rs",
+    "admin/stats.rs",
+    "admin/topology.rs",
+];
+
+/// The published names that cover every route under `/api/v1/admin` and `/api/v2/admin`.
+///
+/// The admin modules are checked one-by-one against their capability names by
+/// `every_admin_module_names_at_least_one_feature`; this table only lets the router-wide
+/// walk know that the prefix is named at all.
+const ADMIN_FEATURES: &[&str] = &[
+    "admin",
+    "moderation",
+    "scanners",
+    "topology",
+    "remote_blocks",
+    "appeals",
+    "instance_rules",
+    "moderation_rules",
+    "media_quarantine",
+    "block_lists",
+    "moderation_stats",
+    "remote_accounts",
+    "warnings",
+    "escalation",
+    "federation_delivery",
+    "domain_pauses",
+    "settings_transfer",
+    "report_forwarding",
+];
+
+/// One prefix of the router's route table and the capability names that stand behind it.
+struct SurfaceGroup {
+    /// A route template prefix; `covers` matches it at a `/` boundary.
+    prefix: &'static str,
+    /// Names published in `FEATURES` for this prefix. Empty means intentionally unnamed.
+    features: &'static [&'static str],
+    /// Why an unnamed prefix is still served. Required (and non-trivial) exactly when
+    /// `features` is empty: a bare allowlist entry is the thing that rots.
+    reason: &'static str,
+}
+
+/// The router's surface groups, named or deliberately not.
+///
+/// A group with names is the both-directions contract: every name must answer a route
+/// under the prefix, and every route under the prefix must be claimed by some group.
+/// Groups with no name are doctrine, not omissions: core Mastodon routes every client
+/// assumes, compatibility dialects that are negotiated rather than gated, and the
+/// deployment's own plumbing. Each carries the reason it is not a capability.
+const SURFACE_GROUPS: &[SurfaceGroup] = &[
+    // Administration: one umbrella prefix; the per-module table below holds the detail.
+    SurfaceGroup {
+        prefix: "/api/v1/admin",
+        features: ADMIN_FEATURES,
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v2/admin",
+        features: ADMIN_FEATURES,
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/scan",
+        features: &["scanners"],
+        reason: "",
+    },
+    // The Nodus protocol surface. The capability document and the role probe are the
+    // handshake; batch is its own verb. The sync/event tail is negotiated by the contract
+    // string, not drawn as a panel, so it shares the prefix without a name of its own.
+    SurfaceGroup {
+        prefix: "/api/v1/nodus/capabilities",
+        features: &["protocol"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/nodus/account",
+        features: &["protocol"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/nodus/batch",
+        features: &["batch"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/nodus",
+        features: &[],
+        reason: "nodus-1 sync/event routes are negotiated by the contract string, not a panel",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/polls",
+        features: &["polls"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/accounts/{id}/undelete",
+        features: &["account_deletion"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/drive",
+        features: &["drive", "drive_share", "drive_attach"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/media/share",
+        features: &["drive_share"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/media",
+        features: &["drive_attach"],
+        reason: "",
+    },
+    // The client surfaces this change names.
+    SurfaceGroup {
+        prefix: "/api/v1/favourites",
+        features: &["favourites"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/bookmarks",
+        features: &["bookmarks"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/conversations",
+        features: &["conversations"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/lists",
+        features: &["lists"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/filters",
+        features: &["filters"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v2/filters",
+        features: &["filters"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/scheduled_statuses",
+        features: &["scheduled_statuses"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/notifications",
+        features: &["notifications"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/announcements",
+        features: &["announcements"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/search",
+        features: &["search"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v2/search",
+        features: &["search"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/directory",
+        features: &["directory"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/markers",
+        features: &["markers"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/preferences",
+        features: &["preferences"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/streaming",
+        features: &["streaming"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/tags",
+        features: &["tags"],
+        reason: "",
+    },
+    // Core Mastodon routes: every client assumes them, so gating them would only make a
+    // console hide a door the protocol guarantees.
+    SurfaceGroup {
+        prefix: "/api/v1/accounts",
+        features: &[],
+        reason: "core account profile, relationship and status routes every client assumes",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/statuses",
+        features: &[],
+        reason: "core status lifecycle: create, show, delete, favourite, bookmark, reblog",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/timelines",
+        features: &[],
+        reason: "core timelines: public, home, list and tag",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/instance",
+        features: &[],
+        reason: "the instance document and its public rules/languages, served to every client",
+    },
+    SurfaceGroup {
+        prefix: "/api/v2/instance",
+        features: &[],
+        reason: "the instance document, v2 shape; served to every client",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/blocks",
+        features: &[],
+        reason: "the actor's own block list; part of the account relationship core",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/mutes",
+        features: &[],
+        reason: "the actor's own mute list; part of the account relationship core",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/apps",
+        features: &[],
+        reason: "OAuth application registration: the step before any token can exist",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/meta",
+        features: &[],
+        reason: "the handshake itself; a capability cannot name the document that lists it",
+    },
+    SurfaceGroup {
+        prefix: "/api/v2/media",
+        features: &[],
+        reason: "deferred media upload; core composer route, not the drive hand-off",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/follow_requests",
+        features: &[],
+        reason: "the follow-request inbox of a locked account; core account route",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/featured_tags",
+        features: &[],
+        reason: "profile featured tags; drawn by the profile, always served",
+    },
+    SurfaceGroup {
+        prefix: "/api/v2/suggestions",
+        features: &[],
+        reason: "follow suggestions, v2 shape; part of the always-on discovery core",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/trends",
+        features: &[],
+        reason: "trending tags/statuses/links; part of the always-on discovery core",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/custom_emojis",
+        features: &[],
+        reason: "the custom-emoji catalogue; core composer data, always served",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/reports",
+        features: &["moderation"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/appeals",
+        features: &["appeals"],
+        reason: "",
+    },
+    // Deployment plumbing and compatibility dialects: reachable, but not client panels.
+    SurfaceGroup {
+        prefix: "/healthz",
+        features: &[],
+        reason: "liveness probe for the process supervisor, not a client surface",
+    },
+    SurfaceGroup {
+        prefix: "/readyz",
+        features: &[],
+        reason: "readiness probe for the process supervisor, not a client surface",
+    },
+    SurfaceGroup {
+        prefix: "/icon.svg",
+        features: &[],
+        reason: "static icon asset served by the API process, not a capability",
+    },
+    SurfaceGroup {
+        prefix: "/icon.png",
+        features: &[],
+        reason: "static icon asset served by the API process, not a capability",
+    },
+    SurfaceGroup {
+        prefix: "/favicon.ico",
+        features: &[],
+        reason: "static icon asset served by the API process, not a capability",
+    },
+    SurfaceGroup {
+        prefix: "/media/thumbnail.png",
+        features: &[],
+        reason: "static placeholder image, not the drive's share route",
+    },
+    SurfaceGroup {
+        prefix: "/api/meta",
+        features: &[],
+        reason: "Misskey compatibility dialect; negotiated by its own meta, not a Nodus panel",
+    },
+    SurfaceGroup {
+        prefix: "/api/i",
+        features: &[],
+        reason: "Misskey compatibility dialect; not a Nodus console capability",
+    },
+    SurfaceGroup {
+        prefix: "/api/users",
+        features: &[],
+        reason: "Misskey compatibility dialect; not a Nodus console capability",
+    },
+    SurfaceGroup {
+        prefix: "/api/following",
+        features: &[],
+        reason: "Misskey compatibility dialect; not a Nodus console capability",
+    },
+    SurfaceGroup {
+        prefix: "/api/notes",
+        features: &[],
+        reason: "Misskey compatibility dialect; not a Nodus console capability",
+    },
+    SurfaceGroup {
+        prefix: "/streaming",
+        features: &[],
+        reason: "the Misskey streaming dialect's socket, beside /api/v1/streaming",
+    },
+    SurfaceGroup {
+        prefix: "/miauth",
+        features: &[],
+        reason: "MiAuth compatibility dialect; a token exchange, not a capability",
+    },
+    SurfaceGroup {
+        prefix: "/api/miauth",
+        features: &[],
+        reason: "MiAuth compatibility dialect; a token exchange, not a capability",
+    },
+];
+
+/// Whether `route` is the prefix itself or sits under it at a path boundary.
+fn covers(prefix: &str, route: &str) -> bool {
+    route == prefix
+        || route
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The most specific group covering a route, so `/media/share` wins over `/media`.
+fn covering_group(route: &str) -> Option<usize> {
+    SURFACE_GROUPS
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| covers(group.prefix, route))
+        .max_by_key(|(_, group)| group.prefix.len())
+        .map(|(index, _)| index)
+}
+
+/// Walks every route the router mounts and holds it to the capability list in both
+/// directions.
+///
+/// This is the test the capability table was missing: `every_advertised_feature_answers_for_itself`
+/// proves a name reaches a door, but nothing proved the converse for the client API — which
+/// is how favourites, notifications and eleven more surfaces stayed served and unannounced.
+/// A route whose group is not in `SURFACE_GROUPS` fails, and a named group with no route
+/// fails too, so neither list can drift alone.
+#[tokio::test]
+async fn every_routed_surface_group_is_named_in_both_directions() {
+    let mut counts = vec![0usize; SURFACE_GROUPS.len()];
+    let mut unclaimed = Vec::new();
+    let mut total = 0usize;
+    for (file, source) in ROUTE_SOURCES {
+        for route in registered_routes(source) {
+            total += 1;
+            match covering_group(&route) {
+                Some(index) => counts[index] += 1,
+                None => unclaimed.push(format!("{file} registers {route}")),
+            }
+        }
+    }
+    assert!(
+        total > 50,
+        "the route sources were not parsed: {total} routes"
+    );
+
+    assert!(
+        unclaimed.is_empty(),
+        "route(s) no capability group names — a console that gates on /api/v1/meta \
+         cannot draw them:\n  {}",
+        unclaimed.join("\n  ")
+    );
+
+    let empty: Vec<&str> = SURFACE_GROUPS
+        .iter()
+        .zip(&counts)
+        .filter(|(group, count)| **count == 0 && !group.features.is_empty())
+        .map(|(group, _)| group.prefix)
+        .collect();
+    assert!(
+        empty.is_empty(),
+        "capability name(s) published for a prefix the router does not serve:\n  {empty:#?}"
+    );
+
+    let stale: Vec<&str> = SURFACE_GROUPS
+        .iter()
+        .zip(&counts)
+        .filter(|(group, count)| **count == 0 && group.features.is_empty())
+        .map(|(group, _)| group.prefix)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "allowlist entry for a prefix the router does not serve; remove it:\n  {stale:#?}"
+    );
+
+    let published: BTreeSet<&str> = nodus_server_api::meta::FEATURES.iter().copied().collect();
+    let tabled: BTreeSet<&str> = CAPABILITIES
+        .iter()
+        .map(|capability| capability.name)
+        .collect();
+    let grouped: BTreeSet<&str> = SURFACE_GROUPS
+        .iter()
+        .flat_map(|group| group.features.iter().copied())
+        .collect();
+
+    for group in SURFACE_GROUPS {
+        if group.features.is_empty() {
+            assert!(
+                group.reason.len() > 20,
+                "{} is allowlisted without a reason",
+                group.prefix
+            );
+        } else {
+            assert!(
+                group.reason.is_empty(),
+                "{} is named; a reason belongs only on an unnamed group",
+                group.prefix
+            );
+        }
+        for feature in group.features {
+            assert!(
+                published.contains(feature),
+                "group {} claims `{feature}`, which FEATURES does not publish",
+                group.prefix
+            );
+            assert!(
+                tabled.contains(feature),
+                "group {} claims `{feature}`, which the capability table does not carry",
+                group.prefix
+            );
+        }
+    }
+
+    let unnamed: Vec<&str> = CAPABILITIES
+        .iter()
+        .filter(|capability| capability.owner == Owner::Api)
+        .map(|capability| capability.name)
+        .filter(|name| !grouped.contains(name))
+        .collect();
+    assert!(
+        unnamed.is_empty(),
+        "advertised capability name(s) with no routed group in SURFACE_GROUPS:\n  {unnamed:#?}"
+    );
+
+    for capability in CAPABILITIES
+        .iter()
+        .filter(|capability| capability.owner == Owner::Feeds)
+    {
+        assert!(
+            !grouped.contains(capability.name),
+            "`{}` belongs to nodus-feed; this router must not claim its prefix",
+            capability.name
+        );
+    }
 }
