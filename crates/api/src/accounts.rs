@@ -103,7 +103,8 @@ pub async fn update_credentials(
     // the account's key when the worker sends it.
     let row = crate::activitypub::ensure_identity(&state, row).await?;
     crate::outbox::deliver_actor_update(&state, &row.id).await;
-    Ok(Json(AccountDto::from_row(&row, state.instance())))
+    // The caller's own document, so it carries the same `staff_role` verify_credentials does.
+    Ok(Json(AccountDto::from_own_row(&row, state.instance())))
 }
 
 /// Turns an uploaded picture into the reference a profile stores.
@@ -270,7 +271,7 @@ pub async fn undelete(
     let row = nodus_server_store::accounts::undelete(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("There is no deletion to undo"))?;
-    Ok(Json(AccountDto::from_row(&row, state.instance())))
+    Ok(Json(AccountDto::from_own_row(&row, state.instance())))
 }
 
 pub async fn lookup(

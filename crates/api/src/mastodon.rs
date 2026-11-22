@@ -234,7 +234,7 @@ pub async fn verify_credentials(
     auth: Auth,
 ) -> ApiResult<Json<AccountDto>> {
     auth.require_scope("read")?;
-    Ok(Json(AccountDto::from_row(
+    Ok(Json(AccountDto::from_own_row(
         &auth.0.account,
         state.instance(),
     )))

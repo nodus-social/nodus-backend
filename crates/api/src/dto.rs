@@ -84,6 +84,30 @@ fn moved_account(uri: &str) -> serde_json::Value {
     })
 }
 
+/// The staff role Mastodon publishes on an account document.
+///
+/// Mastodon's `role` is public: every account document carries at least its name, so a
+/// profile page can say "Moderator" without a token. The other half is nodus's own
+/// spelling (`staff_role`), kept so a nodus client reads one string instead of a nested
+/// object; the two are mapped from the stored role in one place below.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountRoleDto {
+    /// `Admin` or `Moderator`, the names Mastodon's role entity renders.
+    pub name: &'static str,
+}
+
+/// The two spellings of a stored staff role: Mastodon's display name and nodus's value.
+///
+/// `None` for `none`, which is how both a regular account and a read-only public document
+/// say "holds no role". One match keeps `role` and `staff_role` from ever disagreeing.
+fn staff_role_spellings(role: &str) -> Option<(&'static str, &'static str)> {
+    match role {
+        "admin" => Some(("Admin", "admin")),
+        "moderator" => Some(("Moderator", "moderator")),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountDto {
     pub id: String,
@@ -111,6 +135,18 @@ pub struct AccountDto {
     pub moved: Option<serde_json::Value>,
     pub suspended: bool,
     pub limited: bool,
+    /// The account's staff role in Mastodon's shape, `null` for a regular account.
+    ///
+    /// Mastodon makes this public, so it rides on every read of the account, not only the
+    /// account's own document; a client showing "Moderator" needs no privileged call.
+    pub role: Option<AccountRoleDto>,
+    /// The nodus spelling of the same role, `null` unless this is the account's own
+    /// document.
+    ///
+    /// Published only to the subject because it is nodus vocabulary rather than a
+    /// Mastodon field: a public read has no reason to teach other clients a second name
+    /// for a fact `role` already carries. The export keeps the same spelling.
+    pub staff_role: Option<&'static str>,
 }
 
 impl AccountDto {
@@ -163,7 +199,22 @@ impl AccountDto {
             moved: row.moved_to.as_deref().map(moved_account),
             suspended: row.suspended_at.is_some(),
             limited: false,
+            role: staff_role_spellings(&row.staff_role).map(|(name, _)| AccountRoleDto { name }),
+            staff_role: None,
         }
+    }
+
+    /// The account's own document: the public shape plus its nodus `staff_role`.
+    ///
+    /// `verify_credentials` and the self-service writes answer with this. The role is a
+    /// fact about the token's own subject, so learning it needs no admin scope — which is
+    /// what lets the web client draw the Administration door without probing
+    /// `/api/v2/admin/accounts`.
+    #[must_use]
+    pub fn from_own_row(row: &AccountRow, instance: &InstanceConfig) -> Self {
+        let mut dto = Self::from_row(row, instance);
+        dto.staff_role = staff_role_spellings(&row.staff_role).map(|(_, nodus)| nodus);
+        dto
     }
 }
 
