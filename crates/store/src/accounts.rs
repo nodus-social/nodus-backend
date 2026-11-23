@@ -58,6 +58,8 @@ pub struct AccountRow {
     pub last_status_at: Option<DateTime<Utc>>,
     pub suspended_at: Option<DateTime<Utc>>,
     pub silenced_at: Option<DateTime<Utc>>,
+    /// The account's media is marked sensitive without restricting the account itself.
+    pub sensitized_at: Option<DateTime<Utc>>,
     pub moved_to: Option<String>,
     pub also_known_as: Vec<String>,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -69,14 +71,14 @@ pub(crate) const ACCOUNT_COLUMNS_ALIASED: &str = "a.id, a.username::text AS user
      a.display_name, a.note, a.avatar_ref, a.header_ref, a.avatar_url, a.header_url, a.fields, a.client_metadata, a.locked, a.bot, a.local, a.uri, \
      a.inbox_url, a.shared_inbox_url, a.public_key_pem, a.private_key_pem, a.discoverable, a.indexable, a.admin, a.staff_role, a.approved, \
      a.lossless_images_default, a.lossless_videos_default, a.lossless_images_allowed, \
-     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.moved_to, a.also_known_as, \
+     a.lossless_videos_allowed, a.followers_count, a.following_count, a.statuses_count, a.last_status_at, a.suspended_at, a.silenced_at, a.sensitized_at, a.moved_to, a.also_known_as, \
      a.deleted_at, a.purge_at, a.created_at";
 
 pub(crate) const ACCOUNT_COLUMNS: &str = "id, username::text AS username, domain::text AS domain, \
      display_name, note, avatar_ref, header_ref, avatar_url, header_url, fields, client_metadata, locked, bot, local, uri, \
      inbox_url, shared_inbox_url, public_key_pem, private_key_pem, discoverable, indexable, admin, staff_role, approved, \
      lossless_images_default, lossless_videos_default, lossless_images_allowed, \
-     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, moved_to, also_known_as, deleted_at, purge_at, created_at";
+     lossless_videos_allowed, followers_count, following_count, statuses_count, last_status_at, suspended_at, silenced_at, sensitized_at, moved_to, also_known_as, deleted_at, purge_at, created_at";
 
 impl crate::Store {
     /// One account by id, local or remote.

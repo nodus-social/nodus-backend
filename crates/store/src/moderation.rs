@@ -729,6 +729,9 @@ pub enum Action {
     Enable,
     Unsilence,
     Unsuspend,
+    /// Mark this account's media sensitive. Not a restriction: the account keeps posting.
+    Sensitive,
+    Unsensitive,
 }
 
 impl Action {
@@ -741,6 +744,8 @@ impl Action {
             Self::Enable => "enable",
             Self::Unsilence => "unsilence",
             Self::Unsuspend => "unsuspend",
+            Self::Sensitive => "sensitive",
+            Self::Unsensitive => "unsensitive",
         }
     }
 
@@ -753,6 +758,8 @@ impl Action {
             "enable" => Self::Enable,
             "unsilence" => Self::Unsilence,
             "unsuspend" => Self::Unsuspend,
+            "sensitive" => Self::Sensitive,
+            "unsensitive" => Self::Unsensitive,
             _ => return None,
         })
     }
@@ -862,7 +869,7 @@ pub(crate) async fn apply_core_in(
     notice: &Notice<'_>,
 ) -> Result<Option<AccountRow>, sqlx::Error> {
     let before = sqlx::query_as::<_, PreviousState>(
-        "SELECT approved, silenced_at, suspended_at FROM account WHERE id = $1",
+        "SELECT approved, silenced_at, suspended_at, sensitized_at FROM account WHERE id = $1",
     )
     .bind(account_id)
     .fetch_optional(&mut *conn)
@@ -876,6 +883,8 @@ pub(crate) async fn apply_core_in(
         Action::Suspend => "suspended_at = now()",
         Action::Unsilence => "silenced_at = NULL",
         Action::Unsuspend => "suspended_at = NULL",
+        Action::Sensitive => "sensitized_at = now()",
+        Action::Unsensitive => "sensitized_at = NULL",
     };
     let sql = format!("UPDATE account SET {set_clause} WHERE id = $1 RETURNING {ACCOUNT_COLUMNS}");
     let row = sqlx::query_as::<_, AccountRow>(&sql)
@@ -885,8 +894,14 @@ pub(crate) async fn apply_core_in(
     // A decision that changes nothing is not news. The audit row still records that the
     // button was pressed; the person does not need a second copy of an event they were
     // already told about.
+    //
+    // Marking media sensitive is not a decision about what the person may do, so it sends
+    // no moderation notification: the notification table's action vocabulary is the set of
+    // restrictions and their reversals. The audit row is where that decision lives.
     if let Some(row) = &row {
-        if before.is_some_and(|before| before.changes(action)) {
+        if !matches!(action, Action::Sensitive | Action::Unsensitive)
+            && before.is_some_and(|before| before.changes(action))
+        {
             notice_for(conn, account_id, action.as_str(), notice).await?;
         }
         let _ = row;
@@ -901,6 +916,7 @@ struct PreviousState {
     approved: bool,
     silenced_at: Option<DateTime<Utc>>,
     suspended_at: Option<DateTime<Utc>>,
+    sensitized_at: Option<DateTime<Utc>>,
 }
 
 impl PreviousState {
@@ -914,6 +930,8 @@ impl PreviousState {
             Action::Suspend => self.suspended_at.is_none(),
             Action::Unsilence => self.silenced_at.is_some(),
             Action::Unsuspend => self.suspended_at.is_some(),
+            Action::Sensitive => self.sensitized_at.is_none(),
+            Action::Unsensitive => self.sensitized_at.is_some(),
         }
     }
 }
@@ -1042,6 +1060,8 @@ fn sentence(action: Action, notice: &Notice<'_>) -> String {
         Action::Unsilence => "Your silence was lifted.",
         Action::Unsuspend => "Your suspension was lifted.",
         Action::Enable => "Your account was re-enabled.",
+        Action::Sensitive => "Your account's media was marked sensitive.",
+        Action::Unsensitive => "Your account's media is no longer marked sensitive.",
     };
     let reason = notice.reason.trim();
     if reason.is_empty() {

@@ -97,9 +97,11 @@ where
 
 /// The largest batch one moderation request may carry.
 ///
-/// A moderator selects a page of names; a request that looks like a table dump is refused
-/// rather than held open for minutes, because a transaction that long blocks everyone.
-pub(super) const BULK_LIMIT: usize = 500;
+/// A moderator selects a page of names, and a console page is a hundred rows at most. A
+/// request that looks like a table dump is refused rather than held open for minutes: the
+/// whole batch is one transaction, and a transaction that long blocks everyone else writing
+/// to `account`. The number is also what makes "one transaction" affordable.
+pub(super) const BULK_LIMIT: usize = 100;
 
 /// Why one id in a batch did not go through.
 ///
@@ -125,6 +127,25 @@ pub(super) struct BulkItemDto {
     pub error: Option<String>,
 }
 
+/// One account's outcome, keyed the way the account endpoints name an account.
+///
+/// Reports keep `id` above because a report is not an account; an account batch answers
+/// `account_id`, so a console can join a result row to the row the moderator selected
+/// without guessing which kind of id it is looking at.
+#[derive(Debug, Serialize)]
+pub(super) struct AccountBulkItemDto {
+    pub account_id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct AccountBulkResponseDto {
+    pub results: Vec<AccountBulkItemDto>,
+    pub applied: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct BulkResponseDto {
     pub results: Vec<BulkItemDto>,
@@ -140,10 +161,9 @@ pub(super) fn check_batch(ids: &[String], what: &str) -> ApiResult<()> {
         ));
     }
     if ids.len() > BULK_LIMIT {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("a batch may name at most {BULK_LIMIT} {what} ids"),
-        ));
+        return Err(ApiError::unprocessable(format!(
+            "a batch may name at most {BULK_LIMIT} {what} ids"
+        )));
     }
     Ok(())
 }

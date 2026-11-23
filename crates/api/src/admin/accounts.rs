@@ -24,7 +24,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 use super::{audit_write_detail, offset, page};
-use super::{check_batch, BulkFailure, BulkItemDto, BulkResponseDto};
+use super::{check_batch, AccountBulkItemDto, AccountBulkResponseDto, BulkFailure};
 
 #[derive(Debug, Serialize)]
 pub struct AdminAccountDto {
@@ -39,6 +39,8 @@ pub struct AdminAccountDto {
     pub approved: bool,
     pub silenced: bool,
     pub suspended: bool,
+    /// This account's media is shown behind a warning without the account being silenced.
+    pub sensitive: bool,
     pub disabled: bool,
     pub admin: bool,
     /// `none`, `moderator` or `admin` — which door this account walks through. `admin`
@@ -73,6 +75,7 @@ impl AdminAccountDto {
             approved: row.account.approved,
             silenced: row.account.silenced_at.is_some(),
             suspended: row.account.suspended_at.is_some(),
+            sensitive: row.account.sensitized_at.is_some(),
             disabled: !row.account.approved,
             admin: row.account.admin,
             role: row.account.staff_role,
@@ -780,14 +783,25 @@ async fn apply_bulk_one(
 
 /// `POST /api/v1/admin/accounts/bulk` — one action against many accounts.
 ///
-/// One transaction, one audit row per applied account, and a result per id: a moderator
-/// who selected 200 accounts needs to know which three did not go through, not just that
-/// the request was rejected.
+/// The actions are the single-account ones plus the media flag: `silence`, `unsilence`,
+/// `suspend`, `unsuspend`, `sensitive`, `unsensitive`, `approve`, `reject` and `enable`.
+/// Every applied id goes through [`moderation::apply_action_noted_in`] and gets the same
+/// audit row the single-account endpoint writes, so a later `unsuspend` leaves the earlier
+/// `suspend` on the record instead of overwriting it.
+///
+/// # Partial failure
+///
+/// One transaction, and a result per id. A rejected id (unknown account, an administrator
+/// who must be demoted first, the caller's own account) is a fact about that id: it is
+/// reported in that id's result and the other decisions still commit. A *database* error
+/// is a fact about the request — it aborts and rolls the whole batch back, because at that
+/// point nobody knows which ids were written. The two are deliberately different: a
+/// moderator mistyping one id must not lose the other ninety-nine decisions.
 async fn bulk_action(
     State(state): State<AppState>,
     auth: Auth,
     Body(form): Body<BulkActionForm>,
-) -> ApiResult<Json<BulkResponseDto>> {
+) -> ApiResult<Json<AccountBulkResponseDto>> {
     auth.require_admin("admin:write")?;
     check_batch(&form.ids, "account")?;
     let action = Action::parse(form.kind.trim())
@@ -810,14 +824,14 @@ async fn bulk_action(
         {
             Ok(()) => {
                 applied += 1;
-                results.push(BulkItemDto {
-                    id: id.clone(),
+                results.push(AccountBulkItemDto {
+                    account_id: id.clone(),
                     ok: true,
                     error: None,
                 });
             }
-            Err(BulkFailure::Rejected(message)) => results.push(BulkItemDto {
-                id: id.clone(),
+            Err(BulkFailure::Rejected(message)) => results.push(AccountBulkItemDto {
+                account_id: id.clone(),
                 ok: false,
                 error: Some(message),
             }),
@@ -858,7 +872,7 @@ async fn bulk_action(
             .await?;
         }
     }
-    Ok(Json(BulkResponseDto { results, applied }))
+    Ok(Json(AccountBulkResponseDto { results, applied }))
 }
 
 pub fn router() -> Router<AppState> {

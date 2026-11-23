@@ -156,7 +156,7 @@ async fn a_batch_with_one_missing_id_applies_the_rest_and_names_the_failure() {
         let results = value["results"].as_array().expect("results array");
         assert_eq!(results.len(), 3);
         assert_eq!(results[0]["ok"], json!(true));
-        assert_eq!(results[1]["id"], json!("no-such-account-id"));
+        assert_eq!(results[1]["account_id"], json!("no-such-account-id"));
         assert_eq!(results[1]["ok"], json!(false));
         let error = results[1]["error"].as_str().expect("error message");
         assert!(error.contains("does not exist"), "error was: {error}");
@@ -191,8 +191,8 @@ async fn a_batch_over_the_cap_is_refused_before_anything_is_touched() {
         let real = create_account(pool, "bulk-capped").await;
 
         let mut ids = vec![real.clone()];
-        ids.extend((0..500).map(|n| format!("imaginary-{n}")));
-        assert_eq!(ids.len(), 501);
+        ids.extend((0..100).map(|n| format!("imaginary-{n}")));
+        assert_eq!(ids.len(), 101);
 
         let (status, body) = send(
             &app,
@@ -204,8 +204,12 @@ async fn a_batch_over_the_cap_is_refused_before_anything_is_touched() {
         .await;
         assert_eq!(
             status,
-            StatusCode::BAD_REQUEST,
-            "501 ids must be a 400: {body}"
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "101 ids must be a 422: {body}"
+        );
+        assert!(
+            body.contains("at most 100"),
+            "the refusal must name the limit: {body}"
         );
 
         let suspended: i64 = sqlx::query_scalar(
@@ -259,6 +263,97 @@ async fn a_read_only_grant_is_refused_both_batches() {
             get_with_headers(&app, &token, "/api/v1/admin/audit.csv").await;
         assert_eq!(status, StatusCode::OK);
         assert!(content_type.starts_with("text/csv"), "was: {content_type}");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sensitive_marks_media_and_an_unsuspend_keeps_the_earlier_decision_on_record() {
+    run_db_test(|store, app| async move {
+        let pool = store.pool();
+        let (_, token) = staff(pool, "bulk-admin", "admin", &["admin:read", "admin:write"]).await;
+        let target = create_account(pool, "bulk-media").await;
+
+        // Suspend, then lift it. The audit trail must keep both sentences rather than
+        // rewriting the first one: that is what `apply_action_noted` writes per id.
+        for (action, reason) in [("suspend", "spam wave"), ("unsuspend", "appeal upheld")] {
+            let (status, body) = send(
+                &app,
+                &token,
+                "POST",
+                "/api/v1/admin/accounts/bulk",
+                Some(json!({"ids": [target], "action": action, "text": reason})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{action}: {body}");
+            assert_eq!(json_of(&body)["applied"], json!(1), "{action}: {body}");
+        }
+        let still_suspended: bool = sqlx::query_scalar(
+            "SELECT suspended_at IS NOT NULL FROM account WHERE id = $1",
+        )
+        .bind(&target)
+        .fetch_one(pool)
+        .await
+        .expect("read suspension");
+        assert!(!still_suspended, "the unsuspend lifted the suspension");
+        let history: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT action, detail->>'text' FROM audit_log \
+             WHERE target_id = $1 AND action IN ('account_suspend', 'account_unsuspend') \
+             ORDER BY created_at",
+        )
+        .bind(&target)
+        .fetch_all(pool)
+        .await
+        .expect("audit history");
+        assert_eq!(history.len(), 2, "both decisions stay on the record");
+        assert_eq!(history[0].0, "account_suspend");
+        assert_eq!(history[0].1.as_deref(), Some("spam wave"));
+        assert_eq!(history[1].0, "account_unsuspend");
+        assert_eq!(history[1].1.as_deref(), Some("appeal upheld"));
+
+        // Marking media sensitive is the third action shape: it changes no restriction.
+        let (status, body) = send(
+            &app,
+            &token,
+            "POST",
+            "/api/v1/admin/accounts/bulk",
+            Some(json!({"ids": [target], "action": "sensitive", "text": "nsfw under a joke"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "sensitive: {body}");
+        let marked: bool =
+            sqlx::query_scalar("SELECT sensitized_at IS NOT NULL FROM account WHERE id = $1")
+                .bind(&target)
+                .fetch_one(pool)
+                .await
+                .expect("read sensitive flag");
+        assert!(marked, "the sensitive action sets the flag");
+        let audit: Option<String> = sqlx::query_scalar(
+            "SELECT detail->>'text' FROM audit_log \
+             WHERE target_id = $1 AND action = 'account_sensitive'",
+        )
+        .bind(&target)
+        .fetch_one(pool)
+        .await
+        .expect("sensitive audit row");
+        assert_eq!(audit.as_deref(), Some("nsfw under a joke"));
+
+        let (status, body) = send(
+            &app,
+            &token,
+            "POST",
+            "/api/v1/admin/accounts/bulk",
+            Some(json!({"ids": [target], "action": "unsensitive"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unsensitive: {body}");
+        let still_marked: bool =
+            sqlx::query_scalar("SELECT sensitized_at IS NOT NULL FROM account WHERE id = $1")
+                .bind(&target)
+                .fetch_one(pool)
+                .await
+                .expect("read sensitive flag");
+        assert!(!still_marked, "unsensitive clears it");
     })
     .await;
 }
