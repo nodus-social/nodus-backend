@@ -52,11 +52,17 @@ where
         return Ok(());
     }
 
+    let sealer = token_enc_key(&config)?;
+    if sealer.is_some() {
+        // The positive half of the warning below: an operator reading the journal can
+        // tell the sync surface is armed without calling it.
+        tracing::info!("TOKEN_ENC_KEY loaded; background sync can seal stored tokens");
+    }
     let router = nodus_feeds::mount(
         &config.database_url,
         &config.instance.base_url,
         config.database_connections,
-        token_enc_key(&config)?,
+        sealer,
     )
     .await?;
     tracing::info!(address = %config.bind, "feed listening");
