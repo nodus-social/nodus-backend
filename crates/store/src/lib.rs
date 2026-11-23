@@ -43,6 +43,7 @@ pub mod nodeinfo;
 pub mod notification_policy;
 pub mod pauses;
 pub mod polls;
+pub mod preferences;
 pub mod remote_moderation;
 pub mod rules;
 pub mod scanners;
