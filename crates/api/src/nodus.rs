@@ -173,7 +173,7 @@ async fn batch(
                     );
                 }
                 let local = !name.contains("global") && !name.contains("federated");
-                let page = statuses::public_page(state.store().pool(), params, local).await?;
+                let page = statuses::public_page(state.store().pool(), params, local, None).await?;
                 let author_ids: Vec<String> = page
                     .items
                     .iter()

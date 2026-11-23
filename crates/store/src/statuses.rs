@@ -480,10 +480,17 @@ fn page_bounds(params: PageParams) -> (Option<String>, Option<String>, &'static 
 /// A paused domain is hidden here, not in `by_id`: a moderator opening a report must still
 /// see the post. Unlike `instance_block` (permanent, severity-bearing), a pause expires on
 /// its own and is not announced to the peer, so the predicate reads `expires_at` directly.
+///
+/// `viewer` is the account reading the page, if any. A personal domain block is the
+/// reader's own policy, so the handler supplies the authenticated id and an anonymous
+/// caller passes `None` — the public read is unchanged for them. The predicate lives here
+/// rather than in the handler so every public reader gets it, and so a handler that
+/// forgets to pass a viewer is a compile error instead of a leak.
 pub async fn public_page(
     pool: &PgPool,
     params: PageParams,
     local_only: bool,
+    viewer: Option<&str>,
 ) -> Result<StatusPage, sqlx::Error> {
     let size = PageSize::default_max(params.limit);
     let (max_id, lower_id, order) = page_bounds(params);
@@ -501,6 +508,8 @@ pub async fn public_page(
            AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
                            AND m.action IN ('silence', 'suspend') \
                            AND (m.expires_at IS NULL OR m.expires_at > now())) \
+           AND ($5::text IS NULL OR NOT EXISTS (SELECT 1 FROM account_domain_block d \
+                           WHERE d.account_id = $5 AND d.host = a.domain)) \
            AND ($1::text IS NULL OR s.id < $1) \
            AND ($2::text IS NULL OR s.id > $2) \
            AND (NOT $3 OR s.local) \
@@ -511,6 +520,7 @@ pub async fn public_page(
         .bind(lower_id)
         .bind(local_only)
         .bind(size.as_i64() + 1)
+        .bind(viewer)
         .fetch_all(pool)
         .await?;
     Ok(finish(rows, size))
@@ -614,6 +624,8 @@ pub async fn home_page(
             AND s.visibility <> 'direct' \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND a.deleted_at IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM account_domain_block d \
+                            WHERE d.account_id = $1 AND d.host = a.domain) \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id \
                             AND r.kind IN ('block', 'mute')) \
@@ -636,6 +648,8 @@ pub async fn home_page(
             AND s.visibility <> 'direct' \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND a.deleted_at IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM account_domain_block d \
+                            WHERE d.account_id = $1 AND d.host = a.domain) \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id \
                             AND r.kind IN ('block', 'mute')) \
@@ -832,6 +846,8 @@ pub async fn home_rows(
             AND s.visibility <> 'direct' \
             AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND a.deleted_at IS NULL \
+            AND NOT EXISTS (SELECT 1 FROM account_domain_block d \
+                            WHERE d.account_id = $1 AND d.host = a.domain) \
             AND NOT EXISTS (SELECT 1 FROM account_relation r WHERE r.account_id = $1 \
                             AND r.target_account_id = s.account_id \
                             AND r.kind IN ('block', 'mute')) \

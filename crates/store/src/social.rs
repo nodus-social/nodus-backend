@@ -469,6 +469,9 @@ pub async fn notifications(
             AND NOT EXISTS (SELECT 1 FROM account_relation r \
                             WHERE r.account_id = $1 AND r.target_account_id = from_account_id \
                               AND (r.kind = 'block' OR (r.kind = 'mute' AND r.notifications))) \
+            AND NOT EXISTS (SELECT 1 FROM account a \
+                              JOIN account_domain_block d ON d.host = a.domain \
+                            WHERE a.id = from_account_id AND d.account_id = $1) \
           ORDER BY id DESC LIMIT $4",
     )
     .bind(account_id)

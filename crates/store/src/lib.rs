@@ -9,6 +9,7 @@
 //! lives in [`delivery`]: an operator asking why a post never reached a peer reads a row,
 //! not a log line that may have rotated away.
 
+pub mod account_blocks;
 pub mod accounts;
 pub mod alerts;
 pub mod announcements;

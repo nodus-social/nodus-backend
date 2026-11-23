@@ -395,6 +395,11 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/admin/reports",
         owner: Owner::Api,
     },
+    Capability {
+        name: "domain_blocks",
+        path: "/api/v1/domain_blocks",
+        owner: Owner::Api,
+    },
 ];
 
 /// Which features each administration module stands behind.
@@ -787,8 +792,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        62,
-        "/api/v1/meta must answer 62 unique names: {advertised_names:?}"
+        63,
+        "/api/v1/meta must answer 63 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -798,9 +803,10 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        62,
-        "the published vocabulary is 62 unique names: 42 before the page split plus the 20 \
-         page names (21 pages, `moderation_rules` already present, so no duplicate)"
+        63,
+        "the published vocabulary is 63 unique names: 42 before the page split, the 20 page \
+         names (21 pages, `moderation_rules` already present, so no duplicate), and the \
+         personal domain list (`domain_blocks`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1113,6 +1119,7 @@ const ROUTE_SOURCES: &[(&str, &str)] = route_sources![
     "streaming.rs",
     "suggestions.rs",
     "tags.rs",
+    "user_blocks.rs",
     "admin/accounts.rs",
     "admin/appeals.rs",
     "admin/blocklist.rs",
@@ -1440,6 +1447,16 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
         prefix: "/api/v1/mutes",
         features: &[],
         reason: "the actor's own mute list; part of the account relationship core",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/domain_blocks",
+        features: &["domain_blocks"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v2/domain_blocks",
+        features: &["domain_blocks"],
+        reason: "",
     },
     SurfaceGroup {
         prefix: "/api/v1/apps",

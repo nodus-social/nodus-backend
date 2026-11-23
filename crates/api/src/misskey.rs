@@ -596,11 +596,11 @@ async fn timeline(
     }
     let (page, viewer_id) = match timeline {
         Timeline::Local => (
-            statuses::public_page(state.store().pool(), params, true).await?,
+            statuses::public_page(state.store().pool(), params, true, None).await?,
             None,
         ),
         Timeline::Global => (
-            statuses::public_page(state.store().pool(), params, false).await?,
+            statuses::public_page(state.store().pool(), params, false, None).await?,
             None,
         ),
         Timeline::Home => {

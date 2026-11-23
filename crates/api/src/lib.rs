@@ -55,6 +55,7 @@ pub mod statuses;
 pub mod streaming;
 pub mod suggestions;
 pub mod tags;
+pub mod user_blocks;
 
 pub use run::run;
 pub use state::{AppState, FederationKey, InstanceConfig};
@@ -181,6 +182,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(drive::router())
         .merge(polls::router())
         .merge(follow_requests::router())
+        .merge(user_blocks::router())
         .fallback(error::not_found_fallback)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -83,6 +83,20 @@ pub async fn clear_remote_blocks(pool: &PgPool, host: &str) -> Result<u64, sqlx:
     Ok(ids.len() as u64)
 }
 
+/// The host a client names as a bare domain, normalised.
+///
+/// Personal domain blocks arrive as a host rather than a URL, so anything that is not a
+/// bare host name — a scheme, a path, a port, userinfo — is refused rather than silently
+/// reduced to a different host. The normal form is still [`host_of`]'s: lowercased and
+/// without a trailing dot.
+pub fn bare_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains(['/', '?', '#', '@', ':']) {
+        return None;
+    }
+    host_of(&format!("https://{value}"))
+}
+
 /// The host an absolute URL names.
 ///
 /// Delivery compares only hosts, so userinfo and the port are dropped: an inbox on
@@ -117,5 +131,21 @@ mod tests {
         );
         assert_eq!(super::host_of("not a url"), None);
         assert_eq!(super::host_of("https:///inbox"), None);
+    }
+
+    #[test]
+    fn a_personal_block_takes_a_bare_host_only() {
+        assert_eq!(
+            super::bare_host("Remote.Test.").as_deref(),
+            Some("remote.test")
+        );
+        assert_eq!(
+            super::bare_host("remote.test").as_deref(),
+            Some("remote.test")
+        );
+        assert_eq!(super::bare_host("https://remote.test/x"), None);
+        assert_eq!(super::bare_host("remote.test:8080"), None);
+        assert_eq!(super::bare_host("user@remote.test"), None);
+        assert_eq!(super::bare_host(""), None);
     }
 }

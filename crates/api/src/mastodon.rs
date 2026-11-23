@@ -123,12 +123,14 @@ pub async fn public_timeline(
     // Mastodon's default here is the federated view: the client that wants this
     // instance's own posts sends `local=true`, and a caller that sends nothing is
     // asking for everything the instance stores. The visibility rules (pause,
-    // silence, block, quarantine) live in `public_page`, so "everything" still
-    // never includes a post this instance has decided not to show.
+    // silence, block, quarantine, the reader's own domain blocks) live in
+    // `public_page`, so "everything" still never includes a post this instance or
+    // this reader has decided not to show.
     let page = nodus_server_store::statuses::public_page(
         state.store().pool(),
         params,
         query.local.unwrap_or(false),
+        auth.as_ref().map(|auth| auth.0.account.id.as_str()),
     )
     .await?;
     timeline_response(
