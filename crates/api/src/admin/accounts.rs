@@ -6,8 +6,10 @@
 //! moderator's note is part of the action rather than a second request: a decision without
 //! its reason is a decision nobody can review later.
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -24,7 +26,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 use super::{audit_write_detail, offset, page};
-use super::{check_batch, AccountBulkItemDto, AccountBulkResponseDto, BulkFailure};
+use super::{check_batch, csv_cell, csv_response, AccountBulkItemDto, AccountBulkResponseDto, BulkFailure};
 
 #[derive(Debug, Serialize)]
 pub struct AdminAccountDto {
@@ -875,9 +877,165 @@ async fn bulk_action(
     Ok(Json(AccountBulkResponseDto { results, applied }))
 }
 
+/// How many rows one export read asks for. A page is a few hundred kilobytes of text:
+/// big enough that a long file is not one round trip per row, small enough that no page
+/// ever holds more than one screenful of rows in memory.
+const ACCOUNTS_CSV_PAGE: i64 = 500;
+
+/// The state the account export stream carries between chunks.
+struct AccountsCsvCursor {
+    pool: sqlx::PgPool,
+    local: Option<bool>,
+    status: Option<String>,
+    username: Option<String>,
+    display_name: Option<String>,
+    email: Option<String>,
+    by_domain: Option<String>,
+    staff: bool,
+    offset: i64,
+    header_sent: bool,
+    done: bool,
+}
+
+fn account_csv_row(row: &AdminAccountRow) -> String {
+    let account = &row.account;
+    let cells = [
+        csv_cell(&account.id),
+        csv_cell(&account.username),
+        csv_cell(account.domain.as_deref().unwrap_or("")),
+        csv_cell(row.email.as_deref().unwrap_or("")),
+        csv_cell(&account.created_at.to_rfc3339()),
+        csv_cell(if account.approved { "true" } else { "false" }),
+        csv_cell(if account.silenced_at.is_some() { "true" } else { "false" }),
+        csv_cell(if account.suspended_at.is_some() { "true" } else { "false" }),
+        csv_cell(if account.sensitized_at.is_some() { "true" } else { "false" }),
+        csv_cell(&account.staff_role),
+        csv_cell(&row.open_reports.to_string()),
+        csv_cell(&row.strike_count.to_string()),
+    ];
+    let mut line = cells.join(",");
+    line.push_str("\r\n");
+    line
+}
+
+/// `GET /api/v1/admin/accounts/export.csv` — the account directory as a file.
+///
+/// The filters are [`AccountsQuery`]'s, minus `limit` and `offset`: the export pages
+/// itself, so a client cannot widen what it sees by asking the file for more than the
+/// list route would return at the same filters. Both routes also share the `admin:read`
+/// grant.
+///
+/// # What leaves the instance, and why
+///
+/// One row per account the list would show, so an operator can act on a row after
+/// closing the console:
+///
+/// - `id`, `username`, `domain` — the identity a bulk action has to name; `domain` is
+///   empty for local accounts.
+/// - `email` — local accounts only, empty when none is set. A decision has to be told to
+///   the person it is about, and this file is where that address lives once the console
+///   is closed. The list route already hands it to the same grant.
+/// - `created_at`, `approved`, `silenced`, `suspended`, `sensitive`, `role` — the state
+///   the list shows, so a row is readable without a second request.
+/// - `open_reports`, `strike_count` — why a moderator would look at this row at all.
+///
+/// The last IP is deliberately left out: the list returns it for one account a moderator
+/// is already examining, but a file of every address on the instance is a fingerprinting
+/// surface nobody asked to sort by. `disabled` is left out too because it is exactly
+/// `!approved`, and two columns that must agree are two columns that can disagree.
+///
+/// # Bounding
+///
+/// Rows are read one page at a time and each page is streamed and dropped, so a two
+/// hundred thousand row export costs one page of memory rather than the whole table. No
+/// row cap is applied, and therefore none needs announcing in the response: the file is
+/// complete or the transfer fails.
+async fn export_csv(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<AccountsQuery>,
+) -> ApiResult<Response> {
+    auth.require_admin("admin:read")?;
+    let local = match query.origin.as_deref() {
+        Some("local") => Some(true),
+        Some("remote") => Some(false),
+        _ => None,
+    };
+    let cursor = AccountsCsvCursor {
+        pool: state.store().pool().clone(),
+        local,
+        status: query.status,
+        username: query.username,
+        display_name: query.display_name,
+        email: query.email,
+        by_domain: query.by_domain,
+        staff: query.staff,
+        offset: 0,
+        header_sent: false,
+        done: false,
+    };
+    let stream = futures_util::stream::unfold(cursor, |mut cursor| async move {
+        if !cursor.header_sent {
+            cursor.header_sent = true;
+            let header = "id,username,domain,email,created_at,approved,silenced,suspended,\
+                          sensitive,role,open_reports,strike_count\r\n";
+            return Some((
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(header.as_bytes())),
+                cursor,
+            ));
+        }
+        if cursor.done {
+            return None;
+        }
+        let rows = moderation::admin_accounts(
+            &cursor.pool,
+            &AccountFilter {
+                local: cursor.local,
+                status: cursor.status.as_deref().filter(|value| *value != "all"),
+                username: cursor.username.as_deref(),
+                display_name: cursor.display_name.as_deref(),
+                email: cursor.email.as_deref(),
+                by_domain: cursor.by_domain.as_deref(),
+                staff: cursor.staff,
+                limit: ACCOUNTS_CSV_PAGE,
+                offset: cursor.offset,
+            },
+        )
+        .await;
+        match rows {
+            // A failed read has to break the transfer: a file that ends quietly would
+            // look complete to whoever opens it next month.
+            Err(error) => {
+                tracing::error!(error = %error, "account export read failed");
+                Some((
+                    Err::<Bytes, std::io::Error>(std::io::Error::other(
+                        "account export read failed",
+                    )),
+                    cursor,
+                ))
+            }
+            Ok(rows) if rows.is_empty() => None,
+            Ok(rows) => {
+                let read = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+                if read < ACCOUNTS_CSV_PAGE {
+                    cursor.done = true;
+                }
+                cursor.offset += read;
+                let mut chunk = String::new();
+                for row in &rows {
+                    chunk.push_str(&account_csv_row(row));
+                }
+                Some((Ok::<Bytes, std::io::Error>(Bytes::from(chunk)), cursor))
+            }
+        }
+    });
+    csv_response("accounts.csv", stream)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/admin/accounts", get(list))
+        .route("/api/v1/admin/accounts/export.csv", get(export_csv))
         .route("/api/v1/admin/accounts/bulk", post(bulk_action))
         .route("/api/v2/admin/accounts", get(pending))
         .route("/api/v1/admin/accounts/{id}", get(detail).delete(purge))

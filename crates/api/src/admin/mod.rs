@@ -608,22 +608,37 @@ async fn audit_csv(
             }
         }
     });
-    let response = Response::builder()
+    let response = csv_response("audit.csv", stream)?;
+    Ok(response)
+}
+
+/// A streamed CSV attachment.
+///
+/// The export never holds its result set: a handler renders one page to text, hands the
+/// chunk to the body, and drops it, so a file of two hundred thousand rows costs one page
+/// of memory. That is why none of the exports caps its row count — the response is linear
+/// in pages, and a cap would only make an operator repeat the export in slices, guessing
+/// where the last one stopped. The header travels as the first chunk, so even a transfer
+/// that breaks mid-file names its columns.
+fn csv_response(
+    filename: &str,
+    stream: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+) -> ApiResult<Response> {
+    Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
         .header(
             header::CONTENT_DISPOSITION,
-            "attachment; filename=\"audit.csv\"",
+            format!("attachment; filename=\"{filename}\""),
         )
         .body(axum::body::Body::from_stream(stream))
         .map_err(|error| {
-            tracing::error!(error = %error, "audit export response failed");
+            tracing::error!(error = %error, "csv export response failed");
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "could not build the export",
             )
-        })?;
-    Ok(response)
+        })
 }
 
 // ---------------------------------------------------------------------------------------

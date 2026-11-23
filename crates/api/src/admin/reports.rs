@@ -4,7 +4,9 @@
 //! moderator needs next: untouched reports first, then whatever they claimed, with the
 //! statuses and the account inline so triage does not need a second request per row.
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -24,7 +26,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 use super::{audit_write_detail, offset, page};
-use super::{check_batch, BulkFailure, BulkItemDto, BulkResponseDto};
+use super::{check_batch, csv_cell, csv_response, BulkFailure, BulkItemDto, BulkResponseDto};
 
 #[derive(Debug, Serialize)]
 pub struct ReportDto {
@@ -551,9 +553,160 @@ async fn bulk_reports(
     Ok(Json(BulkResponseDto { results, applied }))
 }
 
+/// How many reports one export read asks for; see the account export for why it is a page
+/// and not the whole result set.
+const REPORTS_CSV_PAGE: i64 = 500;
+
+/// The state the report export stream carries between chunks.
+struct ReportsCsvCursor {
+    pool: sqlx::PgPool,
+    state: Option<String>,
+    category: Option<String>,
+    target_account_id: Option<String>,
+    account_id: Option<String>,
+    assigned_account_id: Option<String>,
+    unassigned: bool,
+    offset: i64,
+    header_sent: bool,
+    done: bool,
+}
+
+fn report_csv_row(row: &ReportRow) -> String {
+    let cells = [
+        csv_cell(&row.id),
+        csv_cell(&row.created_at.to_rfc3339()),
+        csv_cell(&row.updated_at.to_rfc3339()),
+        csv_cell(&row.state),
+        csv_cell(&row.category),
+        csv_cell(&row.target_account_id),
+        csv_cell(row.account_id.as_deref().unwrap_or("")),
+        csv_cell(row.assigned_account_id.as_deref().unwrap_or("")),
+        csv_cell(if row.action_taken { "true" } else { "false" }),
+        csv_cell(&row.action_taken_note),
+        csv_cell(row.action_taken_by_account_id.as_deref().unwrap_or("")),
+        csv_cell(
+            &row.action_taken_at
+                .map(|at| at.to_rfc3339())
+                .unwrap_or_default(),
+        ),
+        csv_cell(&row.rule_ids.join(" ")),
+        csv_cell(&row.status_ids.join(" ")),
+        csv_cell(&row.comment),
+    ];
+    let mut line = cells.join(",");
+    line.push_str("\r\n");
+    line
+}
+
+/// `GET /api/v1/admin/reports/export.csv` — the report queue as a file.
+///
+/// The filters are [`ReportQuery`]'s, minus `limit` and `offset`: the export pages itself,
+/// so it cannot show more than the list route would at the same filters, and it asks for
+/// the same `admin:read` grant.
+///
+/// # What leaves the instance, and why
+///
+/// - `id`, `created_at`, `updated_at` — the row a follow-up action names, and when it was
+///   filed and last touched.
+/// - `state`, `category` — the queue's own axes, so the file can be filtered after the
+///   fact.
+/// - `target_account_id`, `reporter_account_id` (empty when the instance filed it) — who
+///   the report is about and who said it.
+/// - `assigned_account_id`, `action_taken`, `action_taken_note`,
+///   `action_taken_by_account_id`, `action_taken_at` — the decision, who made it and when;
+///   the note is the moderator's own sentence and is the only record of *why*.
+/// - `rule_ids` — the rules cited, space separated; two ids in one column beat a second,
+///   one-to-many file.
+/// - `status_ids` — the posts the report points at, so the evidence can be found again.
+/// - `comment` — the reporter's own words. It is free text and can contain anything they
+///   chose to type, including personal details; it is also the report's substance, and the
+///   list route already shows it to this grant.
+///
+/// # Bounding
+///
+/// Paged reads, one page per chunk via [`csv_response`]; no row cap, so no marker to
+/// explain truncation. Reports filed while the export runs can shift the offset window and
+/// repeat a row at a page boundary, which a complete file can absorb; the alternative,
+/// keyset paging, needs an index this table does not have yet.
+async fn export_csv(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<ReportQuery>,
+) -> ApiResult<Response> {
+    auth.require_admin("admin:read")?;
+    let cursor = ReportsCsvCursor {
+        pool: state.store().pool().clone(),
+        state: query.state,
+        category: query.category,
+        target_account_id: query.target_account_id,
+        account_id: query.account_id,
+        assigned_account_id: query.assigned_account_id,
+        unassigned: query.unassigned,
+        offset: 0,
+        header_sent: false,
+        done: false,
+    };
+    let stream = futures_util::stream::unfold(cursor, |mut cursor| async move {
+        if !cursor.header_sent {
+            cursor.header_sent = true;
+            let header = "id,created_at,updated_at,state,category,target_account_id,\
+                          reporter_account_id,assigned_account_id,action_taken,\
+                          action_taken_note,action_taken_by_account_id,action_taken_at,\
+                          rule_ids,status_ids,comment\r\n";
+            return Some((
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(header.as_bytes())),
+                cursor,
+            ));
+        }
+        if cursor.done {
+            return None;
+        }
+        let rows = moderation::reports(
+            &cursor.pool,
+            &moderation::ReportFilter {
+                state: cursor.state.as_deref().filter(|value| *value != "all"),
+                category: cursor.category.as_deref(),
+                target_account_id: cursor.target_account_id.as_deref(),
+                reporter_account_id: cursor.account_id.as_deref(),
+                assigned_account_id: cursor.assigned_account_id.as_deref(),
+                unassigned: cursor.unassigned,
+                limit: REPORTS_CSV_PAGE,
+                offset: cursor.offset,
+            },
+        )
+        .await;
+        match rows {
+            Err(error) => {
+                tracing::error!(error = %error, "report export read failed");
+                Some((
+                    Err::<Bytes, std::io::Error>(std::io::Error::other(
+                        "report export read failed",
+                    )),
+                    cursor,
+                ))
+            }
+            Ok(rows) if rows.is_empty() => None,
+            Ok(rows) => {
+                let read = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+                if read < REPORTS_CSV_PAGE {
+                    cursor.done = true;
+                }
+                cursor.offset += read;
+                let mut chunk = String::new();
+                for row in &rows {
+                    chunk.push_str(&report_csv_row(row));
+                }
+                Some((Ok::<Bytes, std::io::Error>(Bytes::from(chunk)), cursor))
+            }
+        }
+    });
+    csv_response("reports.csv", stream)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/admin/reports", get(list))
+        .route("/api/v1/admin/reports/export.csv", get(export_csv))
         .route("/api/v1/admin/reports/bulk", post(bulk_reports))
         .route("/api/v1/admin/reports/{id}", get(detail))
         .route("/api/v1/admin/reports/{id}/resolve", post(resolve))

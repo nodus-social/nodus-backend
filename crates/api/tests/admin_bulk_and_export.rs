@@ -359,6 +359,101 @@ async fn sensitive_marks_media_and_an_unsuspend_keeps_the_earlier_decision_on_re
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_account_and_report_exports_stream_a_header_and_keep_free_text_in_its_cell() {
+    run_db_test(|store, app| async move {
+        let pool = store.pool();
+        let (_, token) = staff(pool, "export-reader", "moderator", &["admin:read"]).await;
+        let local = create_account(pool, "export-local").await;
+        let reporter = create_account(pool, "export-reporter").await;
+        let report = moderation::create_report(
+            pool,
+            &NewReport {
+                account_id: Some(&reporter),
+                target_account_id: &local,
+                status_ids: &[],
+                category: "spam",
+                comment: "spam, blatant\nsecond line",
+                rule_ids: &[],
+                activity_uri: None,
+            },
+        )
+        .await
+        .expect("create report");
+
+        let (status, content_type, body) =
+            get_with_headers(&app, &token, "/api/v1/admin/accounts/export.csv").await;
+        assert_eq!(status, StatusCode::OK, "accounts csv: {body}");
+        assert!(content_type.starts_with("text/csv"), "was: {content_type}");
+        let header_row = body.split("\r\n").next().expect("header row");
+        assert_eq!(
+            header_row,
+            "id,username,domain,email,created_at,approved,silenced,suspended,sensitive,role,\
+             open_reports,strike_count"
+        );
+        assert!(body.contains(&local), "the local account is missing: {body}");
+        assert_eq!(body.matches(&local).count(), 1);
+
+        // The export sees what the list sees, no more: a filter the list honours has to
+        // filter the file as well.
+        let (status, _, remote_body) = get_with_headers(
+            &app,
+            &token,
+            "/api/v1/admin/accounts/export.csv?origin=remote",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "filtered csv: {remote_body}");
+        assert!(
+            !remote_body.contains(&local),
+            "origin=remote still exported a local account: {remote_body}"
+        );
+        assert_eq!(remote_body.split("\r\n").count(), 2, "header only");
+
+        let (status, content_type, body) =
+            get_with_headers(&app, &token, "/api/v1/admin/reports/export.csv").await;
+        assert_eq!(status, StatusCode::OK, "reports csv: {body}");
+        assert!(content_type.starts_with("text/csv"), "was: {content_type}");
+        let header_row = body.split("\r\n").next().expect("header row");
+        assert_eq!(
+            header_row,
+            "id,created_at,updated_at,state,category,target_account_id,\
+             reporter_account_id,assigned_account_id,action_taken,action_taken_note,\
+             action_taken_by_account_id,action_taken_at,rule_ids,status_ids,comment"
+        );
+        assert!(body.contains(&report.id), "the report is missing: {body}");
+        assert!(
+            body.contains("\"spam, blatant\nsecond line\""),
+            "the comment was not quoted into one cell: {body}"
+        );
+
+        let (_, _, resolved) = get_with_headers(
+            &app,
+            &token,
+            "/api/v1/admin/reports/export.csv?state=resolved",
+        )
+        .await;
+        assert!(
+            !resolved.contains(&report.id),
+            "the state filter was ignored: {resolved}"
+        );
+
+        let outsider = create_account(pool, "export-outsider").await;
+        let plain = create_token(pool, &outsider, &["read"]).await;
+        for uri in [
+            "/api/v1/admin/accounts/export.csv",
+            "/api/v1/admin/reports/export.csv",
+        ] {
+            let (status, _, _) = get_with_headers(&app, &plain, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{uri} without admin:read must be refused"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_audit_csv_quotes_free_text_and_honours_the_filter() {
     run_db_test(|store, app| async move {
         let pool = store.pool();
