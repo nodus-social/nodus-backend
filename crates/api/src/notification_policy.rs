@@ -5,8 +5,9 @@
 //! `accept`, `filter` or `drop`. A PUT names only the kinds it changes, so a client editing
 //! one switch does not have to send the rest back.
 //!
-//! The policy is stored and read here, but the inbox does not consult it yet: a notification
-//! of a `filter` or `drop` kind still arrives. Honouring the policy is the next step.
+//! The policy is enforced where the notification row is written, not where it is read: a
+//! `drop` writes nothing, a `filter` writes a row marked `filtered`, and the ordinary inbox
+//! excludes that flag (`?filtered=true` shows it).
 
 use std::collections::BTreeMap;
 

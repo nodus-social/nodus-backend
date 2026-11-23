@@ -5,9 +5,9 @@
 //! stored row is only an override: a missing row means [`DEFAULT`] for that kind, so an
 //! account that has never opened the tab reads as all-default and needs no backfill.
 //!
-//! The API answers `GET|PUT /api/v2/notifications/policy` from here. The inbox does **not**
-//! consult it yet — filtering by policy is the next step, and until it lands a stored
-//! `filter` or `drop` changes no notification the reader receives.
+//! The API answers `GET|PUT /api/v2/notifications/policy` from here, and [`policy_kind_for`]
+//! is the mapping the write path joins against: a `drop` means no row is written, a
+//! `filter` means the row is written with `filtered = true`.
 
 use std::collections::BTreeMap;
 
@@ -32,10 +32,29 @@ pub const VALUES: [&str; 3] = ["accept", "filter", "drop"];
 /// What a kind answers when the account has no row for it: every notification arrives.
 pub const DEFAULT: &str = "accept";
 
+/// The policy entry that governs a notification row kind, when there is one.
+///
+/// `poll` has no entry in Mastodon's policy map, and `appeal`/`moderation` are this
+/// instance's own safety notices, so those three are always delivered. `follow_request`,
+/// `report` and `pending_request` map here but no write path creates those rows yet.
+pub fn policy_kind_for(kind: &str) -> Option<&'static str> {
+    match kind {
+        "mention" => Some("mention"),
+        "favourite" => Some("favourite"),
+        "reblog" => Some("reblog"),
+        "follow" => Some("follow"),
+        "follow_request" => Some("follow_request"),
+        "report" => Some("report"),
+        "pending_request" => Some("pending_request"),
+        "status" => Some("status"),
+        _ => None,
+    }
+}
+
 /// Every kind's current answer for one account, defaults filled in.
 ///
 /// One statement, whatever the number of stored overrides: the request's kinds are unnested
-/// and left-joined to the rows, so the inbox pays one query for a page rather than one per
+/// and left-joined to the rows, so the settings page pays one query rather than one per
 /// notification kind.
 pub async fn load(
     pool: &PgPool,

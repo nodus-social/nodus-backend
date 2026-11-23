@@ -494,6 +494,7 @@ async fn notifications(
         body.until_id.as_deref(),
         i64::from(limit.get()),
         &[],
+        Some(false),
     )
     .await?;
     let mut items = Vec::with_capacity(rows.len());

@@ -739,6 +739,7 @@ pub async fn export(
         None,
         EXPORT_SECTION_MAX + 1,
         &[],
+        None,
     )
     .await?;
     let notifications_truncated = notifications.len() as i64 > EXPORT_SECTION_MAX;

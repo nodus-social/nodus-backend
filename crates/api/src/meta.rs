@@ -107,8 +107,7 @@ pub const FEATURES: [&str; 68] = [
     "markers",            // GET|POST /api/v1/markers
     "preferences",        // GET /api/v1/preferences
     // The settings tab the inbox never had: what to do with each notification kind, stored
-    // per account. Filtering by it is not implemented yet, so the name means "this policy
-    // can be read and written", not "this policy is honoured".
+    // per account and honoured where the notification is created.
     "notification_settings", // GET|PUT /api/v2/notifications/policy
     "streaming",             // GET /api/v1/streaming (the SSE tail of the events table)
     "tags",                  // GET /api/v1/tags/{name}, /{name}/follow, /{name}/unfollow

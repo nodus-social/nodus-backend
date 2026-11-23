@@ -108,6 +108,8 @@ pub struct ModerationNoticeDto {
 struct NotificationFilter {
     types: Vec<String>,
     exclude_types: Vec<String>,
+    /// `?filtered=true` asks for the rows a `filter` policy kept out of the ordinary list.
+    filtered: bool,
 }
 
 impl NotificationFilter {
@@ -119,6 +121,7 @@ impl NotificationFilter {
                 "exclude_types[]" | "exclude_types" => {
                     filter.exclude_types.extend(split_list(&value));
                 }
+                "filtered" => filter.filtered = matches!(value.as_ref(), "true" | "1"),
                 _ => {}
             }
         }
@@ -188,6 +191,7 @@ pub async fn list(
         cursor.as_deref(),
         i64::from(size.get()),
         &kinds,
+        Some(filter.filtered),
     )
     .await?;
 

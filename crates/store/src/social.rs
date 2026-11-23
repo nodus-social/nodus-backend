@@ -374,6 +374,11 @@ pub async fn notify(
 
 /// The same event with a sentence the reader is told, for kinds whose payload is text
 /// rather than a status: a decided appeal carries its outcome and the moderator's note.
+///
+/// The recipient's policy is joined in the same statement that writes the row, so a `drop`
+/// writes nothing and publishes nothing, while a `filter` writes `filtered = true` in the
+/// same commit. There is no separate policy read, however many notifications one request
+/// creates.
 pub async fn notify_with_note(
     pool: &PgPool,
     account_id: &str,
@@ -385,33 +390,47 @@ pub async fn notify_with_note(
     if account_id == from_account_id {
         return Ok(());
     }
-    // The id comes back from both shapes so the live stream can name the row it tells the
+    let policy_kind = crate::notification_policy::policy_kind_for(kind);
+    // The row comes back from both shapes so the live stream can name what it tells the
     // recipient about. Publishing is fire-and-forget: a browser that stopped reading must
-    // not make a favourite wait.
-    let id: String = if kind == "poll" && status_id.is_some() {
-        sqlx::query_scalar(
-            "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (account_id, status_id) WHERE kind = 'poll' \
-             DO UPDATE SET from_account_id = EXCLUDED.from_account_id, \
-                           group_count = notification.group_count + 1, \
-                           created_at = now(), \
-                           seen_at = NULL \
-             RETURNING id",
-        )
-        .bind(Id::new().to_string())
-        .bind(account_id)
-        .bind(kind)
-        .bind(from_account_id)
-        .bind(status_id)
-        .bind(note)
-        .fetch_one(pool)
-        .await?
+    // not make a favourite wait. A `drop` writes nothing; a `filter` writes a row that is
+    // deliberately kept out of the inbox, so neither publishes a stream event. A client
+    // that received one would show the very notification the reader asked to suppress.
+    let written: Option<(String, bool)> = if kind == "poll" && status_id.is_some() {
+        Some((
+            sqlx::query_scalar(
+                "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (account_id, status_id) WHERE kind = 'poll' \
+                 DO UPDATE SET from_account_id = EXCLUDED.from_account_id, \
+                               group_count = notification.group_count + 1, \
+                               created_at = now(), \
+                               seen_at = NULL \
+                 RETURNING id",
+            )
+            .bind(Id::new().to_string())
+            .bind(account_id)
+            .bind(kind)
+            .bind(from_account_id)
+            .bind(status_id)
+            .bind(note)
+            .fetch_one(pool)
+            .await?,
+            false,
+        ))
     } else {
-        sqlx::query_scalar(
-            "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             RETURNING id",
+        // Mastodon's contract for `filter`: keep the row but keep it out of the ordinary
+        // list. `drop` is enforced by the WHERE clause, before any row exists. A kind with
+        // no policy entry (`poll`, `appeal`, `moderation`) joins to nothing and reads as
+        // the default, `accept`.
+        sqlx::query_as::<_, (String, bool)>(
+            "INSERT INTO notification (id, account_id, kind, from_account_id, status_id, note, filtered) \
+             SELECT $1, $2, $3, $4, $5, $6, COALESCE(p.policy, $7) = 'filter' \
+               FROM (VALUES (1)) AS seed(n) \
+               LEFT JOIN notification_policy p \
+                 ON p.account_id = $2 AND p.kind = $8 \
+              WHERE COALESCE(p.policy, $7) <> 'drop' \
+             RETURNING id, filtered",
         )
         .bind(Id::new().to_string())
         .bind(account_id)
@@ -419,10 +438,14 @@ pub async fn notify_with_note(
         .bind(from_account_id)
         .bind(status_id)
         .bind(note)
-        .fetch_one(pool)
+        .bind(crate::notification_policy::DEFAULT)
+        .bind(policy_kind)
+        .fetch_optional(pool)
         .await?
     };
-    crate::live::notification(account_id, &id);
+    if let Some((id, false)) = written {
+        crate::live::notification(account_id, &id);
+    }
     Ok(())
 }
 
@@ -447,6 +470,8 @@ pub struct NotificationRow {
     pub moderation_expires_at: Option<DateTime<Utc>>,
     /// How many events this line stands for; only `poll` aggregates, so it is 1 elsewhere.
     pub group_count: i32,
+    /// A `filter` policy wrote the row but kept it out of the ordinary list.
+    pub filtered: bool,
     pub seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -457,15 +482,17 @@ pub async fn notifications(
     max_id: Option<&str>,
     limit: i64,
     kinds: &[String],
+    filtered: Option<bool>,
 ) -> Result<Vec<NotificationRow>, sqlx::Error> {
     sqlx::query_as::<_, NotificationRow>(
-        "SELECT id, kind, account_id, from_account_id, status_id, note, group_count, \
+        "SELECT id, kind, account_id, from_account_id, status_id, note, group_count, filtered, \
                 seen_at, created_at, moderation_action, moderation_reason, moderation_rule, \
                 moderation_expires_at \
            FROM notification \
           WHERE account_id = $1 \
             AND ($2::text IS NULL OR id < $2) \
             AND (cardinality($3::text[]) = 0 OR kind = ANY($3)) \
+            AND ($5::bool IS NULL OR filtered = $5) \
             AND NOT EXISTS (SELECT 1 FROM account_relation r \
                             WHERE r.account_id = $1 AND r.target_account_id = from_account_id \
                               AND (r.kind = 'block' OR (r.kind = 'mute' AND r.notifications))) \
@@ -478,8 +505,17 @@ pub async fn notifications(
     .bind(max_id)
     .bind(kinds)
     .bind(limit)
+    .bind(filtered)
     .fetch_all(pool)
     .await
+}
+
+/// How many notifications a `filter` policy has kept out of the ordinary list.
+pub async fn filtered_count(pool: &PgPool, account_id: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*) FROM notification WHERE account_id = $1 AND filtered")
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
 }
 
 /// One notification, for the live stream that names the row it just created.
@@ -493,7 +529,7 @@ pub async fn notification_by_id(
     id: &str,
 ) -> Result<Option<NotificationRow>, sqlx::Error> {
     sqlx::query_as::<_, NotificationRow>(
-        "SELECT id, kind, account_id, from_account_id, status_id, note, group_count, \
+        "SELECT id, kind, account_id, from_account_id, status_id, note, group_count, filtered, \
                 seen_at, created_at, moderation_action, moderation_reason, moderation_rule, \
                 moderation_expires_at \
            FROM notification WHERE account_id = $1 AND id = $2",

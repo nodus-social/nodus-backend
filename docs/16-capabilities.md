@@ -48,9 +48,14 @@ answer is a `422` naming it, and the answer message also lists the three allowed
 row is one per `(account, kind)` in `notification_policy` (migration `0057`), so a missing row is
 the default rather than an error, and a new account needs no backfill.
 
-**Not yet honoured.** The inbox (`crates/api/src/notifications.rs:483-486`) does not consult the
-policy: a kind set to `filter` or `drop` still arrives. Filtering by policy is the next piece of
-work; until it lands the tab changes what is stored, not what is delivered.
+The policy is honoured at the write site, not at read time. `notify_with_note`
+(`crates/store/src/social.rs`) joins `notification_policy` in the same statement that inserts
+the row: `drop` writes nothing (so no stream event is published), `filter` writes the row with
+`filtered = true` and publishes no stream event either, and `accept` is unchanged. The ordinary
+`GET /api/v1/notifications` excludes filtered rows; `?filtered=true` lists them, and
+`social::filtered_count` counts them. Kinds without a policy entry — `poll`, `appeal`,
+`moderation` — always arrive; `follow_request`, `report` and `pending_request` have no write
+path yet, and `status` is mapped but no row is created for it.
 
 ## 2. The one conditional name: `drive_share`
 

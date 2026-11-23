@@ -221,7 +221,7 @@ async fn misskey_create_note_fans_out_records_mentions_tags_and_counters() {
         .unwrap();
         assert_eq!(tags, 1);
 
-        let bob_notifs = social::notifications(pool, &bob_id, None, 20, &[])
+        let bob_notifs = social::notifications(pool, &bob_id, None, 20, &[], Some(false))
             .await
             .unwrap();
         assert_eq!(bob_notifs.len(), 1);
@@ -275,7 +275,7 @@ async fn misskey_reply_and_delete_update_counters_and_dedupe_notifications() {
                 .replies_count,
             1
         );
-        let alice_mentions = social::notifications(pool, &alice_id, None, 20, &[])
+        let alice_mentions = social::notifications(pool, &alice_id, None, 20, &[], Some(false))
             .await
             .unwrap();
         assert_eq!(alice_mentions.len(), 1);
@@ -417,11 +417,11 @@ async fn mastodon_reply_mention_dedupes_notification_and_context_hides_deleted_p
         assert_eq!(status, StatusCode::OK);
         let reply_id = reply["id"].as_str().unwrap().to_owned();
 
-        let alice_notifs = social::notifications(pool, &alice_id, None, 20, &[])
+        let alice_notifs = social::notifications(pool, &alice_id, None, 20, &[], Some(false))
             .await
             .unwrap();
         assert_eq!(alice_notifs.len(), 1);
-        let carol_notifs = social::notifications(pool, &carol_id, None, 20, &[])
+        let carol_notifs = social::notifications(pool, &carol_id, None, 20, &[], Some(false))
             .await
             .unwrap();
         assert_eq!(carol_notifs.len(), 1);
@@ -499,10 +499,16 @@ async fn mastodon_reblog_is_idempotent_and_unreblog_decrements_count() {
         .await;
         assert_eq!(fetched_root["reblogs_count"], 1);
 
-        let alice_reblogs =
-            social::notifications(pool, &alice_id, None, 20, &["reblog".to_owned()])
-                .await
-                .unwrap();
+        let alice_reblogs = social::notifications(
+            pool,
+            &alice_id,
+            None,
+            20,
+            &["reblog".to_owned()],
+            Some(false),
+        )
+        .await
+        .unwrap();
         assert_eq!(alice_reblogs.len(), 1);
 
         let (unreblog_status, unboosted) = send_request(
