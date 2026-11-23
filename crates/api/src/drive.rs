@@ -942,7 +942,7 @@ async fn read_blob(digest: &str, range: Option<ByteRange>) -> ApiResult<Vec<u8>>
 /// drive row in the same account with the same digest (`object_by_sha`), and a
 /// `media_attachment` a post still shows. Only when neither does is the blob unlinked,
 /// and the unlink is the cluster-aware one, so every node loses its copy.
-async fn release_digest(state: &AppState, account: &str, digest: &str) -> ApiResult<()> {
+pub(crate) async fn release_digest(state: &AppState, account: &str, digest: &str) -> ApiResult<()> {
     let pool = state.store().pool();
     if drive::object_by_sha(pool, account, digest).await?.is_some() {
         return Ok(());

@@ -1,25 +1,27 @@
 //! Media upload, metadata and byte serving.
 //!
 //! Uploads are content-addressed: the catalogue id is ours, the stored name is the
-//! digest. That makes a retry idempotent at the object layer even though it creates a
-//! second catalogue row.
+//! digest. Re-uploading bytes the account already holds therefore reuses its attachment,
+//! so a retry leaves one catalogue row rather than two.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use chrono::Utc;
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use nodus_server_core::id::Id;
-use nodus_server_core::limits::{IMAGE_SIZE_LIMIT, VIDEO_SIZE_LIMIT};
+use nodus_server_core::limits::{IMAGE_SIZE_LIMIT, PAGE_MAX, VIDEO_SIZE_LIMIT};
+use nodus_server_core::PageSize;
 use nodus_server_media::{
     expires_in, plan_with_permissions, CachePolicy, Kind, Layer, LosslessPermissions, VariantSpec,
 };
@@ -42,6 +44,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/media", post(upload))
         .route("/api/v2/media", post(upload_deferred))
+        .route("/api/v1/media/library", get(library))
+        .route("/api/v1/media/library/{id}", delete(delete_library))
         .route("/api/v1/media/{id}", get(show).put(update))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD))
 }
@@ -373,6 +377,9 @@ pub(crate) struct UploadFile<'a> {
 /// This is the body of `POST /api/v1/media` once the multipart fields are read, and the
 /// profile-picture form on `update_credentials` calls it with the same fields: a second
 /// writer would have to repeat every limit and refusal and would drift from this one.
+///
+/// The returned row may be one this account already had: bytes it stored before are not
+/// stored or catalogued again.
 pub(crate) async fn ingest_upload(
     state: &AppState,
     auth: &Auth,
@@ -422,6 +429,22 @@ pub(crate) async fn ingest_upload(
     }
 
     let digest = hex(&Sha256::digest(bytes));
+
+    // Reuse is a hit only inside one account: the digest addresses bytes, but the
+    // attachment is the account's, and handing one account's row to another would leak
+    // its description and id. A differing description is refused rather than written,
+    // because the first uploader's words are not this uploader's to change.
+    if let Some(existing) =
+        media::reusable(state.store().pool(), &auth.0.account.id, &digest).await?
+    {
+        if !description.is_empty() && existing.description != description {
+            return Err(ApiError::unprocessable(
+                "This picture is already in your library with a different description",
+            ));
+        }
+        return Ok(existing);
+    }
+
     let dir = storage_dir();
     tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::create_dir_all(variants_dir()).await?;
@@ -437,6 +460,7 @@ pub(crate) async fn ingest_upload(
         id: id.clone(),
         account_id: auth.0.account.id.clone(),
         status_id: None,
+        stored_object_id: None,
         digest,
         content_type: content_type.to_owned(),
         size: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
@@ -498,7 +522,14 @@ pub(crate) async fn ingest_upload(
     )
     .await
     {
-        Ok(object) => Some(object.id),
+        Ok(object) => {
+            if let Err(error) =
+                media::set_projected_object(state.store().pool(), &id, object.id).await
+            {
+                tracing::warn!(%error, %id, "could not record an upload's drive projection");
+            }
+            Some(object.id)
+        }
         Err(error) => {
             tracing::warn!(%error, %id, "could not file an upload in the drive");
             None
@@ -568,7 +599,9 @@ async fn mirror_drive_state(
 /// What a media route answers for a row.
 ///
 /// A `202` is only honest while something is still running: once the row is `ready` or
-/// `failed` the client gets the full attachment either way.
+/// `failed` the client gets the full attachment either way. A reuse answers `200` with the
+/// existing attachment, not `201`: the id and urls are the ones the account already had,
+/// and a client that saw `201` would be entitled to expect a new picture.
 fn media_response(
     row: &MediaRow,
     instance: &crate::state::InstanceConfig,
@@ -934,6 +967,189 @@ pub async fn update(
     Ok(Json(MediaAttachmentDto::from_row(&row, state.instance())))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LibraryQuery {
+    pub limit: Option<u32>,
+}
+
+/// One row of `GET /api/v1/media/library`.
+///
+/// The usage fields are two names for one fact: `usage` says which kind of thing holds the
+/// id, and `usage_id` is that thing's id when it has one. A published style is the account
+/// document, so it names no separate id.
+#[derive(Debug, Serialize)]
+struct LibraryItem {
+    id: String,
+    url: String,
+    preview_url: String,
+    #[serde(rename = "type")]
+    kind: String,
+    size: i64,
+    width: Option<i32>,
+    height: Option<i32>,
+    created_at: DateTime<Utc>,
+    digest: String,
+    usage: &'static str,
+    usage_id: Option<String>,
+    duplicate_of: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LibraryPayload {
+    media: Vec<LibraryItem>,
+    limit: u32,
+}
+
+/// `GET /api/v1/media/library` — the caller's uploaded pictures, newest first.
+///
+/// Mastodon has no such route: `GET /api/v1/media/{id}` reports one attachment, but there
+/// is no page that says what the account holds or what still uses it. The bound is a
+/// limit rather than a cursor because this is a repair view, not a feed: a reader removes
+/// what is unused and reloads.
+async fn library(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<LibraryQuery>,
+) -> ApiResult<Json<LibraryPayload>> {
+    auth.require_scope("read:accounts")?;
+    let account = &auth.0.account.id;
+    let limit = PageSize::clamp(query.limit, PAGE_MAX);
+    let rows = media::library(state.store().pool(), account, limit.as_i64()).await?;
+    let style_ids = style_media_ids(state.store().pool(), account).await?;
+    let media = rows
+        .into_iter()
+        .map(|row| {
+            let (usage, usage_id) = if let Some(status_id) = &row.status_id {
+                ("status", Some(status_id.clone()))
+            } else if let Some(object_id) = row.stored_object_id {
+                ("drive", Some(object_id.to_string()))
+            } else if style_ids.contains(&row.id) {
+                ("style", None)
+            } else {
+                ("none", None)
+            };
+            LibraryItem {
+                url: state
+                    .instance()
+                    .url(&format!("/media/{}/compressed", row.id)),
+                preview_url: state.instance().url(&format!("/media/{}/preview", row.id)),
+                kind: MediaAttachmentDto::kind_name(&row.content_type).to_owned(),
+                id: row.id,
+                size: row.size,
+                width: row.width,
+                height: row.height,
+                created_at: row.created_at,
+                digest: row.digest,
+                usage,
+                usage_id,
+                duplicate_of: row.duplicate_of,
+            }
+        })
+        .collect();
+    Ok(Json(LibraryPayload {
+        media,
+        limit: limit.get(),
+    }))
+}
+
+/// Every media id the account's published style names, across all three banners.
+///
+/// A hidden banner still counts: it is stored and can be shown again, so deleting its
+/// picture would leave the document pointing at nothing.
+async fn style_media_ids(pool: &PgPool, account: &str) -> ApiResult<HashSet<String>> {
+    let Some(style) = nodus_server_store::style_public::load(pool, account).await? else {
+        return Ok(HashSet::new());
+    };
+    let mut ids = HashSet::new();
+    for region in [&style.top, &style.left, &style.right] {
+        for slot in &region.slots {
+            if let Some(media_id) = &slot.media_id {
+                ids.insert(media_id.clone());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Whether a profile slot names this attachment, stored as `<media id>/<layer>`.
+fn is_profile_ref(reference: Option<&str>, media_id: &str) -> bool {
+    reference
+        .and_then(|reference| reference.split('/').next())
+        .is_some_and(|head| head == media_id)
+}
+
+/// `DELETE /api/v1/media/library/{id}` — removes an upload nothing uses.
+///
+/// A picture a status, a drive attachment or a published style still names is refused with
+/// what names it; deleting it would leave that visible thing broken. The refusal is a
+/// `422`, not a `404`: the row exists and the caller can see it in the library. An id from
+/// another account is not in this account's library, so it is a `404`.
+async fn delete_library(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    auth.require_scope("write:accounts")?;
+    let account = &auth.0.account.id;
+    let pool = state.store().pool();
+    let Some(row) = media::by_id(pool, &id).await? else {
+        return Err(ApiError::not_found("Record not found"));
+    };
+    if row.account_id != *account || row.remote {
+        return Err(ApiError::not_found("Record not found"));
+    }
+    if let Some(status_id) = &row.status_id {
+        return Err(ApiError::unprocessable(format!(
+            "This picture is used by status {status_id}"
+        )));
+    }
+    if let Some(object_id) = row.stored_object_id {
+        return Err(ApiError::unprocessable(format!(
+            "This picture is used by drive file {object_id}"
+        )));
+    }
+    if style_media_ids(pool, account).await?.contains(&row.id) {
+        return Err(ApiError::unprocessable(
+            "This picture is used by your published style",
+        ));
+    }
+    // A profile picture is the fourth kind of user: it has no status, but the account
+    // names it as `<media id>/<layer>` and deleting it would remove the face the profile
+    // still points at. It is not one of the library's four `usage` values because a
+    // profile is not a thing with its own id; it is only a refusal here.
+    if is_profile_ref(auth.0.account.avatar_ref.as_deref(), &row.id) {
+        return Err(ApiError::unprocessable(
+            "This picture is used by your avatar",
+        ));
+    }
+    if is_profile_ref(auth.0.account.header_ref.as_deref(), &row.id) {
+        return Err(ApiError::unprocessable(
+            "This picture is used by your header",
+        ));
+    }
+    let projection = media::projected_object(pool, &row.id).await?;
+    if let Some(object_id) = projection {
+        if media::attachment_using_object(pool, object_id)
+            .await?
+            .is_some()
+        {
+            return Err(ApiError::unprocessable(format!(
+                "This picture is used by drive file {object_id}"
+            )));
+        }
+    }
+    if !media::delete(pool, &row.id).await? {
+        return Err(ApiError::not_found("Record not found"));
+    }
+    if let Some(object_id) = projection {
+        if let Err(error) = drive::delete_object(pool, account, object_id).await {
+            tracing::warn!(%error, %object_id, "could not delete an upload's drive projection");
+        }
+    }
+    crate::drive::release_digest(&state, account, &row.digest).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1207,7 @@ mod tests {
                 id: media_id.clone(),
                 account_id: account.id.clone(),
                 status_id: None,
+                stored_object_id: None,
                 digest: source_digest.clone(),
                 content_type: "video/mp4".to_owned(),
                 size: i64::try_from(bytes.len()).unwrap(),

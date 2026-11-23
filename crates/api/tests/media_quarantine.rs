@@ -419,6 +419,7 @@ async fn a_local_upload_is_never_quarantined() {
                 id: media_id.clone(),
                 account_id: author.clone(),
                 status_id: Some(status_id.clone()),
+                stored_object_id: None,
                 digest: format!("digest-{media_id}"),
                 content_type: "image/png".to_owned(),
                 size: 512,

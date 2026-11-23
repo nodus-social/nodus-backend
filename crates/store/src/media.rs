@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
 
 /// A row of `media_attachment`.
 /// The flags are a row's state, not a bag of options: whether the bytes stayed on the
@@ -20,6 +21,9 @@ pub struct MediaRow {
     pub id: String,
     pub account_id: String,
     pub status_id: Option<String>,
+    /// The drive object this attachment was made from, when it was attached rather than
+    /// uploaded. Null for an upload, whose bytes have a projection but no source object.
+    pub stored_object_id: Option<Uuid>,
     pub digest: String,
     pub content_type: String,
     pub size: i64,
@@ -49,7 +53,8 @@ pub struct MediaRow {
     pub created_at: DateTime<Utc>,
 }
 
-const MEDIA_COLUMNS: &str = "id, account_id, status_id, digest, content_type, size, width, \
+const MEDIA_COLUMNS: &str =
+    "id, account_id, status_id, stored_object_id, digest, content_type, size, width, \
      height, blurhash, description, sensitive, lossless, processing_state, processing_progress, \
      processing_error, original_pruned, remote, NULLIF(meta->>'url', '') AS remote_url, \
      content_hash, perceptual_hash, quarantine_state, quarantine_set, created_at";
@@ -508,6 +513,145 @@ pub async fn original_digest_referenced(pool: &PgPool, digest: &str) -> Result<b
     Ok(row.0 > 0)
 }
 
+/// The account's attachment for bytes it already holds, when a new upload may reuse it.
+///
+/// `pending` and `failed` are not reusable: the first has no rendered variants yet and the
+/// second has no usable bytes, so handing either back would turn a retry into a broken
+/// picture. `processing` is reusable: its row exists and the render that is running will
+/// finish it. Remote rows are excluded because their digest is the peer's synthetic key,
+/// not a hash of bytes this instance stores.
+///
+/// # Errors
+///
+/// When the lookup against Postgres fails.
+pub async fn reusable(
+    pool: &PgPool,
+    account_id: &str,
+    digest: &str,
+) -> Result<Option<MediaRow>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {MEDIA_COLUMNS} FROM media_attachment \
+         WHERE account_id = $1 AND digest = $2 AND NOT remote \
+           AND processing_state NOT IN ('pending', 'failed') \
+         ORDER BY created_at ASC, id ASC LIMIT 1"
+    );
+    sqlx::query_as::<_, MediaRow>(&sql)
+        .bind(account_id)
+        .bind(digest)
+        .fetch_optional(pool)
+        .await
+}
+
+/// The drive object an upload created as its listing projection.
+///
+/// The projection is not a second reference to the bytes: it is the same upload seen
+/// through the drive. Keeping its id on the attachment, in the row's existing `meta` bag
+/// beside a remote URL, is what lets the library delete the projection with the picture
+/// instead of orphaning it.
+///
+/// # Errors
+///
+/// When `meta` holds something that is not a UUID, or when the lookup fails.
+pub async fn projected_object(pool: &PgPool, media_id: &str) -> Result<Option<Uuid>, sqlx::Error> {
+    let projected = sqlx::query_scalar::<_, Option<Uuid>>(
+        "SELECT NULLIF(meta->>'projected_object_id', '')::uuid \
+         FROM media_attachment WHERE id = $1",
+    )
+    .bind(media_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(projected.flatten())
+}
+
+/// Records the drive projection of an upload, so deleting the attachment can delete it too.
+///
+/// # Errors
+///
+/// When the update fails; the upload still succeeds, it just cannot clean up its projection.
+pub async fn set_projected_object(
+    pool: &PgPool,
+    media_id: &str,
+    object_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE media_attachment \
+         SET meta = jsonb_set(meta, '{projected_object_id}', to_jsonb($2::text)) \
+         WHERE id = $1",
+    )
+    .bind(media_id)
+    .bind(object_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The attachment made from a drive object, if any.
+///
+/// Used before deleting a projection: another attachment may have been attached to the
+/// same drive object, and then the object is not the upload's to remove.
+///
+/// # Errors
+///
+/// When the lookup fails.
+pub async fn attachment_using_object(
+    pool: &PgPool,
+    object_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT id FROM media_attachment WHERE stored_object_id = $1 LIMIT 1")
+        .bind(object_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// One row of the media library, with the facts the page needs that [`MediaRow`] does not
+/// carry: where the picture is used and which earlier copy it duplicates.
+#[derive(Debug, Clone, FromRow)]
+pub struct LibraryRow {
+    pub id: String,
+    pub digest: String,
+    pub content_type: String,
+    pub size: i64,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub created_at: DateTime<Utc>,
+    pub status_id: Option<String>,
+    pub stored_object_id: Option<Uuid>,
+    /// The oldest row of the same account with this digest, when this row is a later copy.
+    pub duplicate_of: Option<String>,
+}
+
+/// A page of the account's own uploads, newest first.
+///
+/// `duplicate_of` names the oldest row with the same digest, so the page that surfaced the
+/// duplicate state can show it without a second request. The window looks at every row the
+/// account owns, not only the page: an older copy outside the page still decides which id
+/// is the original.
+///
+/// # Errors
+///
+/// When the page query fails.
+pub async fn library(
+    pool: &PgPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<LibraryRow>, sqlx::Error> {
+    sqlx::query_as::<_, LibraryRow>(
+        "SELECT m.id, m.digest, m.content_type, m.size, m.width, m.height, m.created_at, \
+                m.status_id, m.stored_object_id, \
+                CASE WHEN count(*) OVER w > 1 \
+                     THEN NULLIF(first_value(m.id) OVER w, m.id) END AS duplicate_of \
+         FROM media_attachment m \
+         WHERE m.account_id = $1 AND NOT m.remote \
+         WINDOW w AS (PARTITION BY m.digest ORDER BY m.created_at ASC, m.id ASC) \
+         ORDER BY m.created_at DESC, m.id DESC \
+         LIMIT $2",
+    )
+    .bind(account_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Records what the accepted bytes hashed to.
 ///
 /// Called once per attachment, right after the fetch that produced them; the hash is the
@@ -624,6 +768,7 @@ mod tests {
                 id: media_id.clone(),
                 account_id: account.id.clone(),
                 status_id: None,
+                stored_object_id: None,
                 digest: format!("digest-{media_id}"),
                 content_type: "video/mp4".to_owned(),
                 size: 1024,
@@ -764,6 +909,7 @@ mod tests {
                     id: id.clone(),
                     account_id: account.id.clone(),
                     status_id: None,
+                    stored_object_id: None,
                     digest: format!("digest-{id}"),
                     content_type: "image/png".to_owned(),
                     size: 512,
