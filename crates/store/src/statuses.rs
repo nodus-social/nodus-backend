@@ -5,6 +5,7 @@
 //! [`BIG_ACCOUNT_THRESHOLD`] are merged at read time. Both lanes are ordered by the
 //! same id and deduped, so a status that crosses the threshold never appears twice.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
@@ -562,6 +563,71 @@ pub async fn account_page(
         .bind(max_id)
         .bind(lower_id)
         .bind(size.as_i64() + 1)
+        .fetch_all(pool)
+        .await?;
+    Ok(finish(rows, size))
+}
+
+/// The optional narrowing on a profile page.
+///
+/// The flags come from the Mastodon account-statuses surface. `pinned` is not here:
+/// there is no pinned-status table, so a handler cannot honour it without inventing one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProfileFilters {
+    pub exclude_replies: bool,
+    pub exclude_reblogs: bool,
+    pub only_media: bool,
+}
+
+/// A profile page: an account's own statuses under the public visibility rules.
+///
+/// Deliberately not `account_page`: that one is the outbox predicate set, and an outbox
+/// does not know about a reader's personal domain blocks. This adds the `public_page`
+/// clauses (suspended/silenced authors, instance blocks, paused domains, remote
+/// moderation, the reader's own domain blocks) so a profile cannot show a row that the
+/// public timeline would hide.
+pub async fn profile_page(
+    pool: &PgPool,
+    account_id: &str,
+    params: PageParams,
+    filters: ProfileFilters,
+    viewer: Option<&str>,
+) -> Result<StatusPage, sqlx::Error> {
+    let size = PageSize::default_max(params.limit);
+    let (max_id, lower_id, order) = page_bounds(params);
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM status s \
+           JOIN account a ON a.id = s.account_id \
+         WHERE s.account_id = $1 AND s.deleted_at IS NULL \
+           AND s.visibility IN ('public', 'unlisted') \
+           AND s.quarantined_at IS NULL \
+           AND a.suspended_at IS NULL AND a.silenced_at IS NULL \
+           AND a.deleted_at IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM instance_block b WHERE b.domain = a.domain \
+                           AND b.severity IN ('suspend', 'silence')) \
+           AND NOT EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
+                           AND (p.expires_at IS NULL OR p.expires_at > now())) \
+           AND NOT EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
+                           AND m.action IN ('silence', 'suspend') \
+                           AND (m.expires_at IS NULL OR m.expires_at > now())) \
+           AND ($5::text IS NULL OR NOT EXISTS (SELECT 1 FROM account_domain_block d \
+                           WHERE d.account_id = $5 AND d.host = a.domain)) \
+           AND (NOT $6 OR s.in_reply_to_id IS NULL) \
+           AND (NOT $7 OR s.reblog_of_id IS NULL) \
+           AND (NOT $8 OR EXISTS (SELECT 1 FROM media_attachment m WHERE m.status_id = s.id)) \
+           AND ($2::text IS NULL OR s.id < $2) \
+           AND ($3::text IS NULL OR s.id > $3) \
+         ORDER BY s.id {order} LIMIT $4"
+    );
+    let rows = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(account_id)
+        .bind(max_id)
+        .bind(lower_id)
+        .bind(size.as_i64() + 1)
+        .bind(viewer)
+        .bind(filters.exclude_replies)
+        .bind(filters.exclude_reblogs)
+        .bind(filters.only_media)
         .fetch_all(pool)
         .await?;
     Ok(finish(rows, size))
@@ -1420,12 +1486,18 @@ pub async fn is_mentioned(
     .await
 }
 
-/// Ancestors and descendants of a status, oldest first.
-pub async fn context(
+/// The reply chain above a status, oldest first, bounded to the nearest `limit` parents.
+///
+/// A page uses this instead of [`context`]: a thread hydrated for a reader needs the
+/// posts they are about to see, not an unbounded walk to the root of a hostile reply
+/// chain. `context` keeps the unbounded walk for the thread endpoint that already
+/// returns the whole conversation.
+pub async fn ancestor_chain(
     pool: &PgPool,
     id: &str,
-) -> Result<(Vec<StatusRow>, Vec<StatusRow>), sqlx::Error> {
-    let ancestors = format!(
+    limit: i64,
+) -> Result<Vec<StatusRow>, sqlx::Error> {
+    let sql = format!(
         "WITH RECURSIVE chain AS ( \
              SELECT {STATUS_COLUMNS} FROM status s WHERE s.id = \
                  (SELECT in_reply_to_id FROM status WHERE id = $1) \
@@ -1434,9 +1506,20 @@ pub async fn context(
              SELECT {STATUS_COLUMNS} FROM status s \
                JOIN chain c ON s.id = c.in_reply_to_id \
               WHERE s.deleted_at IS NULL \
-         ) SELECT * FROM chain ORDER BY id ASC"
+         ) SELECT * FROM chain ORDER BY id DESC LIMIT $2"
     );
-    let descendants = format!(
+    let mut rows = sqlx::query_as::<_, StatusRow>(&sql)
+        .bind(id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    rows.reverse();
+    Ok(rows)
+}
+
+/// Every reply below a status, oldest first.
+pub async fn descendants(pool: &PgPool, id: &str) -> Result<Vec<StatusRow>, sqlx::Error> {
+    let sql = format!(
         "WITH RECURSIVE tree AS ( \
              SELECT {STATUS_COLUMNS} FROM status s \
               WHERE s.in_reply_to_id = $1 AND s.deleted_at IS NULL \
@@ -1446,15 +1529,59 @@ pub async fn context(
               WHERE s.deleted_at IS NULL \
          ) SELECT * FROM tree ORDER BY id ASC"
     );
-    let ancestors = sqlx::query_as::<_, StatusRow>(&ancestors)
+    sqlx::query_as::<_, StatusRow>(&sql)
         .bind(id)
         .fetch_all(pool)
-        .await?;
-    let descendants = sqlx::query_as::<_, StatusRow>(&descendants)
-        .bind(id)
-        .fetch_all(pool)
-        .await?;
+        .await
+}
+
+/// Ancestors and descendants of a status, oldest first.
+pub async fn context(
+    pool: &PgPool,
+    id: &str,
+) -> Result<(Vec<StatusRow>, Vec<StatusRow>), sqlx::Error> {
+    let ancestors = ancestor_chain(pool, id, i64::MAX).await?;
+    let descendants = descendants(pool, id).await?;
     Ok((ancestors, descendants))
+}
+
+/// The ids among `status_ids` that a page surface must not show this reader.
+///
+/// One statement for the moderation gate that [`public_page`] writes as a predicate:
+/// a tombstoned or quarantined status, a suspended/silenced/deleted author, an instance
+/// block, a paused domain, remote moderation, or the reader's personal domain block.
+/// The page handlers call this once for the whole payload instead of asking
+/// `can_view_for_viewer` per row, which would pay its two reads for every post.
+pub async fn hidden_status_ids(
+    pool: &PgPool,
+    status_ids: &[String],
+    viewer: Option<&str>,
+) -> Result<HashSet<String>, sqlx::Error> {
+    if status_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT s.id FROM status s JOIN account a ON a.id = s.account_id \
+          WHERE s.id = ANY($1) AND ( \
+                s.deleted_at IS NOT NULL OR s.quarantined_at IS NOT NULL \
+             OR a.suspended_at IS NOT NULL OR a.silenced_at IS NOT NULL \
+             OR a.deleted_at IS NOT NULL \
+             OR EXISTS (SELECT 1 FROM instance_block b WHERE b.domain = a.domain \
+                        AND b.severity IN ('suspend', 'silence')) \
+             OR EXISTS (SELECT 1 FROM domain_pause p WHERE p.domain = a.domain \
+                        AND (p.expires_at IS NULL OR p.expires_at > now())) \
+             OR EXISTS (SELECT 1 FROM remote_moderation m WHERE m.actor_uri = a.uri \
+                        AND m.action IN ('silence', 'suspend') \
+                        AND (m.expires_at IS NULL OR m.expires_at > now())) \
+             OR ($2::text IS NOT NULL AND EXISTS (SELECT 1 FROM account_domain_block d \
+                        WHERE d.account_id = $2 AND d.host = a.domain)) \
+          )",
+    )
+    .bind(status_ids)
+    .bind(viewer)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// Who may appear in the accounts behind a status's favourites or reblogs.
