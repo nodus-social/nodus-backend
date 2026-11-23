@@ -497,6 +497,9 @@ const MODULE_FEATURES: &[(&str, &[&str])] = &[
         ],
     ),
     ("forwarded", &["report_forwarding"]),
+    // The address-block console is part of the admin area, so it asks for the umbrella
+    // `admin` capability rather than inventing a name no client has a flag for.
+    ("ip_blocks", &["admin"]),
     ("media", &["media_quarantine"]),
     ("moderation_rules", &["moderation_rules"]),
     ("reports", &["moderation"]),

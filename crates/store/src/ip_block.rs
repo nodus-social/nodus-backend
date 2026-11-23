@@ -179,9 +179,7 @@ pub fn normalize(raw: &str) -> Result<String, String> {
     // A dual-stack listener reports IPv4 callers as `::ffff:a.b.c.d`; they must be widened
     // as IPv4 or every one of them collapses into one useless IPv6 prefix.
     let address = match address {
-        IpAddr::V6(ip) => ip
-            .to_ipv4_mapped()
-            .map_or(IpAddr::V6(ip), IpAddr::V4),
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
         IpAddr::V4(ip) => IpAddr::V4(ip),
     };
     let (bits, network) = match address {
@@ -243,7 +241,10 @@ mod tests {
 
     #[test]
     fn an_ipv4_mapped_address_is_an_ipv4_block() {
-        assert_eq!(normalize("::ffff:203.0.113.7").expect("mapped"), "203.0.113.0/24");
+        assert_eq!(
+            normalize("::ffff:203.0.113.7").expect("mapped"),
+            "203.0.113.0/24"
+        );
     }
 
     #[test]

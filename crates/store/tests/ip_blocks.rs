@@ -80,4 +80,3 @@ async fn the_same_network_cannot_be_blocked_twice(pool: sqlx::PgPool) {
         .await
         .is_err());
 }
-
