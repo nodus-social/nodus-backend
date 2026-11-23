@@ -41,6 +41,15 @@ pub struct BlockForm {
     expires_in: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EditForm {
+    severity: String,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    expires_in: Option<String>,
+}
+
 fn seconds(raw: Option<&str>) -> ApiResult<Option<i64>> {
     raw.map(str::trim)
         .filter(|raw| !raw.is_empty())
@@ -107,7 +116,7 @@ async fn update(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
-    Body(form): Body<BlockForm>,
+    Body(form): Body<EditForm>,
 ) -> ApiResult<Json<IpBlock>> {
     auth.require_admin("admin:write")?;
     let severity = severity(&form.severity)?;
