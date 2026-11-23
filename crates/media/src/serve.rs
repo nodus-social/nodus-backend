@@ -28,7 +28,7 @@ use nodus_storage::{ByteRange, RangeError};
 
 use crate::cluster::{self, placement, Member};
 use crate::hash::hex;
-use crate::{CachePolicy, Layer};
+use crate::{profile, CachePolicy, Layer};
 
 /// The bytes a media catalogue id resolves to, and where they are kept.
 pub struct Serving {
@@ -438,7 +438,9 @@ async fn original(serving: &Arc<Serving>, id: &str, range: Option<&HeaderValue>)
     }
     for layer in [Layer::Compressed, Layer::Preview] {
         if let Some(variant) = variant(serving, id, layer.as_str()).await {
-            return variant_response(serving, variant, layer, range).await;
+            if let Some(response) = variant_response(serving, variant, layer, range).await {
+                return response;
+            }
         }
     }
     not_found()
@@ -472,14 +474,22 @@ pub async fn serve_variant(
     {
         return response;
     }
+    // The remaining layers may legitimately be answered by the original: it is the same
+    // picture at a larger size. A still field is the exception — an animated original is
+    // exactly what that field must never return — so it fails rather than animating.
+    if layer.is_still() {
+        return not_found();
+    }
     original(&serving, &id, headers.get(header::RANGE)).await
 }
 
-/// The variant for `layer`, or the preview when a profile variant is still rendering.
+/// The variant for `layer`, or the preview while its profile layers are rendered.
 ///
-/// A picture someone just set as their avatar has its profile variant rendered behind
-/// the update request, which may still be running. The preview is already the picture;
-/// answering with it keeps the profile working and the next request finds the variant.
+/// A picture can name a profile layer that has no variant yet: it was chosen before the
+/// layers existed, or this replica has not received the bytes. The preview is already the
+/// picture, so an animated layer answers with it and renders the real layer behind the
+/// answer. A still layer is different in kind: a preview of an animation *is* an
+/// animation, so it renders before answering instead of falling through to one.
 async fn variant_or_preview(
     serving: &Arc<Serving>,
     id: &str,
@@ -487,13 +497,66 @@ async fn variant_or_preview(
     range: Option<&HeaderValue>,
 ) -> Option<Response> {
     if let Some(variant) = variant(serving, id, layer.as_str()).await {
-        return Some(variant_response(serving, variant, layer, range).await);
+        if let Some(response) = variant_response(serving, variant, layer, range).await {
+            return Some(response);
+        }
+        // The catalogue has the layer but this node has not received its bytes yet.
     }
-    if layer.is_profile() {
-        let preview = variant(serving, id, Layer::Preview.as_str()).await?;
-        return Some(variant_response(serving, preview, Layer::Preview, range).await);
+    let (_, still) = profile::slot_layers(layer)?;
+    if layer == still {
+        if let Err(error) = render_layer_now(serving, id, layer).await {
+            tracing::warn!(%error, %id, layer = layer.as_str(), "could not render a still profile layer");
+            return None;
+        }
+        let variant = variant(serving, id, layer.as_str()).await?;
+        return variant_response(serving, variant, layer, range).await;
     }
-    None
+    schedule_layer_render(serving, id, layer);
+    let preview = variant(serving, id, Layer::Preview.as_str()).await?;
+    variant_response(serving, preview, Layer::Preview, range).await
+}
+
+/// Renders a profile slot behind the answer the reader is already being given.
+fn schedule_layer_render(serving: &Arc<Serving>, id: &str, layer: Layer) {
+    let serving = Arc::clone(serving);
+    let id = id.to_owned();
+    tokio::spawn(async move {
+        if let Err(error) = render_layer_now(&serving, &id, layer).await {
+            tracing::warn!(%error, %id, layer = layer.as_str(), "could not render a profile layer");
+        }
+    });
+}
+
+/// Renders `layer`'s slot now, fetching the original from a peer when this replica does
+/// not hold it.
+///
+/// A render reads a file, so the original is made local first; the peer copy is the same
+/// bytes and the caller's `copy_from_placement` already deduplicates concurrent fetches.
+async fn render_layer_now(serving: &Arc<Serving>, id: &str, layer: Layer) -> Result<(), String> {
+    let source = local_original(serving, id).await?;
+    profile::render(&serving.pool, &serving.variants, id, &source, layer)
+        .await
+        .map(drop)
+}
+
+async fn local_original(serving: &Arc<Serving>, id: &str) -> Result<PathBuf, String> {
+    let Some(row) = media::by_id(&serving.pool, id)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Err("the media row is gone".to_owned());
+    };
+    let path = serving.root.join(&row.digest);
+    if tokio::fs::metadata(&path).await.is_ok() {
+        return Ok(path);
+    }
+    let bytes = copy_from_placement(serving, &row.digest)
+        .await
+        .ok_or_else(|| "the original is not on this node".to_owned())?;
+    write_atomically(&serving.root, &row.digest, &bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(path)
 }
 
 async fn catalogue(serving: &Serving, id: &str) -> Option<media::MediaRow> {
@@ -539,12 +602,14 @@ async fn variant_response(
     variant: VariantRow,
     layer: Layer,
     range: Option<&HeaderValue>,
-) -> Response {
-    let Ok(bytes) = tokio::fs::read(serving.variants.join(&variant.digest)).await else {
-        return not_found();
-    };
+) -> Option<Response> {
+    // `None` is a node that has not received the bytes, not a missing picture, so the
+    // caller may fall through to a layer it does own instead of answering 404.
+    let bytes = tokio::fs::read(serving.variants.join(&variant.digest))
+        .await
+        .ok()?;
     let cache = CachePolicy::default().cache_control(layer);
-    with_cache(bytes, &variant.content_type, &cache, range)
+    Some(with_cache(bytes, &variant.content_type, &cache, range))
 }
 
 /// A public answer: cached by digest, with the content type the catalogue recorded, and the

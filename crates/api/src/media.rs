@@ -723,14 +723,6 @@ impl ProfileSlot {
         }
     }
 
-    /// The first-frame layer served to clients that must not animate.
-    pub(crate) const fn static_layer(self) -> Layer {
-        match self {
-            Self::Avatar => Layer::AvatarStatic,
-            Self::Header => Layer::HeaderStatic,
-        }
-    }
-
     /// The layer name a profile reference ends in.
     pub(crate) const fn reference(self) -> &'static str {
         match self {
@@ -769,12 +761,8 @@ async fn render_profile_variants(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "the media row is gone".to_owned())?;
     let kind = Kind::from_content_type(&row.content_type);
-    let width = u32::try_from(row.width.unwrap_or(1)).unwrap_or(1).max(1);
-    let height = u32::try_from(row.height.unwrap_or(1)).unwrap_or(1).max(1);
-    let plan =
-        nodus_server_media::plan_profile(kind, width, height).map_err(|error| error.to_string())?;
     let (source, scratch) = profile_source(&row).await?;
-    let result = write_profile_variants(state, &row, kind, &source, &plan, slot).await;
+    let result = write_profile_variants(state, &row, kind, &source, slot).await;
     if scratch {
         let _ = tokio::fs::remove_file(&source).await;
     }
@@ -786,53 +774,18 @@ async fn write_profile_variants(
     row: &MediaRow,
     kind: Kind,
     source: &std::path::Path,
-    plan: &[VariantSpec],
     slot: ProfileSlot,
 ) -> Result<(), String> {
-    let policy = CachePolicy::default();
-    for spec in plan
-        .iter()
-        .filter(|spec| spec.layer == slot.layer() || spec.layer == slot.static_layer())
-    {
-        let rendered = nodus_server_media::process::render_one(source, kind, spec)
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(reason) = rendered.still_reason {
-            tracing::info!(
-                reason = reason.as_str(),
-                media = %row.id,
-                "a profile picture was rendered still"
-            );
-        }
-        let digest = hex(&Sha256::digest(&rendered.bytes));
-        let dir = variants_dir();
-        tokio::fs::write(dir.join(&digest), &rendered.bytes)
-            .await
-            .map_err(|error| error.to_string())?;
-        media::upsert_variant(
-            state.store().pool(),
-            &VariantRow {
-                media_id: row.id.clone(),
-                layer: spec.layer.as_str().to_owned(),
-                max_edge: i64::from(spec.max_edge),
-                object_key: nodus_server_media::object_key(&row.digest, &digest, spec.layer),
-                content_type: rendered.content_type.to_owned(),
-                digest,
-                size: i64::try_from(rendered.bytes.len()).unwrap_or(i64::MAX),
-                width: None,
-                height: None,
-                expires_at: expires_in(policy, spec).and_then(|ttl| {
-                    chrono::Duration::from_std(ttl)
-                        .ok()
-                        .map(|ttl| Utc::now() + ttl)
-                }),
-                created_at: Utc::now(),
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    nodus_server_media::profile::write_layers(
+        state.store().pool(),
+        &variants_dir(),
+        row,
+        kind,
+        source,
+        slot.layer(),
+    )
+    .await
+    .map(drop)
 }
 
 /// A local path to the original, fetching it from the media cluster when this host does
