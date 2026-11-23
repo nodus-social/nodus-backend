@@ -41,6 +41,7 @@ pub mod nodeinfo;
 pub mod nodus;
 pub mod notifications;
 pub mod outbox;
+pub mod pages;
 pub mod poll_votes;
 pub mod polls;
 pub mod preferences;
@@ -157,6 +158,8 @@ pub fn router(state: AppState) -> axum::Router {
             get(statuses::account_statuses),
         )
         .route("/api/v1/statuses/{id}/reactions", get(reactions::list))
+        .route("/api/v1/pages/profile/{id}", get(pages::profile))
+        .route("/api/v1/pages/status/{id}", get(pages::status))
         .merge(misskey::router())
         .merge(miauth::router())
         .merge(nodus::router())

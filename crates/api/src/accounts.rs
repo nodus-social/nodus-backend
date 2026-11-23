@@ -173,7 +173,7 @@ pub struct RelationshipDto {
 }
 
 impl RelationshipDto {
-    fn new(id: &str, relationship: &Relationship) -> Self {
+    pub(crate) fn new(id: &str, relationship: &Relationship) -> Self {
         Self {
             id: id.to_owned(),
             following: relationship.following,

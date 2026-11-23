@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// have without losing the area's door — and a peer that serves them all must draw every
 /// one. New names are appended rather than sorted: clients compare the array, so a reorder
 /// is churn with no meaning.
-pub const FEATURES: [&str; 66] = [
+pub const FEATURES: [&str; 67] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -148,6 +148,9 @@ pub const FEATURES: [&str; 66] = [
     // one's own account): the public list is also served at
     // `/api/v1/accounts/{id}/featured_tags`, and the owner's verbs manage it.
     "featured_tags", // GET|POST /api/v1/featured_tags, /suggestions; DELETE /{id}
+    // The backend-assembled page payloads: a profile with its statuses, a status with its
+    // thread. The shell gates its one-call profile and thread screens on this name.
+    "pages", // GET /api/v1/pages/profile/{id}, /api/v1/pages/status/{id}
 ];
 
 /// The capability names this deployment can actually honour, as owned strings.

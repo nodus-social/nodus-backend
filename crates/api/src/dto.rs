@@ -13,7 +13,7 @@ use nodus_server_core::limits::{
 use nodus_server_core::Id;
 use nodus_server_store::accounts::AccountRow;
 use nodus_server_store::media::MediaRow;
-use nodus_server_store::statuses::StatusRow;
+use nodus_server_store::statuses::{ReactionCount, StatusRow};
 
 use crate::media::ProfileSlot;
 use crate::state::InstanceConfig;
@@ -291,6 +291,11 @@ pub struct StatusDto {
     pub reblogged: bool,
     pub muted: bool,
     pub bookmarked: bool,
+    /// Reaction chips, filled by the page endpoints from their one batched read. Empty
+    /// on every other surface, and omitted rather than serialised as `[]` so those
+    /// payloads stay exactly what they were before pages existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<ReactionCount>,
 }
 
 #[derive(Debug, Serialize)]
@@ -473,6 +478,7 @@ impl StatusDto {
             reblogged: false,
             muted: false,
             bookmarked: false,
+            reactions: Vec::new(),
         }
     }
 }

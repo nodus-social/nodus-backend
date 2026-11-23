@@ -296,6 +296,14 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/featured_tags",
         owner: Owner::Api,
     },
+    // The backend-assembled page payloads. One name covers both shapes because a client
+    // gates the profile screen and the thread screen together; each handler is a separate
+    // page in the same surface.
+    Capability {
+        name: "pages",
+        path: "/api/v1/pages/profile/{id}",
+        owner: Owner::Api,
+    },
     // The administration pages. `admin` above is the door; these are the rooms behind it.
     // Each probe is the first route the page calls; the split and its handler family are
     // stated in `ADMIN_PAGES` below, where `every_admin_page_capability_is_backed` holds
@@ -809,8 +817,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        66,
-        "/api/v1/meta must answer 66 unique names: {advertised_names:?}"
+        67,
+        "/api/v1/meta must answer 67 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -820,11 +828,12 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        66,
-        "the published vocabulary is 66 unique names: 42 before the page split, the 20 page \
+        67,
+        "the published vocabulary is 67 unique names: 42 before the page split, the 20 page \
          names (21 pages, `moderation_rules` already present, so no duplicate), the 2 \
          relationship lists (`mutes`, `blocks`), the personal domain list \
-         (`domain_blocks`), and the profile's featured tags (`featured_tags`)"
+         (`domain_blocks`), the profile's featured tags (`featured_tags`), and the \
+         backend-assembled pages (`pages`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1499,6 +1508,11 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
     SurfaceGroup {
         prefix: "/api/v1/featured_tags",
         features: &["featured_tags"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/pages",
+        features: &["pages"],
         reason: "",
     },
     SurfaceGroup {
