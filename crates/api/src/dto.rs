@@ -12,6 +12,7 @@ use nodus_server_core::limits::{
 };
 use nodus_server_core::Id;
 use nodus_server_store::accounts::AccountRow;
+use nodus_server_store::hydrate::{PictureSize, ProfilePictures, RowMap};
 use nodus_server_store::media::MediaRow;
 use nodus_server_store::statuses::{ReactionCount, StatusRow};
 
@@ -98,6 +99,50 @@ pub struct AccountRoleDto {
     pub name: &'static str,
 }
 
+/// The shape of one profile picture, in the object Mastodon's media `meta` uses.
+///
+/// `size` is the `"WxH"` spelling clients compare as a string and `aspect` is width over
+/// height, which is what a browser needs before the bytes arrive.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PictureMeta {
+    pub width: i32,
+    pub height: i32,
+    pub size: String,
+    pub aspect: f64,
+}
+
+impl PictureMeta {
+    fn from_size(size: PictureSize) -> Self {
+        Self {
+            width: size.width,
+            height: size.height,
+            size: format!("{}x{}", size.width, size.height),
+            aspect: f64::from(size.width) / f64::from(size.height.max(1)),
+        }
+    }
+}
+
+/// An account picture's metadata.
+///
+/// Upstream nests `original` and `small` because it keeps the upload and a thumbnail.
+/// This server renders one profile-sized layer per slot, so `original` describes the
+/// picture the URL serves and `small` is `null` rather than a duplicate size pretending
+/// to be a second rendition.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountPictureMeta {
+    pub original: PictureMeta,
+    pub small: Option<PictureMeta>,
+}
+
+impl AccountPictureMeta {
+    fn from_size(size: PictureSize) -> Self {
+        Self {
+            original: PictureMeta::from_size(size),
+            small: None,
+        }
+    }
+}
+
 /// The two spellings of a stored staff role: Mastodon's display name and nodus's value.
 ///
 /// `None` for `none`, which is how both a regular account and a read-only public document
@@ -127,6 +172,11 @@ pub struct AccountDto {
     pub avatar_static: String,
     pub header: String,
     pub header_static: String,
+    /// Rendered avatar shape, `null` when the picture has no variant row yet (a remote
+    /// account, the default asset, or a render still in flight).
+    pub avatar_meta: Option<AccountPictureMeta>,
+    /// Rendered header shape, absent on the same terms as `avatar_meta`.
+    pub header_meta: Option<AccountPictureMeta>,
     pub followers_count: i64,
     pub following_count: i64,
     pub statuses_count: i64,
@@ -228,6 +278,8 @@ impl AccountDto {
             avatar_static: still_url(&avatar),
             header: header.clone(),
             header_static: still_url(&header),
+            avatar_meta: None,
+            header_meta: None,
             followers_count: row.followers_count,
             following_count: row.following_count,
             statuses_count: row.statuses_count,
@@ -243,6 +295,25 @@ impl AccountDto {
             role: staff_role_spellings(&row.staff_role).map(|(name, _)| AccountRoleDto { name }),
             staff_role: None,
         }
+    }
+
+    /// The same account document with the picture shapes the page's batch read.
+    #[must_use]
+    pub fn with_pictures(mut self, pictures: Option<&ProfilePictures>) -> Self {
+        self.apply_pictures(pictures);
+        self
+    }
+
+    /// Replaces both picture metas from one account's batch entry. A missing picture
+    /// clears both fields, so one DTO shape cannot keep a stale shape from a previous
+    /// caller.
+    pub fn apply_pictures(&mut self, pictures: Option<&ProfilePictures>) {
+        self.avatar_meta = pictures
+            .and_then(|pictures| pictures.avatar)
+            .map(AccountPictureMeta::from_size);
+        self.header_meta = pictures
+            .and_then(|pictures| pictures.header)
+            .map(AccountPictureMeta::from_size);
     }
 
     /// The account's own document: the public shape plus its nodus `staff_role`.
@@ -430,6 +501,17 @@ impl StatusDto {
     #[must_use]
     pub fn from_row(row: &StatusRow, account: &AccountRow, instance: &InstanceConfig) -> Self {
         Self::from_row_with_media(row, account, instance, &[])
+    }
+
+    /// Applies the page's picture shapes to this status's author and its boost's author.
+    ///
+    /// The map is keyed by account id, so a reblog that names a different account gets
+    /// that account's shape rather than its booster's.
+    pub fn apply_account_pictures(&mut self, pictures: &RowMap<ProfilePictures>) {
+        self.account.apply_pictures(pictures.get(&self.account.id));
+        if let Some(reblog) = self.reblog.as_mut() {
+            reblog.apply_account_pictures(pictures);
+        }
     }
 
     /// Builds a status with its already-loaded attachments.

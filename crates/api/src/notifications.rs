@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use nodus_server_core::limits::PAGE_MAX;
 use nodus_server_core::pagination::PageSize;
 use nodus_server_store::accounts::AccountRow;
-use nodus_server_store::hydrate::PollFacts;
+use nodus_server_store::hydrate::{PollFacts, ProfilePictures};
 use nodus_server_store::media::MediaRow;
 use nodus_server_store::social::{NotificationRow, ViewerFlags};
 use nodus_server_store::statuses::StatusRow;
@@ -283,6 +283,7 @@ struct PageParts {
     media: RowMap<Vec<MediaRow>>,
     decorations: RowMap<StatusDecorations>,
     polls: RowMap<PollFacts>,
+    pictures: RowMap<ProfilePictures>,
     flags: HashMap<String, ViewerFlags>,
 }
 
@@ -331,6 +332,7 @@ async fn page_parts(
         .store()
         .batch()
         .accounts(&account_ids)
+        .profile_pictures(&account_ids)
         .media_by_status(&page_ids)
         .decorations(&page_ids)
         .polls(&page_ids, Some(viewer))
@@ -343,6 +345,7 @@ async fn page_parts(
         media: hydrated.media_by_status,
         decorations: hydrated.decorations,
         polls: hydrated.polls,
+        pictures: hydrated.profile_pictures,
         flags,
     })
 }
@@ -359,6 +362,7 @@ fn status_from_page(
     };
     let media = parts.media.get(&row.id).map_or(&[][..], Vec::as_slice);
     let mut dto = StatusDto::from_row_with_media(row, account, state.instance(), media);
+    dto.apply_account_pictures(&parts.pictures);
     if let Some(decorations) = parts.decorations.get(&row.id) {
         statuses::apply_decorations(&mut dto, decorations, state.instance());
     }
@@ -411,7 +415,8 @@ fn dto_from_page(
         id: row.id.clone(),
         kind,
         created_at: row.created_at,
-        account: AccountDto::from_row(account, state.instance()),
+        account: AccountDto::from_row(account, state.instance())
+            .with_pictures(parts.pictures.get(&row.from_account_id)),
         status,
         group_key: format!(
             "{}:{}",

@@ -3,7 +3,9 @@
 #[path = "hydrate/support.rs"]
 mod support;
 
-use nodus_server_store::hydrate::{MentionRow, StatusDecorations, TransactionSettings};
+use nodus_server_store::hydrate::{
+    MentionRow, PictureSize, ProfilePictures, StatusDecorations, TransactionSettings,
+};
 use nodus_server_store::media;
 use nodus_server_store::social::{self, Relationship};
 use nodus_server_store::statuses::{self, ReactionCount, StatusEmoji};
@@ -247,6 +249,111 @@ async fn optional_ops_run_after_the_essential_transaction_commits() {
         .collect(),
         "the same op answers once the table is free"
     );
+
+    cleanup(&pool, &schema).await;
+}
+
+/// A profile picture's shape comes from the variant row its reference names: the highest
+/// edge wins, a bare reference means its slot's layer, and a picture with no variant — a
+/// remote account, a missing render — is absent rather than a square placeholder.
+#[tokio::test]
+async fn profile_pictures_read_the_named_layer_and_leave_unrendered_pictures_absent() {
+    let Some((store, pool, schema)) = setup().await else {
+        return;
+    };
+    let alice = account(&pool, "alice").await;
+    let remote = account(&pool, "remote").await;
+    let unrendered = account(&pool, "unrendered").await;
+    execute(
+        &pool,
+        "INSERT INTO media_attachment (id, account_id, digest, content_type, size) \
+         VALUES ('avatar-media', $1, 'avatar-digest', 'image/png', 1), \
+                ('header-media', $1, 'header-digest', 'image/png', 1)",
+        &[&alice],
+    )
+    .await;
+    execute(
+        &pool,
+        "UPDATE account SET avatar_ref = 'avatar-media/avatar', header_ref = 'header-media' \
+         WHERE id = $1",
+        &[&alice],
+    )
+    .await;
+    execute(
+        &pool,
+        "UPDATE account SET avatar_url = 'https://remote.example/avatar.png' WHERE id = $1",
+        &[&remote],
+    )
+    .await;
+    execute(
+        &pool,
+        "UPDATE account SET avatar_ref = 'gone-media/avatar' WHERE id = $1",
+        &[&unrendered],
+    )
+    .await;
+    for (media_id, layer, max_edge, width, height) in [
+        ("avatar-media", "avatar", 100, 100, 100),
+        ("avatar-media", "avatar", 400, 400, 300),
+        ("avatar-media", "preview", 800, 800, 600),
+        ("header-media", "header", 1500, 1500, 500),
+    ] {
+        media::upsert_variant(
+            &pool,
+            &media::VariantRow {
+                media_id: media_id.to_owned(),
+                layer: layer.to_owned(),
+                max_edge,
+                object_key: format!("media/{media_id}/{layer}"),
+                content_type: "image/webp".to_owned(),
+                digest: format!("{media_id}-{max_edge}"),
+                size: 1,
+                width: Some(width),
+                height: Some(height),
+                expires_at: None,
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("insert variant");
+    }
+
+    let outcome = store
+        .batch()
+        .profile_pictures(&[
+            alice.clone(),
+            remote.clone(),
+            unrendered.clone(),
+            "no-such-account".to_owned(),
+        ])
+        .run()
+        .await
+        .expect("run the batch");
+
+    assert_eq!(
+        outcome.profile_pictures.get(&alice),
+        Some(&ProfilePictures {
+            avatar: Some(PictureSize {
+                width: 400,
+                height: 300,
+            }),
+            header: Some(PictureSize {
+                width: 1500,
+                height: 500,
+            }),
+        }),
+        "the named avatar layer's highest edge, and the bare header reference's header layer"
+    );
+    assert_eq!(
+        outcome.profile_pictures.get(&remote),
+        None,
+        "remote picture"
+    );
+    assert_eq!(
+        outcome.profile_pictures.get(&unrendered),
+        None,
+        "a reference with no variant row is absent, not 1x1"
+    );
+    assert!(!outcome.profile_pictures.contains_key("no-such-account"));
 
     cleanup(&pool, &schema).await;
 }

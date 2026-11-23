@@ -63,6 +63,20 @@ pub struct Rendered {
     pub still_reason: Option<StillReason>,
 }
 
+/// The pixel shape of encoded image bytes.
+///
+/// Variant rows record a width and a height so a client can reserve the box before the
+/// bytes arrive. The encoder's output is the only thing that knows the shape it chose, so
+/// profile and upload writes read it back from the bytes they just produced. `None` for a
+/// format this build cannot decode (a lossless video passthrough, for instance) keeps the
+/// column honest rather than guessing the source's shape.
+#[must_use]
+pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::load_from_memory(bytes)
+        .ok()
+        .map(|image| (image.width(), image.height()))
+}
+
 /// Encodes one planned variant from `source`.
 ///
 /// # Errors

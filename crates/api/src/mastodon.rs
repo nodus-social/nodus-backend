@@ -278,6 +278,7 @@ async fn timeline_response(
         .store()
         .batch()
         .accounts(&author_ids)
+        .profile_pictures(&author_ids)
         .media_by_status(&status_ids)
         .decorations(&status_ids)
         .polls(&status_ids, viewer)
@@ -295,6 +296,7 @@ async fn timeline_response(
             .get(&row.id)
             .map_or(&[][..], Vec::as_slice);
         let mut dto = StatusDto::from_row_with_media(&row, account, instance, attachments);
+        dto.apply_account_pictures(&hydrated.profile_pictures);
         // Tags, emoji and mentions come from the same batch as the authors: a row with no
         // decorations is absent from the map and keeps the empty lists the DTO starts with.
         if let Some(decorations) = hydrated.decorations.get(&row.id) {

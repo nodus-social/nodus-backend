@@ -111,10 +111,22 @@ async fn the_rendered_layers_are_the_profile_sizes() {
             400,
             "an avatar is drawn at 400 px"
         );
+        assert_eq!(avatar.width, Some(400), "the avatar row records its width");
+        assert_eq!(
+            avatar.height,
+            Some(300),
+            "1600x1200 at 400 px is 400x300, not a square"
+        );
         assert_eq!(
             probe_edge(&read_variant(&fixture.variants, &header).await).await,
             1500,
             "a header is drawn at 1500 px"
+        );
+        assert_eq!(header.width, Some(1500), "the header row records its width");
+        assert_eq!(
+            header.height,
+            Some(1125),
+            "1500 px from 1600x1200 is 1125 tall"
         );
     })
     .await;

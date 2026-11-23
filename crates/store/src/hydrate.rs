@@ -12,6 +12,7 @@ mod decorations;
 mod external_ids;
 mod polls;
 mod probe;
+mod profile_pictures;
 mod relationships;
 
 pub use decorations::{MentionRow, StatusDecorations};
@@ -19,6 +20,7 @@ pub use external_ids::ExternalIds;
 pub use polls::PollFacts;
 #[doc(hidden)]
 pub use probe::TransactionSettings;
+pub use profile_pictures::{PictureSize, ProfilePictures};
 
 use std::collections::BTreeMap;
 
@@ -52,6 +54,7 @@ enum EssentialOp {
         statuses: Vec<String>,
         viewer: Option<String>,
     },
+    ProfilePictures(Vec<String>),
     TransactionSettings,
 }
 
@@ -130,6 +133,7 @@ impl Batch<'_> {
             decorations: RowMap::new(),
             external_ids: ExternalIds::default(),
             polls: RowMap::new(),
+            profile_pictures: RowMap::new(),
             reactions: Ok(RowMap::new()),
             transaction_settings: None,
         };
@@ -155,6 +159,10 @@ impl Batch<'_> {
                 EssentialOp::Polls { statuses, viewer } => {
                     outcome.polls =
                         polls::fetch_polls(&mut tx, statuses, viewer.as_deref()).await?;
+                }
+                EssentialOp::ProfilePictures(ids) => {
+                    outcome.profile_pictures =
+                        profile_pictures::fetch_profile_pictures(&mut *tx, ids).await?;
                 }
                 EssentialOp::TransactionSettings => {
                     outcome.transaction_settings =
@@ -187,6 +195,9 @@ pub struct BatchOutcome {
     pub external_ids: ExternalIds,
     /// Polls keyed by status id, tallies counted; a status with none is absent.
     pub polls: RowMap<PollFacts>,
+    /// Rendered profile picture shapes keyed by account id; a picture with no variant is
+    /// absent.
+    pub profile_pictures: RowMap<ProfilePictures>,
     /// Reaction counts, keyed by status id, or the optional op's failure.
     pub reactions: Result<RowMap<Vec<ReactionCount>>, StoreError>,
     /// What Postgres reported about the essential transaction, when the test-only

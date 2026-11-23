@@ -209,7 +209,16 @@ pub async fn show(
     if account.deleted_at.is_some() {
         return Err(ApiError::not_found("Record not found"));
     }
-    Ok(Json(AccountDto::from_row(&account, state.instance())))
+    let pictures = state
+        .store()
+        .batch()
+        .profile_pictures(std::slice::from_ref(&account.id))
+        .run()
+        .await?;
+    Ok(Json(
+        AccountDto::from_row(&account, state.instance())
+            .with_pictures(pictures.profile_pictures.get(&account.id)),
+    ))
 }
 
 /// `DELETE /api/v1/accounts/{id}` — ask to leave.

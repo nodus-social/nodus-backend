@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use nodus_server_core::PageParams;
-use nodus_server_store::hydrate::{BatchOutcome, RowMap};
+use nodus_server_store::hydrate::{BatchOutcome, ProfilePictures, RowMap};
 use nodus_server_store::social::ViewerFlags;
 use nodus_server_store::statuses::{ProfileFilters, ReactionCount, StatusRow};
 
@@ -192,14 +192,15 @@ pub async fn profile(
         None
     };
     let targets: Vec<String> = viewer.map(|_| id.clone()).into_iter().collect();
-    let (statuses, relationships) = hydrate_statuses(&state, page.items, viewer, &targets).await?;
+    let (statuses, relationships, pictures) =
+        hydrate_statuses(&state, page.items, viewer, &targets, Some(&id)).await?;
     let relationship = viewer.and_then(|_| {
         relationships
             .get(&id)
             .map(|relationship| RelationshipDto::new(&id, relationship))
     });
     Ok(Json(ProfilePageDto {
-        account: AccountDto::from_row(&account, state.instance()),
+        account: AccountDto::from_row(&account, state.instance()).with_pictures(pictures.get(&id)),
         statuses,
         relationship,
         page: PageCursors { next, prev },
@@ -224,7 +225,7 @@ pub async fn status(
     rows.push(focused.clone());
     rows.extend(ancestors);
     rows.extend(descendants);
-    let (statuses, _) = hydrate_statuses(&state, rows, viewer, &[]).await?;
+    let (statuses, _, _) = hydrate_statuses(&state, rows, viewer, &[], None).await?;
     let mut by_id: HashMap<String, StatusDto> = statuses
         .into_iter()
         .map(|dto| (dto.id.clone(), dto))
@@ -258,9 +259,11 @@ async fn hydrate_statuses(
     rows: Vec<StatusRow>,
     viewer: Option<&str>,
     relationship_targets: &[String],
+    profile_account: Option<&str>,
 ) -> ApiResult<(
     Vec<StatusDto>,
     RowMap<nodus_server_store::social::Relationship>,
+    RowMap<ProfilePictures>,
 )> {
     let mut all_ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
     let mut reblog_ids: Vec<String> = rows
@@ -300,12 +303,19 @@ async fn hydrate_statuses(
         .collect();
     author_ids.sort_unstable();
     author_ids.dedup();
+    // The profile's own account may have no status on this page, but its pictures come
+    // from the page's batch all the same: a profile with an empty outbox still has a face.
+    let mut picture_ids = author_ids.clone();
+    picture_ids.extend(profile_account.map(str::to_owned));
+    picture_ids.sort_unstable();
+    picture_ids.dedup();
 
     let outcome = if relationship_targets.is_empty() {
         state
             .store()
             .batch()
             .accounts(&author_ids)
+            .profile_pictures(&picture_ids)
             .media_by_status(&status_ids)
             .decorations(&status_ids)
             .polls(&status_ids, viewer)
@@ -317,6 +327,7 @@ async fn hydrate_statuses(
             .store()
             .batch()
             .accounts(&author_ids)
+            .profile_pictures(&picture_ids)
             .media_by_status(&status_ids)
             .decorations(&status_ids)
             .polls(&status_ids, viewer)
@@ -355,7 +366,7 @@ async fn hydrate_statuses(
         }
         statuses.push(dto);
     }
-    Ok((statuses, outcome.relationships))
+    Ok((statuses, outcome.relationships, outcome.profile_pictures))
 }
 
 /// Keeps the rows a reader may see, in the order they arrived.
@@ -397,6 +408,7 @@ fn build_dto(
         .get(&row.id)
         .map_or(&[][..], Vec::as_slice);
     let mut dto = StatusDto::from_row_with_media(row, account, instance, attachments);
+    dto.apply_account_pictures(&outcome.profile_pictures);
     if let Some(decorations) = outcome.decorations.get(&row.id) {
         crate::statuses::apply_decorations(&mut dto, decorations, instance);
     }

@@ -668,6 +668,7 @@ async fn process_upload_in(
         match nodus_server_media::process::render_one(&source, kind, spec).await {
             Ok(rendered) => {
                 let digest = hex(&Sha256::digest(&rendered.bytes));
+                let dimensions = nodus_server_media::process::image_dimensions(&rendered.bytes);
                 let path = variant_dir.join(&digest);
                 if let Err(error) = tokio::fs::write(&path, &rendered.bytes).await {
                     return UploadOutcome::Failed(error.to_string());
@@ -684,8 +685,8 @@ async fn process_upload_in(
                     },
                     digest,
                     size: i64::try_from(rendered.bytes.len()).unwrap_or(i64::MAX),
-                    width: None,
-                    height: None,
+                    width: dimensions.and_then(|(width, _)| i32::try_from(width).ok()),
+                    height: dimensions.and_then(|(_, height)| i32::try_from(height).ok()),
                     expires_at: expires_in(policy, spec).and_then(|ttl| {
                         chrono::Duration::from_std(ttl)
                             .ok()

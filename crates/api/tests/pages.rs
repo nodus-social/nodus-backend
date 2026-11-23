@@ -570,7 +570,11 @@ async fn page_reads_do_not_grow_with_the_number_of_posts() {
              (N=1 {one}, N=20 {twenty})"
         );
         assert_eq!(reaction_reads, 1, "reaction chips came from one read");
-        assert_eq!(one, 13, "the profile page's statement count changed");
+        assert_eq!(
+            one, 14,
+            "the profile page's statement count changed: the picture-shape op is one \
+             page-level read, not one per account"
+        );
         let id_commits = table_reads(&log, COMMIT);
 
         // The handle form resolves the account inside the same snapshot as the page: one
@@ -638,8 +642,9 @@ async fn page_reads_do_not_grow_with_the_number_of_posts() {
         );
         assert_eq!(media_reads, 1, "attachments came from one read");
         assert_eq!(
-            thread_reads, 12,
-            "the thread page's statement count changed"
+            thread_reads, 13,
+            "the thread page's statement count changed: one picture-shape read covers every \
+             author on the page"
         );
     })
     .await;

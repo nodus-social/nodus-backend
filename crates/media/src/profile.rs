@@ -95,6 +95,7 @@ async fn render_layer(
         );
     }
     let digest = hex(&Sha256::digest(&rendered.bytes));
+    let dimensions = process::image_dimensions(&rendered.bytes);
     tokio::fs::write(variants.join(&digest), &rendered.bytes)
         .await
         .map_err(|error| error.to_string())?;
@@ -109,8 +110,8 @@ async fn render_layer(
             content_type: rendered.content_type.to_owned(),
             digest,
             size: i64::try_from(rendered.bytes.len()).unwrap_or(i64::MAX),
-            width: None,
-            height: None,
+            width: dimensions.and_then(|(width, _)| i32::try_from(width).ok()),
+            height: dimensions.and_then(|(_, height)| i32::try_from(height).ok()),
             expires_at: None,
             created_at: sqlx::types::chrono::Utc::now(),
         },
