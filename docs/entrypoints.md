@@ -20,7 +20,7 @@ every `ExecStart=` still names `nodus-api` and friends.
 | --- | --- | --- | --- |
 | `api` | `nodus_server_api::run()` | `NODUS_BIND`, default `0.0.0.0:3000` | the API's environment: `NODUS_BIND`, `NODUS_DATABASE_URL`, `NODUS_DOMAIN`, `NODUS_BASE_URL`, `NODUS_AUTH_SECURE_COOKIES`, `NODUS_REGISTRATIONS_OPEN`, `NODUS_AUTHORIZED_FETCH`, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND`, bootstrap and instance settings |
 | `media-worker` | `nodus_server_media::run()` | `NODUS_BIND`, default `0.0.0.0:3000` | `NODUS_BIND`, `NODUS_DATABASE_URL`, `NODUS_MEDIA_DIR`, `NODUS_MEDIA_VARIANTS_DIR`, `NODUS_MEDIA_NODE`, `NODUS_MEDIA_ENDPOINT`, `NODUS_MEDIA_CLUSTER_TOKEN`, `NODUS_MEDIA_REPAIR`, `NODUS_MEDIA_REPAIR_SECS`, `NODUS_MEDIA_VIDEO_CODEC` (`vp8` default / `vp9`), `NODUS_TELEMETRY_SOCKET` |
-| `feed` | `nodus_server_feed::run()` | `NODUS_BIND`, default `0.0.0.0:3000` | `NODUS_BIND`, `NODUS_DATABASE_URL`, `NODUS_DOMAIN`, the recommendation store and cache, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND` |
+| `feed` | `nodus_server_feed::run()` | `NODUS_BIND`, default `0.0.0.0:3000` | `NODUS_BIND`, `NODUS_DATABASE_URL`, `NODUS_DOMAIN`, `TOKEN_ENC_KEY`, the recommendation store and cache, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND` |
 | `scan` | `nodus_server_scan::run()` | nothing, unless telemetry is configured: then `NODUS_TELEMETRY_SOCKET` or `NODUS_TELEMETRY_BIND` | `NODUS_DATABASE_URL`, the scanner endpoints, the sweep interval, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND` |
 | `prune` | `nodus_server_prune::run()` | nothing, unless telemetry is configured, as `scan` | `NODUS_DATABASE_URL`, `NODUS_MEDIA_DIR`, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND` |
 | `calc` | `nodus_server_calc::run()` | nothing, unless telemetry is configured, as `scan` | `NODUS_DATABASE_URL` (falling back to `NODUS_DATABASE_URL` from `DATABASE_URL`), `TOKEN_ENC_KEY`, the cache and crawl settings, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND` |
@@ -29,6 +29,19 @@ every `ExecStart=` still names `nodus-api` and friends.
 `aio` is api plus media only. The three workers are deliberately not in it: they
 are long-running loops rather than listeners, and folding them in would give one
 process the failure domain of four services.
+
+## `TOKEN_ENC_KEY`
+
+`feed` and `calc` both read `TOKEN_ENC_KEY`: a base64-encoded 32-byte key
+(`openssl rand -base64 32`) that seals the instance tokens stored for background
+sync. It has no `NODUS_` prefix; that spelling appears in older notes and is not
+read. Without it `feed` starts but `/api/v1/sync/*` answers 503 `sync_disabled`
+while `/api/v1/meta` still advertises `sync_token`, so the release script refuses
+to install a feed role on a host whose env file has no valid key.
+
+**Never rotate this key without a re-seal plan.** It encrypts every token in the
+database; a new key makes all existing sealed values undecryptable, and nothing
+re-seals them automatically. Generate it once per host, persist it, and reuse it.
 
 `nodus` with no arguments, `nodus --help` and `nodus -h` print the seven roles
 and exit 0. Any other first argument exits 2 and names the accepted set.

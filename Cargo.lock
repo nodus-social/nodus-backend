@@ -2727,6 +2727,7 @@ dependencies = [
  "nodus-feeds",
  "nodus-server-runtime",
  "nodus-server-transport",
+ "nodus-store",
  "tokio",
  "tracing",
 ]

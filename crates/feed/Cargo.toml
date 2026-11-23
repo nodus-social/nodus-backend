@@ -13,6 +13,7 @@ anyhow.workspace = true
 nodus-feeds = { path = "../../../recommender/crates/feeds" }
 nodus-server-runtime = { path = "../runtime" }
 nodus-server-transport = { path = "../transport" }
+nodus-store = { path = "../../../recommender/crates/store" }
 
 tokio.workspace = true
 tracing.workspace = true

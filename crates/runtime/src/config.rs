@@ -93,6 +93,12 @@ pub struct Config {
     /// here so a typo fails startup instead of the first uploaded video.
     pub video_codec: VideoCodec,
     pub migrate_only: bool,
+    /// `TOKEN_ENC_KEY`, the base64 32-byte key that seals stored instance tokens.
+    ///
+    /// Left undecoded here because only the feed and calc processes use it; each parses
+    /// it at boot so an unusable value stops that process, not every role. Absent means
+    /// background sync cannot work, which the feed says out loud at startup.
+    pub token_enc_key: Option<String>,
     pub bootstrap: Option<Bootstrap>,
     /// Where this process answers questions about itself, if anywhere.
     pub telemetry: Option<Address>,
@@ -204,6 +210,9 @@ pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
         account_delete_grace_days,
         video_codec,
         migrate_only: env::args().any(|argument| argument == "--migrate-only"),
+        token_enc_key: env::var("TOKEN_ENC_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
         bootstrap,
         telemetry,
     })

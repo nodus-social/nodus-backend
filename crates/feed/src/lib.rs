@@ -8,6 +8,7 @@ use std::future::Future;
 
 use anyhow::anyhow;
 use nodus_server_runtime::{self as runtime, Config};
+use nodus_store::crypto::TokenSealer;
 
 /// What `nodus feed` starts and where it listens, without binding.
 #[must_use]
@@ -55,9 +56,29 @@ where
         &config.database_url,
         &config.instance.base_url,
         config.database_connections,
+        token_enc_key(&config)?,
     )
     .await?;
     tracing::info!(address = %config.bind, "feed listening");
     nodus_server_transport::serve_http(&config.bind, router, shutdown).await?;
     Ok(())
+}
+
+/// Parse `TOKEN_ENC_KEY` into the sealer the sync surface needs.
+///
+/// Absent is not fatal — a deployment may choose not to sync — but `/api/v1/meta`
+/// advertises `sync_token`, so the feed says out loud what a caller will hit instead of
+/// letting the capability fail quietly. A value that is present and unusable stops the
+/// process: that is a mistyped key, not a choice.
+fn token_enc_key(config: &Config) -> anyhow::Result<Option<TokenSealer>> {
+    let Some(raw) = config.token_enc_key.as_deref() else {
+        tracing::warn!(
+            "TOKEN_ENC_KEY is not set; /api/v1/meta advertises sync_token but \
+             POST /api/v1/sync/authorize will answer 503 sync_disabled"
+        );
+        return Ok(None);
+    };
+    TokenSealer::from_base64(raw)
+        .map(Some)
+        .map_err(|error| anyhow!("TOKEN_ENC_KEY is not usable: {error}"))
 }
