@@ -34,6 +34,9 @@ use crate::store::{
 
 pub mod domain;
 pub mod outbox;
+mod password_reset;
+mod password_reset_mail;
+mod password_reset_pages;
 pub mod store;
 pub mod totp;
 
@@ -243,6 +246,14 @@ pub fn router<S: AuthStore>(state: AppState<S>) -> Router {
             get(register_page::<S>).post(register_submit::<S>),
         )
         .route("/auth/logout", post(logout::<S>))
+        .route(
+            "/auth/password/reset",
+            get(password_reset::request_page::<S>).post(password_reset::request_submit::<S>),
+        )
+        .route(
+            "/auth/password/reset/{token}",
+            get(password_reset::form_page::<S>).post(password_reset::form_submit::<S>),
+        )
         .route("/auth/confirm/{token}", get(confirm_page::<S>))
         .route(
             "/auth/2fa",
@@ -498,20 +509,28 @@ fn normalized_registration(form: &RegisterForm) -> Result<Registration, &'static
         return Err("That does not look like an email address.");
     }
     let password = form.password.clone();
+    validated_password(&password, &form.password_confirmation)?;
+    Ok(Registration {
+        username,
+        email: email.to_owned(),
+        password,
+    })
+}
+
+/// The one password rule, shared by registration and password reset.
+///
+/// A second rule would drift, and a reset would then accept something sign-up refuses.
+fn validated_password(password: &str, confirmation: &str) -> Result<(), &'static str> {
     if password.chars().count() < PASSWORD_MIN {
         return Err("A password is at least 8 characters.");
     }
     if password.chars().count() > PASSWORD_MAX {
         return Err("That password is too long.");
     }
-    if password != form.password_confirmation {
+    if password != confirmation {
         return Err("The two passwords do not match.");
     }
-    Ok(Registration {
-        username,
-        email: email.to_owned(),
-        password,
-    })
+    Ok(())
 }
 
 /// What passes for an email check here: one `@`, a local part, and a domain with a dot.

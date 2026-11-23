@@ -6,11 +6,20 @@
 
 use std::future::Future;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 
 use crate::outbox::{self, Confirmation};
+
+/// How many reset requests one address may make in [`PASSWORD_RESET_WINDOW_MINUTES`].
+///
+/// One request per window. A retry must wait out the window rather than turning the
+/// endpoint into a cheap way to fill an inbox; the count is per submitted address rather
+/// than per account, so the refusal says nothing about whether a login exists.
+pub const PASSWORD_RESET_MAX_ATTEMPTS: i32 = 1;
+/// The fixed window the reset budget refills on.
+pub const PASSWORD_RESET_WINDOW_MINUTES: i64 = 15;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -266,6 +275,44 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
         token_hash: &str,
         limit: i32,
     ) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// Counts a reset request against the address and says whether it may proceed.
+    ///
+    /// The row is keyed by the submitted address, so an address with no login is counted
+    /// and refused by exactly the same rule; a limiter that only counted known addresses
+    /// would be an enumeration oracle with extra steps.
+    fn allow_password_reset_request(
+        &self,
+        email: &str,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// Replaces the account's live reset links with `reset` and queues its message.
+    ///
+    /// Both writes share a transaction: a link that outlives a rolled-back insert would
+    /// point at nothing, and a message without a row would be a dead link in an inbox.
+    fn enqueue_password_reset(
+        &self,
+        account_id: &str,
+        reset: Confirmation,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// The account behind a live reset token, or `None` when unknown, spent or expired.
+    fn password_reset_account(
+        &self,
+        token_hash: &str,
+    ) -> impl Future<Output = Result<Option<String>, Error>> + Send;
+
+    /// Spends the token, replaces the password and removes every session for the account.
+    ///
+    /// Deleting all sessions in this transaction is deliberate: if the caller then fails
+    /// to mint the new session, the account is still safe, whereas deleting "all but the
+    /// new one" before the new one exists would leave the stolen session alive on the
+    /// error path.
+    fn complete_password_reset(
+        &self,
+        token_hash: &str,
+        password_hash: &str,
+    ) -> impl Future<Output = Result<Option<String>, Error>> + Send;
 }
 
 #[derive(Clone)]
@@ -897,6 +944,138 @@ impl AuthStore for PgAuthStore {
             .await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    async fn allow_password_reset_request(&self, email: &str) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        // The insert is what gives an unknown address a row to lock. Without it the first
+        // request for an address would take a different path than later ones.
+        sqlx::query(
+            "INSERT INTO password_reset_attempt (email) VALUES ($1) ON CONFLICT DO NOTHING",
+        )
+        .bind(email)
+        .execute(&mut *tx)
+        .await?;
+        // FOR UPDATE serialises every request for this address, so parallel requests
+        // cannot all read attempts = limit - 1 and slip through (same shape as the 2FA
+        // challenge counter).
+        let row: (i32, DateTime<Utc>) = sqlx::query_as(
+            "SELECT attempts, window_started_at FROM password_reset_attempt \
+             WHERE email = $1 FOR UPDATE",
+        )
+        .bind(email)
+        .fetch_one(&mut *tx)
+        .await?;
+        let (attempts, window_started_at) = row;
+        let window_start = Utc::now() - Duration::minutes(PASSWORD_RESET_WINDOW_MINUTES);
+        let allowed = if window_started_at < window_start {
+            sqlx::query(
+                "UPDATE password_reset_attempt \
+                 SET attempts = 1, window_started_at = now() WHERE email = $1",
+            )
+            .bind(email)
+            .execute(&mut *tx)
+            .await?;
+            true
+        } else if attempts >= PASSWORD_RESET_MAX_ATTEMPTS {
+            false
+        } else {
+            sqlx::query(
+                "UPDATE password_reset_attempt SET attempts = attempts + 1 WHERE email = $1",
+            )
+            .bind(email)
+            .execute(&mut *tx)
+            .await?;
+            true
+        };
+        tx.commit().await?;
+        Ok(allowed)
+    }
+
+    async fn enqueue_password_reset(
+        &self,
+        account_id: &str,
+        reset: Confirmation,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        // Only the newest link should work. Marking earlier links spent means a second
+        // request cannot leave two live keys to the same account.
+        sqlx::query(
+            "UPDATE password_reset SET used_at = now() \
+             WHERE account_id = $1 AND used_at IS NULL",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO password_reset (token_hash, account_id, expires_at) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(&reset.token_hash)
+        .bind(account_id)
+        .bind(reset.expires_at)
+        .execute(&mut *tx)
+        .await?;
+        outbox::enqueue(&mut *tx, &reset.message).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn password_reset_account(&self, token_hash: &str) -> Result<Option<String>, Error> {
+        let account_id = sqlx::query_scalar(
+            "SELECT account_id FROM password_reset \
+             WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(account_id)
+    }
+
+    async fn complete_password_reset(
+        &self,
+        token_hash: &str,
+        password_hash: &str,
+    ) -> Result<Option<String>, Error> {
+        let mut tx = self.pool.begin().await?;
+        // The UPDATE is the single-use check: two concurrent submissions can both read a
+        // live token, but only one can match `used_at IS NULL` and RETURNING.
+        let account_id: Option<String> = sqlx::query_scalar(
+            "UPDATE password_reset SET used_at = now() \
+             WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() \
+             RETURNING account_id",
+        )
+        .bind(token_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(account_id) = account_id else {
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE account_credential SET password_hash = $2, updated_at = now() \
+             WHERE account_id = $1",
+        )
+        .bind(&account_id)
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await?;
+        // A reset that leaves the stolen session alive is theatre. Every browser session
+        // goes; the handler mints the reset's own session after this commits, so the only
+        // surviving key is the one created from the new password.
+        sqlx::query("DELETE FROM auth_session WHERE account_id = $1")
+            .bind(&account_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE password_reset SET used_at = now() \
+             WHERE account_id = $1 AND token_hash <> $2 AND used_at IS NULL",
+        )
+        .bind(&account_id)
+        .bind(token_hash)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(account_id))
     }
 }
 
