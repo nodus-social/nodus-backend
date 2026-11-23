@@ -1,6 +1,7 @@
 //! Account lookup, follow graph and relationship endpoints.
 
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{FromRequest, Multipart, Path, Query, RawQuery, Request, State};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -17,7 +18,7 @@ use crate::body::{JsonOrForm, OptionalJsonOrForm};
 use crate::dto::AccountDto;
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
-use crate::media::ProfileSlot;
+use crate::media::{ProfileSlot, UploadFile};
 use crate::profile_fields::ProfileFieldInput;
 use crate::state::{AppState, InstanceConfig};
 
@@ -25,7 +26,7 @@ use crate::state::{AppState, InstanceConfig};
 ///
 /// Everything is optional so a form that only changes the display name does not blank the
 /// rest of the profile.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct UpdateCredentials {
     #[serde(default)]
     pub display_name: Option<String>,
@@ -52,14 +53,186 @@ pub struct UpdateCredentials {
     pub fields: Option<Vec<ProfileFieldInput>>,
 }
 
+/// One file part from a multipart credentials form.
+///
+/// The bytes are held until the whole body has been read; the profile itself is written
+/// only after every part has been ingested, so a refused part leaves the profile unchanged.
+struct ProfileUpload {
+    bytes: Vec<u8>,
+    content_type: String,
+    filename: String,
+}
+
+impl ProfileUpload {
+    fn as_upload(&self) -> UploadFile<'_> {
+        UploadFile {
+            bytes: &self.bytes,
+            content_type: &self.content_type,
+            filename: &self.filename,
+            description: "",
+            sensitive: false,
+            lossless: false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProfileUploads {
+    avatar: Option<ProfileUpload>,
+    header: Option<ProfileUpload>,
+}
+
+/// The credentials body in any of the encodings a Mastodon client uses.
+///
+/// A form or JSON body carries attachment ids; a multipart body carries the picture
+/// bytes themselves, which is the only shape that can change a profile picture in one
+/// request.
+pub struct CredentialsBody {
+    values: UpdateCredentials,
+    uploads: ProfileUploads,
+}
+
+impl FromRequest<AppState> for CredentialsBody {
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        let multipart = request
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("multipart/form-data")
+            });
+        if multipart {
+            let multipart = <Multipart as FromRequest<AppState>>::from_request(request, state)
+                .await
+                .map_err(IntoResponse::into_response)?;
+            return read_multipart(multipart)
+                .await
+                .map_err(IntoResponse::into_response);
+        }
+        let JsonOrForm(values) =
+            JsonOrForm::<UpdateCredentials>::from_request(request, state).await?;
+        Ok(Self {
+            values,
+            uploads: ProfileUploads::default(),
+        })
+    }
+}
+
+/// Reads a profile form, keeping file parts in memory until the handler has validated
+/// everything.
+///
+/// The row list is the one parameter the form encoding cannot spell — `fields` is a nested
+/// array and multipart has no nested keys — so it is refused with a sentence rather than
+/// dropped, which would report a save that never happened.
+async fn read_multipart(mut multipart: Multipart) -> ApiResult<CredentialsBody> {
+    let mut values = UpdateCredentials::default();
+    let mut uploads = ProfileUploads::default();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::unprocessable("Malformed multipart body"))?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        if is_fields_part(&name) {
+            return Err(ApiError::unprocessable(
+                "Profile fields cannot be sent in a multipart body: multipart parts have no nested keys, so the rows would be lost. Send the fields in a JSON body; the picture upload may stay multipart.",
+            ));
+        }
+        match name.as_str() {
+            "avatar" | "header" => {
+                if let Some(filename) = field.file_name().map(str::to_owned) {
+                    let content_type = field
+                        .content_type()
+                        .unwrap_or("application/octet-stream")
+                        .to_owned();
+                    let bytes = field
+                        .bytes()
+                        .await
+                        .map_err(|_| ApiError::unprocessable("Could not read the upload"))?
+                        .to_vec();
+                    let upload = ProfileUpload {
+                        bytes,
+                        content_type,
+                        filename,
+                    };
+                    if name == "avatar" {
+                        uploads.avatar = Some(upload);
+                    } else {
+                        uploads.header = Some(upload);
+                    }
+                } else {
+                    let id = field
+                        .text()
+                        .await
+                        .map_err(|_| ApiError::unprocessable(format!("Could not read {name}")))?;
+                    if name == "avatar" {
+                        values.avatar = Some(id);
+                    } else {
+                        values.header = Some(id);
+                    }
+                }
+            }
+            _ => {
+                if let Some(filename) = field.file_name() {
+                    return Err(ApiError::unprocessable(format!(
+                        "Multipart part \u{201c}{name}\u{201d} (file {filename}) is not a profile picture: only avatar and header may carry a file."
+                    )));
+                }
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|_| ApiError::unprocessable(format!("Could not read {name}")))?;
+                match name.as_str() {
+                    "display_name" => values.display_name = Some(text),
+                    "note" => values.note = Some(text),
+                    "locked" => values.locked = Some(parse_form_bool(&name, &text)?),
+                    "bot" => values.bot = Some(parse_form_bool(&name, &text)?),
+                    "discoverable" => values.discoverable = Some(parse_form_bool(&name, &text)?),
+                    "indexable" => values.indexable = Some(parse_form_bool(&name, &text)?),
+                    // Unknown scalar parameters are ignored, the way Rails ignores the
+                    // permit-list's leftovers, so an older client stays usable.
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(CredentialsBody { values, uploads })
+}
+
+fn is_fields_part(name: &str) -> bool {
+    name == "fields" || name.starts_with("fields[") || name.starts_with("fields_attributes")
+}
+
+fn parse_form_bool(name: &str, text: &str) -> ApiResult<bool> {
+    text.trim()
+        .parse()
+        .map_err(|_| ApiError::unprocessable(format!("{name} must be true or false")))
+}
+
 /// `PATCH /api/v1/accounts/update_credentials`
 pub async fn update_credentials(
     State(state): State<AppState>,
     auth: Auth,
-    JsonOrForm(request): JsonOrForm<UpdateCredentials>,
+    CredentialsBody {
+        mut values,
+        uploads,
+    }: CredentialsBody,
 ) -> ApiResult<Json<AccountDto>> {
     auth.require_scope("write:accounts")?;
-    let display_name = request.display_name.as_deref().map(str::trim);
+    if let Some(upload) = uploads.avatar.as_ref() {
+        let media = crate::media::ingest_upload(&state, &auth, upload.as_upload()).await?;
+        values.avatar = Some(media.id);
+    }
+    if let Some(upload) = uploads.header.as_ref() {
+        let media = crate::media::ingest_upload(&state, &auth, upload.as_upload()).await?;
+        values.header = Some(media.id);
+    }
+    let display_name = values.display_name.as_deref().map(str::trim);
     if let Some(value) = display_name {
         if value.chars().count() > 30 {
             return Err(ApiError::unprocessable(
@@ -67,7 +240,7 @@ pub async fn update_credentials(
             ));
         }
     }
-    let note = request.note.as_deref();
+    let note = values.note.as_deref();
     if let Some(value) = note {
         if value.chars().count() > 500 {
             return Err(ApiError::unprocessable(
@@ -75,21 +248,11 @@ pub async fn update_credentials(
             ));
         }
     }
-    let avatar_ref = attachment_ref(
-        &state,
-        &auth,
-        request.avatar.as_deref(),
-        ProfileSlot::Avatar,
-    )
-    .await?;
-    let header_ref = attachment_ref(
-        &state,
-        &auth,
-        request.header.as_deref(),
-        ProfileSlot::Header,
-    )
-    .await?;
-    let fields = request
+    let avatar_ref =
+        attachment_ref(&state, &auth, values.avatar.as_deref(), ProfileSlot::Avatar).await?;
+    let header_ref =
+        attachment_ref(&state, &auth, values.header.as_deref(), ProfileSlot::Header).await?;
+    let fields = values
         .fields
         .as_deref()
         .map(|rows| crate::profile_fields::to_stored(rows, &auth.0.account.fields))
@@ -97,10 +260,10 @@ pub async fn update_credentials(
     let update = nodus_server_store::accounts::ProfileUpdate {
         display_name,
         note,
-        locked: request.locked,
-        bot: request.bot,
-        discoverable: request.discoverable,
-        indexable: request.indexable,
+        locked: values.locked,
+        bot: values.bot,
+        discoverable: values.discoverable,
+        indexable: values.indexable,
         avatar_ref: avatar_ref.as_deref(),
         header_ref: header_ref.as_deref(),
         fields: fields.as_ref(),

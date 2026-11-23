@@ -31,7 +31,7 @@ use crate::dto::MediaAttachmentDto;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-const MAX_UPLOAD: usize = 40 * 1024 * 1024;
+pub(crate) const MAX_UPLOAD: usize = 40 * 1024 * 1024;
 pub(crate) const MAX_DESCRIPTION: usize = 1_500;
 
 /// `/api/v1/media`, `/api/v2/media`.
@@ -265,7 +265,6 @@ pub async fn upload_deferred(
 
 /// The body both upload routes share. `deferred` only decides the shape of the answer:
 /// v2 hands back an id before the variants exist, v1 answers with the full row.
-#[allow(clippy::too_many_lines)]
 async fn receive(
     state: AppState,
     auth: Auth,
@@ -343,6 +342,50 @@ async fn receive(
     }
 
     let bytes = bytes.ok_or_else(|| ApiError::unprocessable("A file is required"))?;
+    let row = ingest_upload(
+        &state,
+        &auth,
+        UploadFile {
+            bytes: &bytes,
+            content_type: &content_type,
+            filename: &filename,
+            description: &description,
+            sensitive,
+            lossless,
+        },
+    )
+    .await?;
+    Ok(media_response(&row, state.instance(), deferred))
+}
+
+/// One uploaded file, before it has a catalogue row.
+pub(crate) struct UploadFile<'a> {
+    pub bytes: &'a [u8],
+    pub content_type: &'a str,
+    pub filename: &'a str,
+    pub description: &'a str,
+    pub sensitive: bool,
+    pub lossless: bool,
+}
+
+/// Validates and stores one uploaded file, then starts its variant render.
+///
+/// This is the body of `POST /api/v1/media` once the multipart fields are read, and the
+/// profile-picture form on `update_credentials` calls it with the same fields: a second
+/// writer would have to repeat every limit and refusal and would drift from this one.
+pub(crate) async fn ingest_upload(
+    state: &AppState,
+    auth: &Auth,
+    upload: UploadFile<'_>,
+) -> ApiResult<MediaRow> {
+    let UploadFile {
+        bytes,
+        content_type,
+        filename,
+        description,
+        sensitive,
+        lossless,
+    } = upload;
     if bytes.is_empty() {
         return Err(ApiError::unprocessable("The upload is empty"));
     }
@@ -356,7 +399,7 @@ async fn receive(
         return Err(ApiError::unprocessable("The description is too long"));
     }
 
-    let kind = Kind::from_content_type(&content_type);
+    let kind = Kind::from_content_type(content_type);
     let size_limit = if kind == Kind::Video {
         VIDEO_SIZE_LIMIT
     } else {
@@ -378,12 +421,12 @@ async fn receive(
         ));
     }
 
-    let digest = hex(&Sha256::digest(&bytes));
+    let digest = hex(&Sha256::digest(bytes));
     let dir = storage_dir();
     tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::create_dir_all(variants_dir()).await?;
     let cluster = ClusterUpload::from_env();
-    let original = store_original(&dir, &digest, &bytes, cluster.as_ref()).await?;
+    let original = store_original(&dir, &digest, bytes, cluster.as_ref()).await?;
     let source = original.path().clone();
     // A cluster upload leaves no original here, so the copy the renderer reads is thrown
     // away as soon as the variants exist.
@@ -395,12 +438,12 @@ async fn receive(
         account_id: auth.0.account.id.clone(),
         status_id: None,
         digest,
-        content_type,
+        content_type: content_type.to_owned(),
         size: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
         width: None,
         height: None,
         blurhash: None,
-        description,
+        description: description.to_owned(),
         sensitive,
         lossless,
         processing_state: "pending".to_owned(),
@@ -417,7 +460,7 @@ async fn receive(
     };
 
     if row.content_type.starts_with("image/") {
-        match nodus_server_media::blurhash(&bytes) {
+        match nodus_server_media::blurhash(bytes) {
             Ok(preview) => {
                 row.blurhash = Some(preview.blurhash);
                 row.width = i32::try_from(preview.width).ok();
@@ -438,7 +481,7 @@ async fn receive(
     // The same bytes now have a drive row too, so an upload can be listed, renamed, or
     // shared like any other file. A failure here must not fail the upload: the bytes and
     // the catalogue row are already stored, and the attachment does not depend on it.
-    let name = crate::drive::clean_filename(&filename);
+    let name = crate::drive::clean_filename(filename);
     let name = if name.is_empty() {
         "upload".to_owned()
     } else {
@@ -499,7 +542,7 @@ async fn receive(
         }
     });
 
-    Ok(media_response(&row, state.instance(), deferred))
+    Ok(row)
 }
 
 /// Copies the pipeline's verdict onto the drive row, so a listing does not show a file

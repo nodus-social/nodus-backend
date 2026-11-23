@@ -85,7 +85,9 @@ pub fn router(state: AppState) -> axum::Router {
         )
         .route(
             "/api/v1/accounts/update_credentials",
-            patch(accounts::update_credentials).post(accounts::update_credentials),
+            patch(accounts::update_credentials)
+                .post(accounts::update_credentials)
+                .layer(axum::extract::DefaultBodyLimit::max(media::MAX_UPLOAD)),
         )
         .route(
             "/api/v1/statuses/{id}/reaction",
