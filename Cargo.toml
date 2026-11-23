@@ -20,6 +20,7 @@ nodus-server-api = { path = "crates/api" }
 nodus-server-feed = { path = "crates/feed" }
 nodus-server-federation = { path = "crates/federation" }
 nodus-auth = { path = "crates/auth" }
+nodus-mail = { path = "crates/mail" }
 nodus-server-sdk = { path = "../server-sdk/crates/server", features = ["activitypub", "misskey", "nodus", "native", "federation", "crypto"] }
 
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
@@ -58,6 +59,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ulid = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 url = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
+webpki-roots = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

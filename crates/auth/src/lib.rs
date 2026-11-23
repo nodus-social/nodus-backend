@@ -10,7 +10,7 @@ use std::sync::{Arc, LazyLock};
 
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use argon2::Argon2;
-use axum::extract::{ConnectInfo, Form, FromRequestParts, Query, RawQuery, State};
+use axum::extract::{ConnectInfo, Form, FromRequestParts, Path, Query, RawQuery, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -27,9 +27,11 @@ use crate::domain::{
     redirect_allowed, redirect_with, token_hash, verify_csrf, verify_pkce, AuthorizeRequest,
     CSRF_COOKIE,
 };
+use crate::outbox::Confirmation;
 use crate::store::{AuthStore, Credential, PgAuthStore, RegisterError, SessionAccount};
 
 pub mod domain;
+pub mod outbox;
 pub mod store;
 
 /// Hashes a bootstrap password with Argon2id's default parameters.
@@ -44,6 +46,8 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
 
 pub const SESSION_COOKIE: &str = "nodus_auth";
 const SESSION_DAYS: i64 = 30;
+/// Long enough to survive a mail queue and a weekend, short enough to be worthless later.
+const CONFIRMATION_HOURS: i64 = 48;
 const CODE_MINUTES: i64 = 5;
 /// Enough for every user agent in the wild; the header is attacker-controlled, so a
 /// session row must not be a place to park kilobytes.
@@ -169,6 +173,15 @@ pub struct Config {
     pub registrations_open: bool,
 }
 
+/// Where a confirmation link points, and the base every link must use.
+///
+/// Held on [`AppState`] rather than in [`Config`] because it is only ever present when a
+/// real sender exists; a `Config` literal therefore never has to invent a value for mail.
+#[derive(Clone)]
+pub struct EmailConfirmation {
+    pub base_url: String,
+}
+
 impl Config {
     #[must_use]
     pub fn new(domain: impl Into<String>) -> Self {
@@ -186,6 +199,7 @@ impl Config {
 pub struct AppState<S: AuthStore> {
     store: S,
     config: Arc<Config>,
+    email_confirmation: Option<EmailConfirmation>,
 }
 
 impl<S: AuthStore> AppState<S> {
@@ -193,7 +207,15 @@ impl<S: AuthStore> AppState<S> {
         Self {
             store,
             config: Arc::new(config),
+            email_confirmation: None,
         }
+    }
+
+    /// Turns on the confirmation mail queued by registration.
+    #[must_use]
+    pub fn with_email_confirmation(mut self, confirmation: EmailConfirmation) -> Self {
+        self.email_confirmation = Some(confirmation);
+        self
     }
 }
 
@@ -206,6 +228,7 @@ pub fn router<S: AuthStore>(state: AppState<S>) -> Router {
             get(register_page::<S>).post(register_submit::<S>),
         )
         .route("/auth/logout", post(logout::<S>))
+        .route("/auth/confirm/{token}", get(confirm_page::<S>))
         .route("/auth/session", get(session::<S>))
         .route(
             "/.well-known/oauth-authorization-server",
@@ -476,9 +499,27 @@ async fn register_submit<S: AuthStore>(
         )
             .into_response();
     };
+    let confirmation = state.email_confirmation.as_ref().map(|mail| {
+        let token = opaque_token();
+        Confirmation {
+            token_hash: token_hash(&token),
+            expires_at: Utc::now() + Duration::hours(CONFIRMATION_HOURS),
+            message: confirmation_message(
+                &mail.base_url,
+                &registration.username,
+                &registration.email,
+                &token,
+            ),
+        }
+    });
     let account = match state
         .store
-        .register_local(&registration.username, &registration.email, &password_hash)
+        .register_local(
+            &registration.username,
+            &registration.email,
+            &password_hash,
+            confirmation,
+        )
         .await
     {
         Ok(account) => account,
@@ -532,6 +573,92 @@ async fn register_submit<S: AuthStore>(
     let rotated_csrf = csrf_cookie(opaque_token(), state.config.secure_cookies);
     let target = safe_return_to(form.return_to.as_deref()).unwrap_or("/");
     (jar.add(cookie).add(rotated_csrf), Redirect::to(target)).into_response()
+}
+
+/// Answers a confirmation link.
+///
+/// A GET because the link is opened from a mail client. The token is single-use, so a
+/// second visit reports the expired case instead of confirming twice.
+async fn confirm_page<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    Path(token): Path<String>,
+) -> Response {
+    match state.store.confirm_email(&token_hash(&token)).await {
+        Ok(Some(username)) => {
+            let heading = format!("@{username}, your address is confirmed.");
+            Html(shell(
+                "Address confirmed · Nodus",
+                None,
+                view! {
+                    <h1>{heading}</h1>
+                    <p class="muted">"You can close this page and return to Nodus."</p>
+                    <p><a href="/">"Go to Nodus"</a></p>
+                },
+            ))
+            .into_response()
+        }
+        Ok(None) => (
+            StatusCode::GONE,
+            Html(shell(
+                "Confirmation expired · Nodus",
+                None,
+                view! {
+                    <h1>"This link is no longer valid."</h1>
+                    <p class="muted">"It may have expired or already been used."</p>
+                },
+            )),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "confirmation failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "confirmation failed").into_response()
+        }
+    }
+}
+
+/// The message a new account receives.
+///
+/// Both bodies carry the same absolute link. The HTML has no images, fonts or tracking
+/// pixel: opening a confirmation must not tell a third party which address exists.
+fn confirmation_message(
+    base_url: &str,
+    username: &str,
+    email: &str,
+    token: &str,
+) -> nodus_mail::Message {
+    let link = format!("{}/auth/confirm/{token}", base_url.trim_end_matches('/'));
+    let subject = "Confirm your Nodus address".to_owned();
+    let text = format!(
+        "Hello @{username},\n\nConfirm this address for your Nodus account by opening:\n\n{link}\n\n\
+         The link is valid for {CONFIRMATION_HOURS} hours and can be used once.\n\
+         If you did not create an account, ignore this message.\n"
+    );
+    let username_html = escape_html(username);
+    let email_html = escape_html(email);
+    let html = format!(
+        "<!doctype html><html><body>\
+         <p>Hello @{username_html},</p>\
+         <p>Confirm this address for your Nodus account:</p>\
+         <p><a href=\"{link}\">Confirm {email_html}</a></p>\
+         <p>The link is valid for {CONFIRMATION_HOURS} hours and can be used once.</p>\
+         <p>If you did not create an account, ignore this message.</p>\
+         </body></html>"
+    );
+    nodus_mail::Message {
+        to: email.to_owned(),
+        subject,
+        text,
+        html: Some(html),
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 /// Re-renders the form with the submitted name and email still in it.

@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 
+use crate::outbox::{self, Confirmation};
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("database error: {0}")]
@@ -130,12 +132,24 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
     fn revoke_token(&self, token_hash: &str) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Creates a local account together with its password login.
+    ///
+    /// `confirmation` is queued in the same transaction as the account: the caller has
+    /// already decided a real sender exists, and a confirmation that survives a rolled
+    /// back registration would point at an account nobody has.
     fn register_local(
         &self,
         username: &str,
         email: &str,
         password_hash: &str,
+        confirmation: Option<Confirmation>,
     ) -> impl Future<Output = Result<SessionAccount, RegisterError>> + Send;
+
+    /// Marks an address confirmed and returns the username, or `None` when the token is
+    /// unknown, expired or already used.
+    fn confirm_email(
+        &self,
+        token_hash: &str,
+    ) -> impl Future<Output = Result<Option<String>, Error>> + Send;
 }
 
 #[derive(Clone)]
@@ -232,6 +246,7 @@ impl PgAuthStore {
         username: &str,
         email: &str,
         password_hash: &str,
+        confirmation: Option<Confirmation>,
     ) -> Result<SessionAccount, RegisterError> {
         let mut tx = pool.begin().await?;
 
@@ -272,6 +287,19 @@ impl PgAuthStore {
         .execute(&mut *tx)
         .await
         .map_err(name_clash)?;
+
+        if let Some(confirmation) = confirmation {
+            sqlx::query(
+                "INSERT INTO email_confirmation (token_hash, account_id, expires_at) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(&confirmation.token_hash)
+            .bind(&id)
+            .bind(confirmation.expires_at)
+            .execute(&mut *tx)
+            .await?;
+            outbox::enqueue(&mut *tx, &confirmation.message).await?;
+        }
 
         tx.commit().await?;
 
@@ -331,8 +359,38 @@ impl AuthStore for PgAuthStore {
         username: &str,
         email: &str,
         password_hash: &str,
+        confirmation: Option<Confirmation>,
     ) -> Result<SessionAccount, RegisterError> {
-        Self::register_local_with(&self.pool, username, email, password_hash).await
+        Self::register_local_with(&self.pool, username, email, password_hash, confirmation).await
+    }
+
+    async fn confirm_email(&self, token: &str) -> Result<Option<String>, Error> {
+        let mut tx = self.pool.begin().await?;
+        let account_id: Option<String> = sqlx::query_scalar(
+            "UPDATE email_confirmation SET used_at = now() \
+             WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now() \
+             RETURNING account_id",
+        )
+        .bind(token)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(account_id) = account_id else {
+            return Ok(None);
+        };
+        sqlx::query(
+            "UPDATE account_credential SET confirmed_at = COALESCE(confirmed_at, now()) \
+             WHERE account_id = $1",
+        )
+        .bind(&account_id)
+        .execute(&mut *tx)
+        .await?;
+        let username: String =
+            sqlx::query_scalar("SELECT username::text FROM account WHERE id = $1")
+                .bind(&account_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(Some(username))
     }
 
     async fn client_app(&self, client_id: &str) -> Result<Option<ClientApp>, Error> {

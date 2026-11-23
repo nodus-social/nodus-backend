@@ -64,6 +64,12 @@ where
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let sink = invalidation_sink();
+    // Mail is optional by construction: no SMTP means no sender, no worker and no
+    // confirmation tokens, exactly as `NODUS_DRIVE_SHARE_SECRET` gates share links.
+    let mail = nodus_mail::sender_from_env();
+    if let Some(mail) = mail.clone() {
+        tokio::spawn(nodus_auth::outbox::run(store.pool().clone(), mail));
+    }
     // One variable turns the home timelines' fan-out on: with no `NODUS_VALKEY_URL` this is
     // `None`, and every home read is the SQL query it has always been.
     let home = crate::home::HomeShards::from_env();
@@ -116,7 +122,7 @@ where
     };
     nodus_server_transport::serve_http(
         &config.bind,
-        router(&store, &config, federation, sink, home),
+        router(&store, &config, federation, sink, home, mail.as_ref()),
         shutdown,
     )
     .await?;
@@ -151,6 +157,7 @@ fn router(
     federation: Option<FederationKey>,
     sink: Option<Arc<dyn InvalidationSink>>,
     home: Option<Arc<crate::home::HomeShards>>,
+    mail: Option<&Arc<dyn nodus_mail::Transport>>,
 ) -> Router {
     let api = root_router(
         AppState::with_federation_and_sink(
@@ -164,7 +171,7 @@ fn router(
         .with_account_delete_grace_days(config.account_delete_grace_days)
         .with_home(home),
     );
-    let auth = nodus_auth::router(nodus_auth::AppState::new(
+    let mut auth_state = nodus_auth::AppState::new(
         PgAuthStore::new(store.pool().clone()),
         nodus_auth::Config {
             domain: config.instance.domain.clone(),
@@ -172,6 +179,12 @@ fn router(
             secure_cookies: config.secure_cookies,
             registrations_open: config.registrations_open,
         },
-    ));
+    );
+    if mail.is_some() {
+        auth_state = auth_state.with_email_confirmation(nodus_auth::EmailConfirmation {
+            base_url: config.instance.base_url.clone(),
+        });
+    }
+    let auth = nodus_auth::router(auth_state);
     api.merge(auth)
 }

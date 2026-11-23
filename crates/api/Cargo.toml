@@ -26,6 +26,7 @@ nodus-server-transport = { path = "../transport" }
 nodus-storage = { path = "../storage" }
 nodus-shared = { path = "../../../sdk/crates/shared", version = "0.1.0" }
 nodus-auth = { workspace = true }
+nodus-mail = { workspace = true }
 axum-extra = { workspace = true }
 leptos = { workspace = true }
 nodus-server-sdk = { workspace = true, features = ["nodus", "misskey", "native"] }
