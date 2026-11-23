@@ -709,11 +709,20 @@ pub async fn follow_page(
     })
 }
 
-/// Resolves `user` or `user@domain` to a local account.
-pub async fn lookup(pool: &PgPool, acct: &str) -> Result<Option<AccountRow>, sqlx::Error> {
-    let mut parts = acct.trim_start_matches('@').split('@');
-    let username = parts.next().unwrap_or_default();
-    let domain = parts.next();
+/// One account by the parts of its handle, against any executor.
+///
+/// `domain == None` means the account is local. The caller splits the handle rather than
+/// this function because whether a host names the local instance is a fact of the
+/// instance, not of the store.
+///
+/// # Errors
+///
+/// A database error, unchanged.
+pub async fn by_handle<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    username: &str,
+    domain: Option<&str>,
+) -> Result<Option<AccountRow>, sqlx::Error> {
     let sql = format!(
         "SELECT {ACCOUNT_COLUMNS} FROM account \
           WHERE username = $1 AND (($2::text IS NULL AND domain IS NULL) OR domain = $2) \
@@ -722,8 +731,19 @@ pub async fn lookup(pool: &PgPool, acct: &str) -> Result<Option<AccountRow>, sql
     sqlx::query_as::<_, AccountRow>(&sql)
         .bind(username)
         .bind(domain)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
+}
+
+/// Resolves `user` or `user@domain` to a local account.
+///
+/// # Errors
+///
+/// A database error, unchanged.
+pub async fn lookup(pool: &PgPool, acct: &str) -> Result<Option<AccountRow>, sqlx::Error> {
+    let mut parts = acct.trim_start_matches('@').split('@');
+    let username = parts.next().unwrap_or_default();
+    by_handle(pool, username, parts.next()).await
 }
 
 /// Local account search by username, display name and bio.

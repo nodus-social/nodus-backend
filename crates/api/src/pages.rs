@@ -36,7 +36,14 @@ pub struct PageCursors {
     pub prev: Option<String>,
 }
 
-/// `GET /api/v1/pages/profile/{id}`
+/// `GET /api/v1/pages/profile/{acct}`
+///
+/// `{acct}` is either an account id or a handle. The handle form is `name@host` with a
+/// literal `@` — the form the web client's URL builder sends, since it pushes path
+/// segments and `@` is not in a path segment's percent-encode set; `%40` is accepted
+/// too. A handle whose host is this instance's domain resolves to the local account, so
+/// the SSR route can forward an `@name@host` the reader typed. Ids are ULIDs and never
+/// contain `@`, which is what tells the two forms apart.
 #[derive(Debug, Serialize)]
 pub struct ProfilePageDto {
     pub account: AccountDto,
@@ -93,10 +100,36 @@ impl ProfileQuery {
     }
 }
 
+/// Whether a path segment names an account by id or by handle.
+///
+/// An id is a ULID, so `@` is the discriminator; there is no guessing a bare name
+/// against an id. A leading `@` is accepted because that is how a handle is typed, and
+/// a host equal to the instance's own domain means the local account.
+enum ProfileTarget<'a> {
+    Id(&'a str),
+    Handle {
+        username: &'a str,
+        domain: Option<&'a str>,
+    },
+}
+
+fn profile_target<'a>(segment: &'a str, local_domain: &str) -> ProfileTarget<'a> {
+    let bare = segment.strip_prefix('@').unwrap_or(segment);
+    let Some((username, host)) = bare.split_once('@') else {
+        return ProfileTarget::Id(segment);
+    };
+    let domain = if host.eq_ignore_ascii_case(local_domain) {
+        None
+    } else {
+        Some(host)
+    };
+    ProfileTarget::Handle { username, domain }
+}
+
 pub async fn profile(
     State(state): State<AppState>,
     MaybeAuth(auth): MaybeAuth,
-    Path(id): Path<String>,
+    Path(segment): Path<String>,
     Query(query): Query<ProfileQuery>,
 ) -> ApiResult<Json<ProfilePageDto>> {
     if query.pinned {
@@ -104,28 +137,53 @@ pub async fn profile(
             "pinned statuses are not stored on this instance",
         ));
     }
-    let account = state
-        .store()
-        .account(&id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    if account.deleted_at.is_some() {
-        return Err(ApiError::not_found("Record not found"));
-    }
     let params = query.params()?;
     let viewer = auth.as_ref().map(|auth| auth.0.account.id.as_str());
-    let page = nodus_server_store::statuses::profile_page(
-        state.store().pool(),
-        &id,
-        params,
-        ProfileFilters {
-            exclude_replies: query.exclude_replies,
-            exclude_reblogs: query.exclude_reblogs,
-            only_media: query.only_media,
-        },
-        viewer,
-    )
-    .await?;
+    let filters = ProfileFilters {
+        exclude_replies: query.exclude_replies,
+        exclude_reblogs: query.exclude_reblogs,
+        only_media: query.only_media,
+    };
+    let (account, page) = match profile_target(&segment, &state.instance().domain) {
+        ProfileTarget::Id(id) => {
+            let account = state
+                .store()
+                .account(id)
+                .await?
+                .ok_or_else(|| ApiError::not_found("Record not found"))?;
+            if account.deleted_at.is_some() {
+                return Err(ApiError::not_found("Record not found"));
+            }
+            let page = nodus_server_store::statuses::profile_page(
+                state.store().pool(),
+                id,
+                params,
+                filters,
+                viewer,
+            )
+            .await?;
+            (account, page)
+        }
+        ProfileTarget::Handle { username, domain } => {
+            let (account, page) = nodus_server_store::statuses::profile_page_by_handle(
+                state.store().pool(),
+                username,
+                domain,
+                params,
+                filters,
+                viewer,
+            )
+            .await?
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "the handle @{} is not known here",
+                    segment.trim_start_matches('@')
+                ))
+            })?;
+            (account, page)
+        }
+    };
+    let id = account.id.clone();
 
     let next = page.next_max_id.clone();
     let prev = if query.max_id.is_some() {

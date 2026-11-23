@@ -593,6 +593,50 @@ pub async fn profile_page(
     filters: ProfileFilters,
     viewer: Option<&str>,
 ) -> Result<StatusPage, sqlx::Error> {
+    profile_rows(pool, account_id, params, filters, viewer).await
+}
+
+/// A profile page reached by handle: the account resolution and the page rows read in
+/// one `REPEATABLE READ READ ONLY` snapshot, so the account the reader lands on is the
+/// account whose posts are painted, even if the handle is moving between two requests.
+///
+/// The rows are [`profile_page`]'s, predicate and all: the handle form cannot disagree
+/// with the id form about what a suspended, silenced or paused author contributes. A
+/// handle that names nobody here is `None`, which the caller reports as a 404.
+///
+/// `domain == None` means a local account.
+///
+/// # Errors
+///
+/// A database error, unchanged.
+pub async fn profile_page_by_handle(
+    pool: &PgPool,
+    username: &str,
+    domain: Option<&str>,
+    params: PageParams,
+    filters: ProfileFilters,
+    viewer: Option<&str>,
+) -> Result<Option<(crate::accounts::AccountRow, StatusPage)>, sqlx::Error> {
+    // `begin_with` for the same reason the page batch uses it: the isolation level must be
+    // part of the transaction's first statement.
+    let mut tx = pool
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
+    let Some(account) = crate::accounts::by_handle(&mut *tx, username, domain).await? else {
+        return Ok(None);
+    };
+    let page = profile_rows(&mut *tx, &account.id, params, filters, viewer).await?;
+    tx.commit().await?;
+    Ok(Some((account, page)))
+}
+
+async fn profile_rows<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    account_id: &str,
+    params: PageParams,
+    filters: ProfileFilters,
+    viewer: Option<&str>,
+) -> Result<StatusPage, sqlx::Error> {
     let size = PageSize::default_max(params.limit);
     let (max_id, lower_id, order) = page_bounds(params);
     let sql = format!(
@@ -628,7 +672,7 @@ pub async fn profile_page(
         .bind(filters.exclude_replies)
         .bind(filters.exclude_reblogs)
         .bind(filters.only_media)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
     Ok(finish(rows, size))
 }

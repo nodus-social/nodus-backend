@@ -8,6 +8,7 @@ mod support;
 
 use std::sync::{Arc, Mutex};
 
+use axum::http::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
 
@@ -64,6 +65,12 @@ fn table_reads(log: &CapturedLog, marker: &str) -> usize {
         .count()
 }
 
+/// sqlx logs each statement's shortened summary at DEBUG; these two markers are long
+/// enough to be unique among them and short enough to survive the truncation.
+const COMMIT: &str = "summary=\"COMMIT\"";
+const HANDLE_RESOLVE: &str = "summary=\"SELECT id, username::text AS";
+const PAGE_READ: &str = "summary=\"SELECT s.id, s.account_id";
+
 async fn attach(pool: &PgPool, account_id: &str, status_id: &str) {
     sqlx::query(
         "INSERT INTO media_attachment (id, account_id, status_id, digest, content_type, size) \
@@ -114,6 +121,23 @@ async fn create_reply(
 
 fn page(body: &Value) -> &Value {
     body.get("page").expect("page cursors")
+}
+
+/// The `name@host` spelling of a fixture account: the same handle a reader would type in
+/// the web client's `/accounts/{host}/{name}` route.
+async fn handle_of(pool: &PgPool, account_id: &str, host: &str) -> String {
+    let username: String = sqlx::query_scalar("SELECT username::text FROM account WHERE id = $1")
+        .bind(account_id)
+        .fetch_one(pool)
+        .await
+        .expect("account username");
+    format!("{username}@{host}")
+}
+
+async fn profile_by_id(app: &axum::Router, account_id: &str) -> Value {
+    let (status, body) =
+        send_anon(app, "GET", &format!("/api/v1/pages/profile/{account_id}")).await;
+    json_of(&expect_ok(status, &body, "profile by id"))
 }
 
 #[tokio::test]
@@ -301,6 +325,172 @@ async fn a_status_page_carries_its_ancestor_and_its_reply() {
 }
 
 #[tokio::test]
+async fn a_handle_answers_the_same_profile_page_as_an_id() {
+    let _serial = serial().await;
+    run_db_test(|store, app| async move {
+        let author = create_account(store.pool(), "handlepage").await;
+        create_status(store.pool(), &author, "first", "public", &[], &[]).await;
+        create_status(store.pool(), &author, "second", "public", &[], &[]).await;
+        let by_id = profile_by_id(&app, &author).await;
+
+        // The SDK's URL builder leaves `@` literal in a path segment; a client that
+        // percent-encodes it instead is decoded by axum, so both spellings answer.
+        let handle = handle_of(store.pool(), &author, "social.test").await;
+        let (status, body) =
+            send_anon(&app, "GET", &format!("/api/v1/pages/profile/{handle}")).await;
+        let by_handle = json_of(&expect_ok(status, &body, "profile by handle"));
+        assert_eq!(
+            by_handle, by_id,
+            "the handle form must answer the id form's document"
+        );
+
+        let encoded = handle.replace('@', "%40");
+        let (status, body) = send_anon(
+            &app,
+            "GET",
+            &format!("/api/v1/pages/profile/{encoded}"),
+        )
+        .await;
+        let by_encoded = json_of(&expect_ok(status, &body, "profile by encoded handle"));
+        assert_eq!(by_encoded, by_id, "a %40 handle answers the same document");
+
+        // The viewer-dependent half of the payload (the relationship) is identical too.
+        let viewer = create_account(store.pool(), "handleviewer").await;
+        let token = create_token(store.pool(), &viewer, &["read"]).await;
+        let (status, body) = send(
+            &app,
+            &token,
+            "GET",
+            &format!("/api/v1/pages/profile/{author}"),
+            None,
+        )
+        .await;
+        let signed_in_by_id = json_of(&expect_ok(status, &body, "signed-in profile by id"));
+        let (status, body) = send(
+            &app,
+            &token,
+            "GET",
+            &format!("/api/v1/pages/profile/{handle}"),
+            None,
+        )
+        .await;
+        let signed_in_by_handle =
+            json_of(&expect_ok(status, &body, "signed-in profile by handle"));
+        assert_eq!(signed_in_by_handle, signed_in_by_id);
+        assert_eq!(signed_in_by_handle["relationship"]["id"], author);
+
+        // `pinned=true` is refused on both forms, before either target is resolved.
+        for target in [author.as_str(), handle.as_str()] {
+            let (status, body) = send_anon(
+                &app,
+                "GET",
+                &format!("/api/v1/pages/profile/{target}?pinned=true"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{target}: {body}");
+            assert_eq!(
+                json_of(&body)["error"],
+                "pinned statuses are not stored on this instance"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_remote_handle_resolves_by_its_own_domain() {
+    let _serial = serial().await;
+    run_db_test(|store, app| async move {
+        let author = create_account(store.pool(), "remotehandle").await;
+        sqlx::query(
+            "UPDATE account SET local = false, domain = 'remote.test', \
+             uri = 'https://remote.test/users/x' WHERE id = $1",
+        )
+        .bind(&author)
+        .execute(store.pool())
+        .await
+        .expect("make author remote");
+        create_status(store.pool(), &author, "from the remote host", "public", &[], &[]).await;
+
+        let by_id = profile_by_id(&app, &author).await;
+        let handle = handle_of(store.pool(), &author, "remote.test").await;
+        let (status, body) =
+            send_anon(&app, "GET", &format!("/api/v1/pages/profile/{handle}")).await;
+        let by_handle = json_of(&expect_ok(status, &body, "remote profile by handle"));
+        assert_eq!(by_handle, by_id, "the remote domain is part of the handle");
+        assert_eq!(
+            by_handle["statuses"].as_array().map(Vec::len),
+            Some(1),
+            "the remote account's post is on the page: {by_handle}"
+        );
+
+        // The same username under a different host names nobody on this instance; the
+        // instance domain must not be silently substituted for it.
+        let username = handle_of(store.pool(), &author, "elsewhere.test").await;
+        let (status, body) =
+            send_anon(&app, "GET", &format!("/api/v1/pages/profile/{username}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unknown_handle_is_a_404_that_names_it() {
+    let _serial = serial().await;
+    run_db_test(|store, app| async move {
+        let _ = store;
+        let (status, body) = send_anon(
+            &app,
+            "GET",
+            "/api/v1/pages/profile/nobody%40social.test",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let body = json_of(&body);
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("nobody@social.test"),
+            "the reason names the handle: {body}"
+        );
+        assert!(
+            message.contains("not known here"),
+            "the reason says the handle is unknown here, not that the page is empty: {body}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_silenced_accounts_handle_is_refused_by_the_id_forms_predicate() {
+    let _serial = serial().await;
+    run_db_test(|store, app| async move {
+        let author = create_account(store.pool(), "silencedhandle").await;
+        create_status(store.pool(), &author, "before silence", "public", &[], &[]).await;
+        sqlx::query("UPDATE account SET silenced_at = now() WHERE id = $1")
+            .bind(&author)
+            .execute(store.pool())
+            .await
+            .expect("silence account");
+
+        let by_id = profile_by_id(&app, &author).await;
+        assert!(
+            by_id["statuses"].as_array().is_some_and(Vec::is_empty),
+            "the id form's predicate hides a silenced author's post: {by_id}"
+        );
+
+        let handle = handle_of(store.pool(), &author, "social.test").await;
+        let (status, body) =
+            send_anon(&app, "GET", &format!("/api/v1/pages/profile/{handle}")).await;
+        let by_handle = json_of(&expect_ok(status, &body, "silenced profile by handle"));
+        assert_eq!(
+            by_handle, by_id,
+            "the handle form must apply the same predicate, not a looser one"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn page_reads_do_not_grow_with_the_number_of_posts() {
     let _serial = serial().await;
     run_db_test(|store, app| async move {
@@ -382,6 +572,49 @@ async fn page_reads_do_not_grow_with_the_number_of_posts() {
         );
         assert_eq!(reaction_reads, 1, "reaction chips came from one read");
         assert_eq!(one, 13, "the profile page's statement count changed");
+        let id_commits = table_reads(&log, COMMIT);
+
+        // The handle form resolves the account inside the same snapshot as the page: one
+        // explicit transaction, so the resolve replaces the id lookup and its `COMMIT`
+        // is the only statement the id form does not pay.
+        let handle = handle_of(store.pool(), &author, "social.test").await;
+        clear(&log);
+        let (status, body) = send(
+            &app,
+            &token,
+            "GET",
+            &format!("/api/v1/pages/profile/{handle}?limit=1"),
+            None,
+        )
+        .await;
+        let body = expect_ok(status, &body, "profile page by handle");
+        assert_eq!(json_of(&body)["statuses"].as_array().map(Vec::len), Some(1));
+        let by_handle = statements(&log);
+        let text = String::from_utf8_lossy(&log.0.lock().expect("log buffer")).into_owned();
+        let resolve_at = text
+            .find(HANDLE_RESOLVE)
+            .expect("the handle resolve is missing from the log");
+        let page_at = text
+            .find(PAGE_READ)
+            .expect("the page read is missing from the log");
+        let commit_at = text.find(COMMIT).expect("no commit for the handle page");
+        assert!(
+            resolve_at < page_at && page_at < commit_at,
+            "the handle must be resolved and the page read in one snapshot, in that order"
+        );
+        let handle_commits = table_reads(&log, COMMIT);
+        assert_eq!(
+            (id_commits, handle_commits),
+            (1, 2),
+            "the handle page adds one explicit transaction (the resolve + page snapshot) \
+             on top of the id form's hydration batch"
+        );
+        assert_eq!(
+            by_handle,
+            one + 1,
+            "the handle form costs the id form's statements plus its snapshot's COMMIT \
+             (id {one}, handle {by_handle})"
+        );
 
         // The thread page's count is pinned for a one-ancestor, one-reply fixture. Its
         // rows never carry a `limit`, so this is the page's shape, not a page-size knob.
@@ -402,7 +635,7 @@ async fn page_reads_do_not_grow_with_the_number_of_posts() {
         eprintln!(
             "pages: profile N=1 {one} statements, N=20 {twenty} statements \
              ({reaction_reads} reaction read, {media_reads} attachment read); \
-             thread {thread_reads} statements"
+             profile by handle {by_handle} statements; thread {thread_reads} statements"
         );
         assert_eq!(media_reads, 1, "attachments came from one read");
         assert_eq!(
