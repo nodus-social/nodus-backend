@@ -1,6 +1,6 @@
 # Entrypoints — one binary, seven roles
 
-Status: current · Last revised: 2026-11-20
+Status: current · Last revised: 2026-11-23
 
 `nodus` is one binary that can start any of the six services, or the API and the
 media worker together. The six units the host runs today are untouched: each
@@ -18,7 +18,7 @@ every `ExecStart=` still names `nodus-api` and friends.
 
 | Role | Calls | Listens on | Reads |
 | --- | --- | --- | --- |
-| `api` | `nodus_server_api::run()` | `NODUS_BIND`, default `0.0.0.0:3000` | the API's environment: `NODUS_BIND`, `NODUS_DATABASE_URL`, `NODUS_DOMAIN`, `NODUS_BASE_URL`, `NODUS_AUTH_SECURE_COOKIES`, `NODUS_REGISTRATIONS_OPEN`, `NODUS_AUTHORIZED_FETCH`, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND`, bootstrap and instance settings |
+| `api` | `nodus_server_api::run()` | `NODUS_BIND`, default `0.0.0.0:3000` | the API's environment: `NODUS_BIND`, `NODUS_DATABASE_URL`, `NODUS_DOMAIN`, `NODUS_BASE_URL`, `NODUS_AUTH_SECURE_COOKIES`, `NODUS_REGISTRATIONS_OPEN`, `NODUS_AUTHORIZED_FETCH`, `NODUS_SMTP_HOST`, `NODUS_SMTP_PORT`, `NODUS_SMTP_USERNAME`, `NODUS_SMTP_PASSWORD`, `NODUS_SMTP_FROM`, `NODUS_SMTP_TLS`, `NODUS_REQUIRE_EMAIL_CONFIRMATION`, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND`, bootstrap and instance settings |
 | `media-worker` | `nodus_server_media::run()` | `NODUS_BIND`, default `0.0.0.0:3000` | `NODUS_BIND`, `NODUS_DATABASE_URL`, `NODUS_MEDIA_DIR`, `NODUS_MEDIA_VARIANTS_DIR`, `NODUS_MEDIA_NODE`, `NODUS_MEDIA_ENDPOINT`, `NODUS_MEDIA_CLUSTER_TOKEN`, `NODUS_MEDIA_REPAIR`, `NODUS_MEDIA_REPAIR_SECS`, `NODUS_MEDIA_VIDEO_CODEC` (`vp8` default / `vp9`), `NODUS_TELEMETRY_SOCKET` |
 | `feed` | `nodus_server_feed::run()` | `NODUS_BIND`, default `0.0.0.0:3000` | `NODUS_BIND`, `NODUS_DATABASE_URL`, `NODUS_DOMAIN`, `TOKEN_ENC_KEY`, the recommendation store and cache, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND` |
 | `scan` | `nodus_server_scan::run()` | nothing, unless telemetry is configured: then `NODUS_TELEMETRY_SOCKET` or `NODUS_TELEMETRY_BIND` | `NODUS_DATABASE_URL`, the scanner endpoints, the sweep interval, `NODUS_TELEMETRY_SOCKET` / `NODUS_TELEMETRY_BIND` |

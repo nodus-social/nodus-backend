@@ -86,6 +86,10 @@ pub struct Config {
     /// Whether `ActivityPub` reads require an HTTP signature (`NODUS_AUTHORIZED_FETCH`).
     /// Off unless the operator opts in, and read once so peers see one stable mode.
     pub authorized_fetch: bool,
+    /// Whether an unconfirmed address may post or follow
+    /// (`NODUS_REQUIRE_EMAIL_CONFIRMATION`). Off by default: turning it on without a
+    /// sender would lock every new account out of a working instance.
+    pub require_email_confirmation: bool,
     /// Days between an account deletion request and the purge of its profile and keys
     /// (`NODUS_ACCOUNT_DELETE_GRACE_DAYS`, default 30).
     pub account_delete_grace_days: i64,
@@ -154,6 +158,8 @@ pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
         env::var("NODUS_REGISTRATIONS_OPEN").map_or(Ok(false), |value| value.parse())?;
     let authorized_fetch =
         env::var("NODUS_AUTHORIZED_FETCH").map_or(Ok(false), |value| value.parse())?;
+    let require_email_confirmation = env::var("NODUS_REQUIRE_EMAIL_CONFIRMATION")
+        .map_or(Ok(false), |value| value.parse())?;
     let account_delete_grace_days = env::var("NODUS_ACCOUNT_DELETE_GRACE_DAYS")
         .ok()
         .map(|value| value.parse())
@@ -207,6 +213,7 @@ pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
         secure_cookies,
         registrations_open,
         authorized_fetch,
+        require_email_confirmation,
         account_delete_grace_days,
         video_codec,
         migrate_only: env::args().any(|argument| argument == "--migrate-only"),

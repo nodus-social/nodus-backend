@@ -564,6 +564,7 @@ pub async fn follow(
     Path(id): Path<String>,
 ) -> ApiResult<Json<RelationshipDto>> {
     auth.require_scope("write:follows")?;
+    crate::auth::require_confirmed_email(&state, &auth.0.account.id).await?;
     let target = target(&state, &id).await?;
     let outcome = nodus_server_store::social::follow(
         state.store().pool(),

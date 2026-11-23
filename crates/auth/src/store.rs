@@ -174,6 +174,9 @@ impl PgAuthStore {
     }
 
     /// Attaches a password credential to an existing local account using the given executor.
+    ///
+    /// No confirmation message goes out from this path, so the address is recorded as
+    /// confirmed at creation. The registration path is the one that can leave it NULL.
     pub async fn create_credential_with<'e>(
         executor: impl sqlx::PgExecutor<'e>,
         account_id: &str,
@@ -181,7 +184,8 @@ impl PgAuthStore {
         password_hash: &str,
     ) -> Result<(), Error> {
         sqlx::query(
-            "INSERT INTO account_credential (account_id, email, password_hash) VALUES ($1, $2, $3)",
+            "INSERT INTO account_credential (account_id, email, password_hash, confirmed_at) \
+             VALUES ($1, $2, $3, now())",
         )
         .bind(account_id)
         .bind(email)
@@ -241,6 +245,10 @@ impl PgAuthStore {
     /// The uniqueness checks run inside the transaction so a refused name leaves no
     /// orphaned account behind, and the two unique indexes stay the real guard against two
     /// people claiming one name at the same moment.
+    ///
+    /// Without a `confirmation` there is no message to answer, so the address is recorded
+    /// as confirmed at creation. A NULL `confirmed_at` therefore always means "a link was
+    /// sent and has not been followed", which is exactly what enforcement reads.
     pub async fn register_local_with(
         pool: &PgPool,
         username: &str,
@@ -278,12 +286,15 @@ impl PgAuthStore {
         .execute(&mut *tx)
         .await
         .map_err(name_clash)?;
+        let confirmed_at = confirmation.is_none().then(Utc::now);
         sqlx::query(
-            "INSERT INTO account_credential (account_id, email, password_hash) VALUES ($1, $2, $3)",
+            "INSERT INTO account_credential (account_id, email, password_hash, confirmed_at) \
+             VALUES ($1, $2, $3, $4)",
         )
         .bind(&id)
         .bind(email)
         .bind(password_hash)
+        .bind(confirmed_at)
         .execute(&mut *tx)
         .await
         .map_err(name_clash)?;

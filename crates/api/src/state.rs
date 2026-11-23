@@ -60,6 +60,9 @@ struct Inner {
     /// `NODUS_AUTHORIZED_FETCH`, read once at startup. Off means ActivityPub reads
     /// answer anyone, exactly as they did before the switch existed.
     authorized_fetch: bool,
+    /// `NODUS_REQUIRE_EMAIL_CONFIRMATION`, read once at startup. On means a local
+    /// account whose address is not confirmed may not post or follow.
+    require_email_confirmation: bool,
     /// `NODUS_DRIVE_SHARE_SECRET`, read once at startup. Off means the drive's share
     /// route refuses, so `drive_share` is withheld from the handshake.
     drive_share: bool,
@@ -203,6 +206,7 @@ impl AppState {
                 instance,
                 federation: federation.map(Arc::new),
                 authorized_fetch: false,
+                require_email_confirmation: false,
                 drive_share: false,
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
@@ -227,6 +231,7 @@ impl AppState {
                 instance: self.inner.instance.clone(),
                 federation: self.inner.federation.clone(),
                 authorized_fetch: self.inner.authorized_fetch,
+                require_email_confirmation: self.inner.require_email_confirmation,
                 drive_share: self.inner.drive_share,
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
@@ -251,6 +256,7 @@ impl AppState {
                 instance: self.inner.instance.clone(),
                 federation: self.inner.federation.clone(),
                 authorized_fetch: enabled,
+                require_email_confirmation: self.inner.require_email_confirmation,
                 drive_share: self.inner.drive_share,
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
@@ -276,7 +282,33 @@ impl AppState {
                 instance: self.inner.instance.clone(),
                 federation: self.inner.federation.clone(),
                 authorized_fetch: self.inner.authorized_fetch,
+                require_email_confirmation: self.inner.require_email_confirmation,
                 drive_share: enabled,
+                stats_cache: Mutex::new(HashMap::new()),
+                actor_keys: Mutex::new(HashMap::new()),
+                key_fetches: Mutex::new(HashMap::new()),
+                account_delete_grace_days: self.inner.account_delete_grace_days,
+                writer: self.inner.writer.clone(),
+                home: self.inner.home.clone(),
+                sink: self.inner.sink.clone(),
+            }),
+        }
+    }
+
+    /// The same state with email-confirmation enforcement on or off.
+    ///
+    /// The switch is read once, in the binary, for the same reason as the other
+    /// deployment switches: the refusal must not change between two requests.
+    #[must_use]
+    pub fn with_require_email_confirmation(self, enabled: bool) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                store: self.inner.store.clone(),
+                instance: self.inner.instance.clone(),
+                federation: self.inner.federation.clone(),
+                authorized_fetch: self.inner.authorized_fetch,
+                require_email_confirmation: enabled,
+                drive_share: self.inner.drive_share,
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
                 key_fetches: Mutex::new(HashMap::new()),
@@ -297,6 +329,7 @@ impl AppState {
                 instance: self.inner.instance.clone(),
                 federation: self.inner.federation.clone(),
                 authorized_fetch: self.inner.authorized_fetch,
+                require_email_confirmation: self.inner.require_email_confirmation,
                 drive_share: self.inner.drive_share,
                 stats_cache: Mutex::new(HashMap::new()),
                 actor_keys: Mutex::new(HashMap::new()),
@@ -307,6 +340,13 @@ impl AppState {
                 sink: self.inner.sink.clone(),
             }),
         }
+    }
+
+    /// Whether an unconfirmed address is refused for posting and following
+    /// (`NODUS_REQUIRE_EMAIL_CONFIRMATION` is on).
+    #[must_use]
+    pub fn require_email_confirmation(&self) -> bool {
+        self.inner.require_email_confirmation
     }
 
     /// Whether drive share links are configured (`NODUS_DRIVE_SHARE_SECRET` is set).

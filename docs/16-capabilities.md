@@ -101,6 +101,23 @@ no name, draws no control, and a call made anyway reaches `Error::UnsupportedCap
 secret is read once and passed as a `bool` (`crates/api/src/state.rs:268-280`), so replicas and
 tests answer alike.
 
+### `email`: deliberately unpublished
+
+The backend sends transactional mail (SMTP plus the `email_outbox`) and enforces
+`NODUS_REQUIRE_EMAIL_CONFIRMATION`, but **`email` is not a published capability**. It is
+absent from `FEATURES` on purpose, and a client must not look for it.
+
+The blocker is the vocabulary contract, not an omission. `crates/api/tests/capabilities.rs::the_published_vocabulary_is_the_sdk_vocabulary`
+asserts, in both directions, that `meta::FEATURES` is exactly `nodus_protocol::Feature::ALL`,
+and `Feature::COUNT == 72` (`sdk/crates/nodus/src/feature.rs:175`). That enum has no `Email`
+variant. Adding the name to `FEATURES` without the SDK fails the test; adding it to the SDK is
+a three-repo change (variant, per-protocol baseline answers, count assertions), not a backend
+edit. Publishing a name no client can decode would also announce a door the shell has no
+affordance for — the same dishonesty as advertising a route that answers `404`, inverted.
+
+So the name lands only when the SDK can carry it. Until then the confirmation switch is an
+operator setting with no capability bit, and `/api/v1/meta` staying silent is the contract.
+
 ## 3. Three names the API does not serve
 
 `feed_accounts`, `events` and `sync_token` belong to `nodus-feed` on the same origin

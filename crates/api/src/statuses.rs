@@ -129,6 +129,7 @@ pub async fn create(
     body: Bytes,
 ) -> ApiResult<Response> {
     auth.require_scope("write:statuses")?;
+    crate::auth::require_confirmed_email(&state, &auth.0.account.id).await?;
     let request = parse_create_request(&headers, &body)?;
     if let Some(at) = request.scheduled_at.as_deref() {
         let at = chrono::DateTime::parse_from_rfc3339(at.trim())

@@ -110,6 +110,33 @@ pub(crate) async fn authenticate(state: &AppState, token: &str) -> Result<Authen
         .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))
 }
 
+/// Refuses posting and following until the account's address is confirmed.
+///
+/// The switch is off by default and checked before the database: an instance that has
+/// not opted in pays nothing. A local account always has a credential row; a missing one
+/// (bootstrap, or a remote actor) has no address to confirm, so it is not refused.
+pub(crate) async fn require_confirmed_email(
+    state: &AppState,
+    account_id: &str,
+) -> Result<(), ApiError> {
+    if !state.require_email_confirmation() {
+        return Ok(());
+    }
+    let confirmed: Option<bool> = sqlx::query_scalar(
+        "SELECT confirmed_at IS NOT NULL FROM account_credential WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(state.store().pool())
+    .await?;
+    if matches!(confirmed, Some(false)) {
+        return Err(ApiError::forbidden(
+            "Confirm your email address before posting or following. \
+             Open the confirmation link in the message we sent you.",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

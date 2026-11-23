@@ -60,13 +60,24 @@ pub async fn serve<F>(config: Config, shutdown: F) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Mail is optional by construction: no SMTP means no sender, no worker and no
+    // confirmation tokens, exactly as `NODUS_DRIVE_SHARE_SECRET` gates share links.
+    // Enforcement cannot work without that sender, so a half-configured instance stops
+    // here instead of accepting a switch that would refuse every new account forever.
+    let mail = nodus_mail::sender_from_env();
+    // A migrations-only run never serves requests, so it must not be blocked by a
+    // switch that only matters to the serving path.
+    if !config.migrate_only {
+        if let Some(message) =
+            missing_mail_sender(config.require_email_confirmation, mail.is_some())
+        {
+            return Err(anyhow!("{message}"));
+        }
+    }
     let store = runtime::prepare(&config)
         .await
         .map_err(|error| anyhow!("{error}"))?;
     let sink = invalidation_sink();
-    // Mail is optional by construction: no SMTP means no sender, no worker and no
-    // confirmation tokens, exactly as `NODUS_DRIVE_SHARE_SECRET` gates share links.
-    let mail = nodus_mail::sender_from_env();
     if let Some(mail) = mail.clone() {
         tokio::spawn(nodus_auth::outbox::run(store.pool().clone(), mail));
     }
@@ -89,6 +100,7 @@ where
         sink.clone(),
     )
     .with_authorized_fetch(config.authorized_fetch)
+    .with_require_email_confirmation(config.require_email_confirmation)
     .with_drive_share(crate::drive::share_links_configured())
     .with_account_delete_grace_days(config.account_delete_grace_days)
     .with_home(home.clone());
@@ -129,6 +141,24 @@ where
     Ok(())
 }
 
+/// The startup contract for email-confirmation enforcement.
+///
+/// Enforcement without a sender cannot work: every new account would wait for a link
+/// that is never sent. Such a configuration is refused before the database is opened.
+fn missing_mail_sender(
+    require_email_confirmation: bool,
+    sender_configured: bool,
+) -> Option<&'static str> {
+    if require_email_confirmation && !sender_configured {
+        Some(
+            "NODUS_REQUIRE_EMAIL_CONFIRMATION is on but no mail sender is configured: \
+             set NODUS_SMTP_HOST (and the rest of NODUS_SMTP_*) or turn the switch off",
+        )
+    } else {
+        None
+    }
+}
+
 /// The sink committed writes publish to, from the environment.
 ///
 /// One variable decides it: `NODUS_VALKEY_URL` set means other replicas are told what
@@ -167,6 +197,7 @@ fn router(
             sink,
         )
         .with_authorized_fetch(config.authorized_fetch)
+        .with_require_email_confirmation(config.require_email_confirmation)
         .with_drive_share(crate::drive::share_links_configured())
         .with_account_delete_grace_days(config.account_delete_grace_days)
         .with_home(home),
@@ -187,4 +218,29 @@ fn router(
     }
     let auth = nodus_auth::router(auth_state);
     api.merge(auth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::missing_mail_sender;
+
+    #[test]
+    fn enforcement_without_a_sender_refuses_to_start() {
+        let message = missing_mail_sender(true, false).expect("must refuse");
+        assert!(message.contains("NODUS_SMTP_HOST"), "{message}");
+        assert!(
+            message.contains("NODUS_REQUIRE_EMAIL_CONFIRMATION"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn enforcement_with_a_sender_starts() {
+        assert_eq!(missing_mail_sender(true, true), None);
+    }
+
+    #[test]
+    fn the_default_switch_does_not_need_a_sender() {
+        assert_eq!(missing_mail_sender(false, false), None);
+    }
 }

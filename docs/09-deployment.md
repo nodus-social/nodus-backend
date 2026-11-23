@@ -175,6 +175,48 @@ line that a shell records. Read it through the service environment, and generate
 a replacement on the host with `openssl rand -hex 32` so the 32 random bytes
 never travel over the wire.
 
+## Mail
+
+Transactional mail is optional. Setting `NODUS_SMTP_HOST` turns on the sender; with it
+unset there is no SMTP connection, no confirmation message, and every account created
+through registration is recorded as confirmed at creation. A partially configured SMTP
+(a host without `NODUS_SMTP_FROM`, or a username without a password) is logged at
+`warn` and treated as unset, so the instance keeps serving.
+
+The variables are read once at API startup:
+
+| Variable | Meaning |
+| --- | --- |
+| `NODUS_SMTP_HOST` | Mail server. Unset (or empty) means no sender; this is the switch that enables the rest. |
+| `NODUS_SMTP_PORT` | Defaults to `587` for `starttls`, `465` for `implicit`, `25` for `none`. |
+| `NODUS_SMTP_TLS` | `starttls` (default), `implicit`, or `none`. `none` is only for a relay on the same trusted network. |
+| `NODUS_SMTP_USERNAME` | Optional; must be set together with `NODUS_SMTP_PASSWORD`. |
+| `NODUS_SMTP_PASSWORD` | Optional; must be set together with `NODUS_SMTP_USERNAME`. |
+| `NODUS_SMTP_FROM` | Required when a host is set. The envelope and header sender. |
+| `NODUS_REQUIRE_EMAIL_CONFIRMATION` | `true` refuses a post or a follow from an account whose address has not been confirmed. Default `false`. |
+
+With the switch **on**, `POST /api/v1/statuses` and `POST /api/v1/accounts/{id}/follow`
+answer `403` with a message naming the confirmation until the link is followed. The
+switch cannot work without a sender: an instance started with
+`NODUS_REQUIRE_EMAIL_CONFIRMATION=true` and no `NODUS_SMTP_HOST` exits at startup with
+an error naming both variables. Keep it off while bringing mail up, confirm the sender
+works, then turn it on. Accounts registered while no sender was configured are recorded
+as confirmed at creation, so enabling the switch later does not lock them out; only
+accounts that received a confirmation message are held. Credentials that predate the
+`confirmed_at` column are `NULL` and are treated as unconfirmed: on an existing
+instance, backfill `account_credential.confirmed_at` for those accounts before turning
+the switch on, or enable it only on a fresh instance.
+
+The confirmation link is `{NODUS_BASE_URL}/auth/confirm/{token}`. It is single-use,
+expires after 48 hours, and the token is stored hashed. A successful follow of the link
+records `account_credential.confirmed_at`.
+
+Delivery is transactional through `email_outbox`: in one transaction with the account
+or message that caused it, never inline with the request. A worker drains the table
+every five seconds. A failed send increments `attempts` and stores `last_error`; after
+five attempts the row is left alone with its last error for an operator to inspect.
+Mail failures never fail the request that queued the message.
+
 ## Logging and abuse alerts
 
 Every request is logged by `tower_http::trace::TraceLayer` with method, path,
