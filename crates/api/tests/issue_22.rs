@@ -358,6 +358,8 @@ async fn miauth_flow_persists_session_issues_token_and_authenticates() {
                 &token_hash(&session_secret),
                 &account_id,
                 Utc::now() + chrono::Duration::hours(1),
+                "test-agent",
+                None,
             )
             .await
             .expect("create browser session");

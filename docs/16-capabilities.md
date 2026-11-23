@@ -7,8 +7,8 @@ vocabularies answer it — the API's list (`crates/api/src/meta.rs:39`, 71 names
 
 The 71 names are not only routes: thirteen administration pages and eight moderation sections are
 names of their own, while `admin` and `moderation` went on meaning the *area* (§5). An area bit
-says the room exists; a page name says which screens inside it answer. Two of the 71 are abilities
-of the shell with no route behind them (§1, "The shell's own two").
+says the room exists; a page name says which screens inside it answer. One of the 72 is an ability
+of the shell with no route behind it (§1, "The shell's own").
 
 ## 1. The publication rule
 
@@ -60,18 +60,21 @@ the row: `drop` writes nothing (so no stream event is published), `filter` write
 `moderation` — always arrive; `follow_request`, `report` and `pending_request` have no write
 path yet, and `status` is mapped but no row is created for it.
 
-### The shell's own two: `two_factor` and `sessions`
+### The shell's own: `two_factor`
 
-Two of the 71 names describe an ability of the **shell**, not of this API: `two_factor` — a second
-proof at sign-in, with the TOTP enrolment, verification and recovery codes that belong beside it —
-and `sessions`, the browsers and apps signed in to the account. Neither has a JSON endpoint, here
-or upstream: Mastodon keeps both in its HTML settings, and so does this instance — the second
-factor is proved and a session is signed out by the shell's own login, with the credential that
-login minted. `crates/api/tests/capabilities.rs::SHELL_CAPABILITIES` (`:460`) is where that is
-stated, one sentence per name saying what serves it, because a silent omission is what hid both
-settings sections on every instance.
+One of the 72 names describes an ability of the **shell**, not of this API: `two_factor` — a
+second proof at sign-in, with the TOTP enrolment, verification and recovery codes that belong
+beside it. It has no JSON endpoint here or upstream: Mastodon keeps it in its HTML settings, and
+so does this instance — the second factor is proved by the shell's own login.
+`crates/api/tests/capabilities.rs::SHELL_CAPABILITIES` is where that is stated, saying what
+serves the name, because a silent omission is what hid the Two-factor settings section on every
+instance.
 
-They are published because the settings strip gates its sections on them
+`sessions` is no longer in that list. The browsers and apps signed in to the account are served
+by `GET`/`DELETE /api/v1/auth/sessions` and `GET`/`DELETE /api/v1/oauth/authorizations`
+(`crates/api/src/sessions.rs`), so the name is proved like every other routed capability.
+
+Both names are published because the settings strip gates its sections on them
 (`web/crates/pages/src/pages/settings/nav.rs`, `SettingsSection::gate`: `TwoFactor` →
 `Feature::TwoFactor`, `Sessions` → `Feature::Sessions`). A client that reads the name may draw the
 section; a client that does not must not, and must conclude this instance's login does not offer

@@ -48,6 +48,7 @@ pub mod remote_moderation;
 pub mod rules;
 pub mod scanners;
 pub mod schedules;
+pub mod sessions;
 pub mod social;
 pub mod stats;
 pub mod statuses;

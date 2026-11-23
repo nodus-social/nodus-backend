@@ -52,6 +52,7 @@ pub mod remote;
 pub mod rulewatch;
 pub mod run;
 pub mod schedules;
+pub mod sessions;
 pub mod state;
 pub mod statuses;
 pub mod streaming;
@@ -179,6 +180,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(lists::router())
         .merge(highlights::router())
         .merge(schedules::router())
+        .merge(sessions::router())
         .merge(notifications::router())
         .merge(notification_policy::router())
         .merge(streaming::router())

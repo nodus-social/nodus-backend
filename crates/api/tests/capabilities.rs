@@ -445,6 +445,11 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/domain_blocks",
         owner: Owner::Api,
     },
+    Capability {
+        name: "sessions",
+        path: "/api/v1/auth/sessions",
+        owner: Owner::Api,
+    },
 ];
 
 /// One published name whose surface is the shell's own, with no API route behind it.
@@ -456,28 +461,19 @@ struct ShellCapability {
 
 /// The names no API route answers, stated rather than skipped.
 ///
-/// Every other published name is proved by [`CAPABILITIES`] plus the router. These two
-/// describe abilities of the shell's own account screens, and upstream Mastodon has no JSON
-/// API for either (both live in its HTML settings): a session is reviewed and signed out
-/// with the credential the login minted, and the second factor is proved by the login
-/// itself. `SHELL_CAPABILITIES` is not a silencer — each row must say what serves the name,
-/// must be published by `FEATURES`, and must not be claimed by a routed group. Leaving the
-/// two out of `FEATURES` instead is exactly what hid the shell's Sessions and Two-factor
-/// tabs on every instance.
-const SHELL_CAPABILITIES: &[ShellCapability] = &[
-    ShellCapability {
-        name: "sessions",
-        served_by: "the shell's Sessions tab: the browsers and apps signed in to the account \
-                    are signed out with the credential the login minted, not with a route this \
-                    API serves",
-    },
-    ShellCapability {
-        name: "two_factor",
-        served_by: "the shell's own login proves the second factor: TOTP enrolment, \
+/// Every other published name is proved by [`CAPABILITIES`] plus the router. This one
+/// describes an ability of the shell's own login screen, and upstream Mastodon has no JSON
+/// API for it either (it lives in its HTML settings): the second factor is proved by the
+/// login itself. `SHELL_CAPABILITIES` is not a silencer — each row must say what serves the
+/// name, must be published by `FEATURES`, and must not be claimed by a routed group.
+/// Leaving it out of `FEATURES` instead is exactly what hid the shell's Two-factor tab on
+/// every instance.
+const SHELL_CAPABILITIES: &[ShellCapability] = &[ShellCapability {
+    name: "two_factor",
+    served_by: "the shell's own login proves the second factor: TOTP enrolment, \
                     verification and recovery codes; a JSON 2FA API does not exist upstream \
                     either, because Mastodon keeps it in HTML settings",
-    },
-];
+}];
 
 /// Which features each administration module stands behind.
 ///
@@ -887,8 +883,7 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
          (`domain_blocks`), the profile's featured tags (`featured_tags`), the \
          backend-assembled pages (`pages`), the notification policy \
          (`notification_settings`), the account export (`exports`), the published profile \
-         banners (`style_public`), and the two abilities the shell serves itself \
-         (`sessions`, `two_factor`)"
+         banners (`style_public`), and the ability the shell serves itself (`two_factor`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1263,6 +1258,7 @@ const ROUTE_SOURCES: &[(&str, &str)] = route_sources![
     "polls.rs",
     "preferences.rs",
     "schedules.rs",
+    "sessions.rs",
     "style_public.rs",
     "streaming.rs",
     "suggestions.rs",
@@ -1751,6 +1747,18 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
         prefix: "/api/miauth",
         features: &[],
         reason: "MiAuth compatibility dialect; a token exchange, not a capability",
+    },
+    // The settings page's one credential list: browser sessions and app authorizations
+    // are the same published capability, drawn as one section.
+    SurfaceGroup {
+        prefix: "/api/v1/auth/sessions",
+        features: &["sessions"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/oauth/authorizations",
+        features: &["sessions"],
+        reason: "",
     },
 ];
 

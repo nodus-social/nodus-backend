@@ -4,12 +4,15 @@
 //! clients expect. Storage is behind [`AuthStore`]; the service never opens a second
 //! database abstraction of its own.
 
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use argon2::Argon2;
-use axum::extract::{Form, Query, RawQuery, State};
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, Form, FromRequestParts, Query, RawQuery, State};
+use axum::http::request::Parts;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -42,6 +45,67 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
 pub const SESSION_COOKIE: &str = "nodus_auth";
 const SESSION_DAYS: i64 = 30;
 const CODE_MINUTES: i64 = 5;
+/// Enough for every user agent in the wild; the header is attacker-controlled, so a
+/// session row must not be a place to park kilobytes.
+const USER_AGENT_MAX: usize = 512;
+
+/// The peer address the transport observed, when it observed one.
+///
+/// The socket transport inserts [`ConnectInfo`] only for the ingress path, where the
+/// ingress is the only process that can dial it. A TCP listener's peer is already the
+/// caller, so a forwarded header there would be a claim rather than an observation.
+struct Peer(Option<SocketAddr>);
+
+// The trait's method is async; reading an extension is not. There is nothing to wait
+// for, and a second await point would only be noise.
+#[allow(clippy::unused_async_trait_impl)]
+impl<S: Send + Sync> FromRequestParts<S> for Peer {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(address)| *address),
+        ))
+    }
+}
+
+/// The session's device: the user agent it announced and the network it came from.
+fn session_device(headers: &HeaderMap, peer: Option<SocketAddr>) -> (String, Option<String>) {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .chars()
+        .take(USER_AGENT_MAX)
+        .collect();
+    (user_agent, peer.map(|address| network_prefix(address.ip())))
+}
+
+/// Keeps the network and drops the host: `/24` for IPv4, `/48` for IPv6.
+///
+/// A session list answers "which network was this", and the host bits do not add to
+/// that answer. Thirty days of a full address is a location record; a prefix is not.
+fn network_prefix(address: IpAddr) -> String {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2])
+        }
+        // A dual-stack listener reports an IPv4 caller as `::ffff:a.b.c.d`; treating that
+        // as native IPv6 would truncate every IPv4 visitor to the same useless prefix.
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                network_prefix(IpAddr::V4(mapped))
+            } else {
+                let segments = address.segments();
+                format!("{:x}:{:x}:{:x}::/48", segments[0], segments[1], segments[2])
+            }
+        }
+    }
+}
 
 static DUMMY_PASSWORD_HASH: LazyLock<String> = LazyLock::new(|| {
     hash_password("nodus-dummy-timing-oracle-guard").expect("dummy password hash")
@@ -203,6 +267,8 @@ fn verify_login_password(credential: Option<&Credential>, password: &str) -> boo
 async fn login_submit<S: AuthStore>(
     State(state): State<AppState<S>>,
     jar: CookieJar,
+    headers: HeaderMap,
+    peer: Peer,
     Form(form): Form<LoginForm>,
 ) -> Response {
     if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
@@ -236,9 +302,16 @@ async fn login_submit<S: AuthStore>(
 
     let session = opaque_token();
     let expiry = Utc::now() + Duration::days(SESSION_DAYS);
+    let (user_agent, ip) = session_device(&headers, peer.0);
     if state
         .store
-        .create_session(&token_hash(&session), &credential.account_id, expiry)
+        .create_session(
+            &token_hash(&session),
+            &credential.account_id,
+            expiry,
+            &user_agent,
+            ip.as_deref(),
+        )
         .await
         .is_err()
     {
@@ -378,6 +451,8 @@ async fn register_page<S: AuthStore>(
 async fn register_submit<S: AuthStore>(
     State(state): State<AppState<S>>,
     jar: CookieJar,
+    headers: HeaderMap,
+    peer: Peer,
     Form(form): Form<RegisterForm>,
 ) -> Response {
     if !state.config.registrations_open {
@@ -432,9 +507,16 @@ async fn register_submit<S: AuthStore>(
     // into the same page is a step that only exists to be clicked past.
     let session = opaque_token();
     let expiry = Utc::now() + Duration::days(SESSION_DAYS);
+    let (user_agent, ip) = session_device(&headers, peer.0);
     if state
         .store
-        .create_session(&token_hash(&session), &account.account_id, expiry)
+        .create_session(
+            &token_hash(&session),
+            &account.account_id,
+            expiry,
+            &user_agent,
+            ip.as_deref(),
+        )
         .await
         .is_err()
     {
@@ -1271,6 +1353,23 @@ mod tests {
         assert!(!verify_login_password(None, "anything"));
         let parsed = PasswordHash::new(DUMMY_PASSWORD_HASH.as_str()).expect("valid dummy hash");
         assert_eq!(parsed.algorithm.as_str(), "argon2id");
+    }
+
+    #[test]
+    fn the_network_prefix_drops_the_host_and_unwraps_mapped_ipv4() {
+        assert_eq!(
+            network_prefix("203.0.113.7".parse().expect("ipv4")),
+            "203.0.113.0/24"
+        );
+        assert_eq!(
+            network_prefix("2001:db8:abcd:12::1".parse().expect("ipv6")),
+            "2001:db8:abcd::/48"
+        );
+        assert_eq!(
+            network_prefix("::ffff:203.0.113.7".parse().expect("mapped ipv4")),
+            "203.0.113.0/24",
+            "a dual-stack peer keeps the IPv4 network instead of collapsing to ::/48"
+        );
     }
 
     #[test]

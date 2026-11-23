@@ -145,6 +145,8 @@ async fn create_browser_session(pool: &PgPool, account_id: &str) -> String {
             &token_hash(&secret),
             account_id,
             Utc::now() + chrono::Duration::hours(1),
+            "test-agent",
+            None,
         )
         .await
         .expect("create browser session");

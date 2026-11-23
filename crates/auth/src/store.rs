@@ -91,6 +91,8 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
         token_hash: &str,
         account_id: &str,
         expires_at: DateTime<Utc>,
+        user_agent: &str,
+        ip: Option<&str>,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
     fn session_account(
@@ -357,20 +359,38 @@ impl AuthStore for PgAuthStore {
         token_hash: &str,
         account_id: &str,
         expires_at: DateTime<Utc>,
+        user_agent: &str,
+        ip: Option<&str>,
     ) -> Result<(), Error> {
         sqlx::query(
-            "INSERT INTO auth_session (id, account_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
+            "INSERT INTO auth_session \
+                 (id, account_id, token_hash, expires_at, user_agent, ip, last_used_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, now())",
         )
         .bind(new_id())
         .bind(account_id)
         .bind(token_hash)
         .bind(expires_at)
+        .bind(user_agent)
+        .bind(ip)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     async fn session_account(&self, token_hash: &str) -> Result<Option<SessionAccount>, Error> {
+        // A session is used on every page load, but "last used" only has to be true to a
+        // minute. The conditional UPDATE matches nothing until the stored value is stale,
+        // so two requests in the same minute cost one write, not two.
+        let _ = sqlx::query(
+            "UPDATE auth_session SET last_used_at = now() \
+             WHERE token_hash = $1 \
+               AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')",
+        )
+        .bind(token_hash)
+        .execute(&self.pool)
+        .await;
+
         let row = sqlx::query_as::<_, (String, String, String, bool)>(
             "SELECT a.id, a.username::text, a.display_name, a.admin \
              FROM auth_session s JOIN account a ON a.id = s.account_id \
