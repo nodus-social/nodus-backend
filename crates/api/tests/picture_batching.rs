@@ -372,6 +372,61 @@ async fn a_response_reads_picture_shapes_once_however_many_statuses_it_paints() 
         // A page-shaped endpoint: the whole read set is already flat.
         assert_eq!(page_one.statements, 10, "one-post list statements");
         assert_eq!(page_twenty.statements, 10, "twenty-post list statements");
+
+        // ---- An outbox: `/accounts/{id}/statuses` paints the same page shape. ----
+        // It used to build each row through `statuses::dto`, reading the author, media,
+        // decorations and viewer flags one row at a time (~12 statements per status). The
+        // page seam makes the count a property of the page, not of its length.
+        let one_outbox_owner = create_account(pool, "picture-outbox-one").await;
+        give_pictures(&store, &one_outbox_owner).await;
+        create_status(pool, &one_outbox_owner, "one outbox post", "public", &[], &[]).await;
+        let twenty_outbox_owner = create_account(pool, "picture-outbox-twenty").await;
+        give_pictures(&store, &twenty_outbox_owner).await;
+        for _ in 0..20 {
+            create_status(
+                pool,
+                &twenty_outbox_owner,
+                "an outbox post",
+                "public",
+                &[],
+                &[],
+            )
+            .await;
+        }
+
+        let outbox_one = measure(
+            &log,
+            &app,
+            &owner_token,
+            &format!("/api/v1/accounts/{one_outbox_owner}/statuses"),
+        )
+        .await;
+        let outbox_twenty = measure(
+            &log,
+            &app,
+            &owner_token,
+            &format!("/api/v1/accounts/{twenty_outbox_owner}/statuses"),
+        )
+        .await;
+        assert_eq!(
+            outbox_one.body.as_array().map(Vec::len),
+            Some(1),
+            "one-post outbox"
+        );
+        assert_eq!(
+            outbox_twenty.body.as_array().map(Vec::len),
+            Some(20),
+            "twenty-post outbox"
+        );
+        assert_eq!(outbox_one.pictures, 1, "one-post outbox picture reads");
+        assert_eq!(
+            outbox_twenty.pictures, 1,
+            "twenty-post outbox picture reads"
+        );
+        assert_eq!(
+            outbox_twenty.statements, outbox_one.statements,
+            "outbox statements must not grow with the page"
+        );
     })
     .await;
 }

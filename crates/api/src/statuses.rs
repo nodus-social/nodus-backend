@@ -768,17 +768,11 @@ pub async fn account_statuses(
     let params = query.params()?;
     let page =
         nodus_server_store::statuses::account_page(state.store().pool(), &id, params).await?;
-    let mut visible = Vec::with_capacity(page.items.len());
-    for row in page.items {
-        if can_view(&state, auth.as_ref(), &row).await? {
-            visible.push(row);
-        }
-    }
-    let pictures = pictures_for_rows(&state, &visible).await?;
-    let mut items = Vec::with_capacity(visible.len());
-    for row in &visible {
-        items.push(dto_with_pictures(&state, row, auth.as_ref(), Some(&pictures)).await?);
-    }
+    // One snapshot for the whole page. Looping `dto` here read the author, media,
+    // decorations and viewer flags of every row separately: ~12 statements per status,
+    // 245 for a 20-status page, all queueing for a pool connection.
+    let viewer = auth.as_ref().map(|auth| auth.0.account.id.as_str());
+    let (items, _, _) = crate::pages::hydrate_statuses(&state, page.items, viewer, &[], None).await?;
     let mut response = Json(items).into_response();
     if let Some(next) = page.next_max_id {
         let size = nodus_server_core::PageSize::default_max(params.limit);

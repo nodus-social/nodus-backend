@@ -254,7 +254,7 @@ pub async fn status(
 ///
 /// `rows` is filtered here rather than by the caller so the two page handlers cannot
 /// disagree about which row is safe to paint. The order of the input is preserved.
-async fn hydrate_statuses(
+pub(crate) async fn hydrate_statuses(
     state: &AppState,
     rows: Vec<StatusRow>,
     viewer: Option<&str>,
