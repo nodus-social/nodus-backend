@@ -2043,9 +2043,7 @@ async fn every_routed_surface_group_is_named_in_both_directions() {
     let orphans: Vec<&str> = published
         .iter()
         .copied()
-        .filter(|name| {
-            !grouped.contains(name) && !shell.contains(name) && !feeds.contains(name)
-        })
+        .filter(|name| !grouped.contains(name) && !shell.contains(name) && !feeds.contains(name))
         .collect();
     assert!(
         orphans.is_empty(),

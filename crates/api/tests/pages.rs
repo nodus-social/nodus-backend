@@ -345,12 +345,8 @@ async fn a_handle_answers_the_same_profile_page_as_an_id() {
         );
 
         let encoded = handle.replace('@', "%40");
-        let (status, body) = send_anon(
-            &app,
-            "GET",
-            &format!("/api/v1/pages/profile/{encoded}"),
-        )
-        .await;
+        let (status, body) =
+            send_anon(&app, "GET", &format!("/api/v1/pages/profile/{encoded}")).await;
         let by_encoded = json_of(&expect_ok(status, &body, "profile by encoded handle"));
         assert_eq!(by_encoded, by_id, "a %40 handle answers the same document");
 
@@ -374,8 +370,7 @@ async fn a_handle_answers_the_same_profile_page_as_an_id() {
             None,
         )
         .await;
-        let signed_in_by_handle =
-            json_of(&expect_ok(status, &body, "signed-in profile by handle"));
+        let signed_in_by_handle = json_of(&expect_ok(status, &body, "signed-in profile by handle"));
         assert_eq!(signed_in_by_handle, signed_in_by_id);
         assert_eq!(signed_in_by_handle["relationship"]["id"], author);
 
@@ -410,7 +405,15 @@ async fn a_remote_handle_resolves_by_its_own_domain() {
         .execute(store.pool())
         .await
         .expect("make author remote");
-        create_status(store.pool(), &author, "from the remote host", "public", &[], &[]).await;
+        create_status(
+            store.pool(),
+            &author,
+            "from the remote host",
+            "public",
+            &[],
+            &[],
+        )
+        .await;
 
         let by_id = profile_by_id(&app, &author).await;
         let handle = handle_of(store.pool(), &author, "remote.test").await;
@@ -439,12 +442,8 @@ async fn an_unknown_handle_is_a_404_that_names_it() {
     let _serial = serial().await;
     run_db_test(|store, app| async move {
         let _ = store;
-        let (status, body) = send_anon(
-            &app,
-            "GET",
-            "/api/v1/pages/profile/nobody%40social.test",
-        )
-        .await;
+        let (status, body) =
+            send_anon(&app, "GET", "/api/v1/pages/profile/nobody%40social.test").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let body = json_of(&body);
         let message = body["error"].as_str().unwrap_or_default();
