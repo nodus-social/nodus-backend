@@ -127,16 +127,26 @@ async fn batch(
     for call in calls {
         let (value, error) = match call.call {
             Verb::Account { id } => match state.store().account(&id).await? {
-                Some(account) => (
-                    Some(
-                        serde_json::to_value(crate::dto::AccountDto::from_row(
-                            &account,
-                            state.instance(),
-                        ))
-                        .map_err(|error| serialise_error(&error))?,
-                    ),
-                    None,
-                ),
+                Some(account) => {
+                    let pictures = state
+                        .store()
+                        .batch()
+                        .profile_pictures(std::slice::from_ref(&account.id))
+                        .run()
+                        .await?;
+                    let mut documents = crate::dto::accounts_with_pictures(
+                        std::slice::from_ref(&account),
+                        &pictures,
+                        state.instance(),
+                    );
+                    (
+                        Some(
+                            serde_json::to_value(documents.pop().expect("one account"))
+                                .map_err(|error| serialise_error(&error))?,
+                        ),
+                        None,
+                    )
+                }
                 None => (None, Some("account not found".to_owned())),
             },
             Verb::Status { id } => match statuses::by_id(state.store().pool(), &id).await? {

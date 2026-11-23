@@ -28,7 +28,7 @@ use nodus_server_store::live::{self, LiveEvent, Subscription};
 
 use crate::auth::{authenticate, Auth};
 use crate::conversations::ConversationDto;
-use crate::dto::AccountDto;
+use crate::dto::accounts_with_pictures;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::statuses;
@@ -272,16 +272,27 @@ async fn conversation(state: &AppState, auth: &Auth, status_id: &str) -> Option<
         .ok()
         .flatten()?;
     let roots = std::slice::from_ref(&root);
-    let mut accounts = Vec::new();
+    let mut ids = Vec::new();
     for (_, account_id) in
         nodus_server_store::conversations::participants(pool, &auth.0.account.id, roots)
             .await
             .ok()?
     {
-        if let Some(account) = state.store().account(&account_id).await.ok().flatten() {
-            accounts.push(AccountDto::from_row(&account, state.instance()));
-        }
+        ids.push(account_id);
     }
+    let outcome = state
+        .store()
+        .batch()
+        .accounts(&ids)
+        .profile_pictures(&ids)
+        .run()
+        .await
+        .ok()?;
+    let ordered: Vec<&nodus_server_store::accounts::AccountRow> = ids
+        .iter()
+        .filter_map(|id| outcome.accounts.get(id))
+        .collect();
+    let accounts = accounts_with_pictures(ordered, &outcome, state.instance());
     let muted = nodus_server_store::conversations::muted_roots(pool, &auth.0.account.id, roots)
         .await
         .is_ok_and(|muted| muted.contains(&root));

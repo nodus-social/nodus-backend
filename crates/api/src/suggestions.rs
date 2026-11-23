@@ -13,7 +13,7 @@ use nodus_server_core::limits::PAGE_MAX_ACCOUNTS;
 use nodus_server_core::PageSize;
 
 use crate::auth::Auth;
-use crate::dto::AccountDto;
+use crate::dto::{accounts_with_pictures, AccountDto};
 use crate::error::ApiResult;
 use crate::state::AppState;
 
@@ -45,10 +45,13 @@ pub async fn list(
         i64::from(size.get()),
     )
     .await?;
+    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let pictures = state.store().batch().profile_pictures(&ids).run().await?;
     Ok(Json(
-        rows.iter()
-            .map(|row| SuggestionDto {
-                account: AccountDto::from_row(row, state.instance()),
+        accounts_with_pictures(&rows, &pictures, state.instance())
+            .into_iter()
+            .map(|account| SuggestionDto {
+                account,
                 source: "recent_activity".to_owned(),
                 sources: vec!["recent_activity".to_owned()],
             })

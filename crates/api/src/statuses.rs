@@ -18,7 +18,7 @@ use nodus_server_store::social::ViewerFlags;
 use nodus_server_store::statuses::{InteractionAudience, NewStatus, StatusRow};
 
 use crate::auth::{Auth, MaybeAuth};
-use crate::dto::{account_url_parts, AccountDto, StatusDto};
+use crate::dto::{account_url_parts, accounts_with_pictures, AccountDto, StatusDto};
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
 use crate::state::AppState;
@@ -460,7 +460,15 @@ pub async fn history(
         .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    let account = AccountDto::from_row(&author, state.instance());
+    let pictures = state
+        .store()
+        .batch()
+        .profile_pictures(std::slice::from_ref(&author.id))
+        .run()
+        .await?;
+    let mut accounts =
+        accounts_with_pictures(std::slice::from_ref(&author), &pictures, state.instance());
+    let account = accounts.pop().expect("one account");
     let edits = nodus_server_store::statuses::edits(state.store().pool(), &row.id).await?;
     Ok(Json(
         edits
@@ -520,12 +528,13 @@ pub async fn favourited_by(
         i64::from(size.get()),
     )
     .await?;
-    Ok(Json(
-        accounts
-            .iter()
-            .map(|account| AccountDto::from_row(account, state.instance()))
-            .collect(),
-    ))
+    let ids: Vec<String> = accounts.iter().map(|account| account.id.clone()).collect();
+    let pictures = state.store().batch().profile_pictures(&ids).run().await?;
+    Ok(Json(accounts_with_pictures(
+        &accounts,
+        &pictures,
+        state.instance(),
+    )))
 }
 
 /// `GET /api/v1/statuses/{id}/reblogged_by`
@@ -549,12 +558,13 @@ pub async fn reblogged_by(
         i64::from(size.get()),
     )
     .await?;
-    Ok(Json(
-        accounts
-            .iter()
-            .map(|account| AccountDto::from_row(account, state.instance()))
-            .collect(),
-    ))
+    let ids: Vec<String> = accounts.iter().map(|account| account.id.clone()).collect();
+    let pictures = state.store().batch().profile_pictures(&ids).run().await?;
+    Ok(Json(accounts_with_pictures(
+        &accounts,
+        &pictures,
+        state.instance(),
+    )))
 }
 
 pub async fn destroy(
@@ -775,8 +785,15 @@ pub(crate) async fn dto(
         .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
+    let author_pictures = state
+        .store()
+        .batch()
+        .profile_pictures(std::slice::from_ref(&account.id))
+        .run()
+        .await?;
     let media = nodus_server_store::media::by_status(state.store().pool(), &row.id).await?;
     let mut dto = StatusDto::from_row_with_media(row, &account, state.instance(), &media);
+    dto.apply_account_pictures(&author_pictures.profile_pictures);
     let viewer_id = viewer.map(|auth| auth.0.account.id.as_str());
     decorate(state, &mut dto, &row.id, viewer_id).await?;
     if let Some(original_id) = &row.reblog_of_id {
@@ -790,12 +807,19 @@ pub(crate) async fn dto(
                 .ok_or_else(|| ApiError::not_found("Record not found"))?;
             let original_media =
                 nodus_server_store::media::by_status(state.store().pool(), &original.id).await?;
+            let original_pictures = state
+                .store()
+                .batch()
+                .profile_pictures(std::slice::from_ref(&original_account.id))
+                .run()
+                .await?;
             let mut boost = StatusDto::from_row_with_media(
                 &original,
                 &original_account,
                 state.instance(),
                 &original_media,
             );
+            boost.apply_account_pictures(&original_pictures.profile_pictures);
             decorate(state, &mut boost, &original.id, viewer_id).await?;
             dto.reblog = Some(Box::new(boost));
         }

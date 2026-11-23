@@ -15,7 +15,7 @@ use nodus_server_core::limits::PAGE_MAX;
 use nodus_server_core::pagination::PageSize;
 
 use crate::auth::MaybeAuth;
-use crate::dto::{AccountDto, StatusDto};
+use crate::dto::{accounts_with_pictures, AccountDto, StatusDto};
 use crate::error::ApiResult;
 use crate::state::AppState;
 use crate::statuses;
@@ -93,15 +93,22 @@ pub async fn search(
         let rows =
             nodus_server_store::discovery::search_accounts(pool, &term, &instance.domain, limit)
                 .await?;
-        result.accounts = rows
-            .iter()
-            .map(|row| AccountDto::from_row(row, instance))
-            .collect();
+        let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+        let pictures = state.store().batch().profile_pictures(&ids).run().await?;
+        result.accounts = accounts_with_pictures(&rows, &pictures, instance);
         if query.resolve == Some(true) {
             if let Some(row) = resolve_named_account(&state, &term, &result.accounts).await {
+                let pictures = state
+                    .store()
+                    .batch()
+                    .profile_pictures(std::slice::from_ref(&row.id))
+                    .run()
+                    .await?;
+                let mut documents =
+                    accounts_with_pictures(std::slice::from_ref(&row), &pictures, instance);
                 result
                     .accounts
-                    .insert(0, AccountDto::from_row(&row, instance));
+                    .insert(0, documents.pop().expect("one account"));
             }
         }
     }

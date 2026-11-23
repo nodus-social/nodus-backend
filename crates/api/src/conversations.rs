@@ -16,7 +16,7 @@ use nodus_server_core::limits::PAGE_MAX;
 use nodus_server_core::pagination::PageSize;
 
 use crate::auth::Auth;
-use crate::dto::{AccountDto, StatusDto};
+use crate::dto::{accounts_with_pictures, AccountDto, StatusDto};
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
 use crate::state::AppState;
@@ -69,27 +69,32 @@ pub async fn list(
     let mut participant_ids: Vec<String> = by_root.values().flatten().cloned().collect();
     participant_ids.sort_unstable();
     participant_ids.dedup();
-    let mut participant_rows: nodus_server_store::RowMap<nodus_server_store::accounts::AccountRow> =
-        nodus_server_store::RowMap::new();
+    let mut participant_outcome = None;
     if !participant_ids.is_empty() {
-        participant_rows = state
-            .store()
-            .batch()
-            .accounts(&participant_ids)
-            .run()
-            .await?
-            .accounts;
+        participant_outcome = Some(
+            state
+                .store()
+                .batch()
+                .accounts(&participant_ids)
+                .profile_pictures(&participant_ids)
+                .run()
+                .await?,
+        );
     }
 
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
-        let mut accounts = Vec::new();
         let participants = by_root.get(&row.root_id).map_or(&[][..], Vec::as_slice);
-        for id in participants {
-            if let Some(account) = participant_rows.get(id) {
-                accounts.push(AccountDto::from_row(account, state.instance()));
+        let accounts = match &participant_outcome {
+            Some(outcome) => {
+                let ordered: Vec<&nodus_server_store::accounts::AccountRow> = participants
+                    .iter()
+                    .filter_map(|id| outcome.accounts.get(id))
+                    .collect();
+                accounts_with_pictures(ordered, outcome, state.instance())
             }
-        }
+            None => Vec::new(),
+        };
         let last_status =
             match nodus_server_store::statuses::by_id(pool, &row.last_status_id).await? {
                 Some(status) => Some(statuses::dto(&state, &status, Some(&auth)).await?),
@@ -257,13 +262,19 @@ async fn participant_dtos(state: &AppState, auth: &Auth, root: &str) -> ApiResul
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = state.store().batch().accounts(&ids).run().await?.accounts;
+    let outcome = state
+        .store()
+        .batch()
+        .accounts(&ids)
+        .profile_pictures(&ids)
+        .run()
+        .await?;
     // A participant whose account row is gone is omitted rather than defaulted.
-    Ok(ids
+    let ordered: Vec<&nodus_server_store::accounts::AccountRow> = ids
         .iter()
-        .filter_map(|id| rows.get(id))
-        .map(|account| AccountDto::from_row(account, state.instance()))
-        .collect())
+        .filter_map(|id| outcome.accounts.get(id))
+        .collect();
+    Ok(accounts_with_pictures(ordered, &outcome, state.instance()))
 }
 
 /// The router fragment, mounted by `crate::router`.

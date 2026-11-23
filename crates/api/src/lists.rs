@@ -163,17 +163,25 @@ async fn accounts(
         return Err(ApiError::not_found("list does not exist"));
     }
     let ids = nodus_server_store::lists::account_ids(state.store().pool(), &id, 200).await?;
-    let rows = state.store().batch().accounts(&ids).run().await?;
+    let outcome = state
+        .store()
+        .batch()
+        .accounts(&ids)
+        .profile_pictures(&ids)
+        .run()
+        .await?;
     // Walk `ids`, not the row map: the response order is the membership order the client
     // sees, and `RowMap` is sorted by id. A member whose account row is gone is skipped,
     // exactly as the per-id lookup skipped it.
-    let mut out = Vec::with_capacity(ids.len());
-    for account_id in &ids {
-        if let Some(row) = rows.accounts.get(account_id) {
-            out.push(crate::dto::AccountDto::from_row(row, state.instance()));
-        }
-    }
-    Ok(Json(out))
+    let ordered: Vec<&nodus_server_store::accounts::AccountRow> = ids
+        .iter()
+        .filter_map(|account_id| outcome.accounts.get(account_id))
+        .collect();
+    Ok(Json(crate::dto::accounts_with_pictures(
+        ordered,
+        &outcome,
+        state.instance(),
+    )))
 }
 
 async fn add_accounts(

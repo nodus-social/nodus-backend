@@ -16,8 +16,8 @@ use nodus_server_core::{PageParams, PageSize};
 
 use crate::auth::{Auth, MaybeAuth};
 use crate::dto::{
-    AccountDto, ConfigurationDto, InstanceV1Dto, InstanceV2Dto, RegistrationsDto, RuleDto,
-    StatusDto,
+    own_account_with_pictures, AccountDto, ConfigurationDto, InstanceV1Dto, InstanceV2Dto,
+    RegistrationsDto, RuleDto, StatusDto,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -236,8 +236,15 @@ pub async fn verify_credentials(
     auth: Auth,
 ) -> ApiResult<Json<AccountDto>> {
     auth.require_scope("read")?;
-    Ok(Json(AccountDto::from_own_row(
+    let pictures = state
+        .store()
+        .batch()
+        .profile_pictures(std::slice::from_ref(&auth.0.account.id))
+        .run()
+        .await?;
+    Ok(Json(own_account_with_pictures(
         &auth.0.account,
+        &pictures,
         state.instance(),
     )))
 }

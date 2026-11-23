@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use nodus_server_core::Id;
 
 use crate::auth::{Auth, MaybeAuth};
-use crate::dto::{AccountDto, RuleDto};
+use crate::dto::{accounts_with_pictures, AccountDto, RuleDto};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -230,11 +230,13 @@ pub async fn directory(
         i64::from(size.get()),
     )
     .await?;
-    Ok(Json(
-        rows.iter()
-            .map(|row| AccountDto::from_row(row, state.instance()))
-            .collect(),
-    ))
+    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let pictures = state.store().batch().profile_pictures(&ids).run().await?;
+    Ok(Json(accounts_with_pictures(
+        &rows,
+        &pictures,
+        state.instance(),
+    )))
 }
 
 /// The router fragment, mounted by `crate::router`.

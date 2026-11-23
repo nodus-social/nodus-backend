@@ -12,7 +12,7 @@ use nodus_server_core::limits::PAGE_MAX;
 use nodus_server_core::pagination::PageSize;
 
 use crate::auth::Auth;
-use crate::dto::AccountDto;
+use crate::dto::{accounts_with_pictures, AccountDto};
 use crate::error::ApiResult;
 use crate::state::AppState;
 
@@ -26,16 +26,24 @@ pub async fn list(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<V
     )
     .await?;
     let ids: Vec<String> = rows.iter().map(|row| row.account_id.clone()).collect();
-    let accounts = state.store().batch().accounts(&ids).run().await?;
+    let outcome = state
+        .store()
+        .batch()
+        .accounts(&ids)
+        .profile_pictures(&ids)
+        .run()
+        .await?;
     // Walk the request rows, not the row map, so the pending list keeps its
     // newest-first order instead of sorting by account id.
-    let mut items = Vec::with_capacity(rows.len());
-    for row in &rows {
-        if let Some(account) = accounts.accounts.get(&row.account_id) {
-            items.push(AccountDto::from_row(account, state.instance()));
-        }
-    }
-    Ok(Json(items))
+    let ordered: Vec<&nodus_server_store::accounts::AccountRow> = rows
+        .iter()
+        .filter_map(|row| outcome.accounts.get(&row.account_id))
+        .collect();
+    Ok(Json(accounts_with_pictures(
+        ordered,
+        &outcome,
+        state.instance(),
+    )))
 }
 
 /// `POST /api/v1/follow_requests/{id}/authorize`

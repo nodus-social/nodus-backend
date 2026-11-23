@@ -15,7 +15,7 @@ use nodus_server_store::social::{FollowOutcome, Relationship};
 
 use crate::auth::{Auth, RecoveryAuth};
 use crate::body::{JsonOrForm, OptionalJsonOrForm};
-use crate::dto::AccountDto;
+use crate::dto::{accounts_with_pictures, own_account_with_pictures, AccountDto};
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
 use crate::media::{ProfileSlot, UploadFile};
@@ -279,8 +279,18 @@ pub async fn update_credentials(
     // the account's key when the worker sends it.
     let row = crate::activitypub::ensure_identity(&state, row).await?;
     crate::outbox::deliver_actor_update(&state, &row.id).await;
+    let pictures = state
+        .store()
+        .batch()
+        .profile_pictures(std::slice::from_ref(&row.id))
+        .run()
+        .await?;
     // The caller's own document, so it carries the same `staff_role` verify_credentials does.
-    Ok(Json(AccountDto::from_own_row(&row, state.instance())))
+    Ok(Json(own_account_with_pictures(
+        &row,
+        &pictures,
+        state.instance(),
+    )))
 }
 
 /// Turns an uploaded picture into the reference a profile stores.
@@ -461,7 +471,17 @@ pub async fn undelete(
     let row = nodus_server_store::accounts::undelete(state.store().pool(), &id)
         .await?
         .ok_or_else(|| ApiError::not_found("There is no deletion to undo"))?;
-    Ok(Json(AccountDto::from_own_row(&row, state.instance())))
+    let pictures = state
+        .store()
+        .batch()
+        .profile_pictures(std::slice::from_ref(&row.id))
+        .run()
+        .await?;
+    Ok(Json(own_account_with_pictures(
+        &row,
+        &pictures,
+        state.instance(),
+    )))
 }
 
 pub async fn lookup(
@@ -481,7 +501,14 @@ pub async fn lookup(
     let account = nodus_server_store::accounts::lookup(state.store().pool(), wanted)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    Ok(Json(AccountDto::from_row(&account, instance)))
+    let pictures = state
+        .store()
+        .batch()
+        .profile_pictures(std::slice::from_ref(&account.id))
+        .run()
+        .await?;
+    let mut documents = accounts_with_pictures(std::slice::from_ref(&account), &pictures, instance);
+    Ok(Json(documents.pop().expect("one account")))
 }
 
 pub async fn followers(
@@ -511,11 +538,9 @@ async fn follow_list(
     let page =
         nodus_server_store::accounts::follow_page(state.store().pool(), &id, followers, params)
             .await?;
-    let items: Vec<_> = page
-        .items
-        .iter()
-        .map(|row| AccountDto::from_row(row, state.instance()))
-        .collect();
+    let ids: Vec<String> = page.items.iter().map(|row| row.id.clone()).collect();
+    let pictures = state.store().batch().profile_pictures(&ids).run().await?;
+    let items = accounts_with_pictures(&page.items, &pictures, state.instance());
     let mut response = Json(items).into_response();
     if let Some(next) = page.next_max_id {
         let path = format!(
@@ -690,11 +715,13 @@ pub async fn blocks(State(state): State<AppState>, auth: Auth) -> ApiResult<Json
     let rows =
         nodus_server_store::social::relations(state.store().pool(), &auth.0.account.id, "block")
             .await?;
-    Ok(Json(
-        rows.iter()
-            .map(|row| AccountDto::from_row(row, state.instance()))
-            .collect(),
-    ))
+    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let pictures = state.store().batch().profile_pictures(&ids).run().await?;
+    Ok(Json(accounts_with_pictures(
+        &rows,
+        &pictures,
+        state.instance(),
+    )))
 }
 
 pub async fn mutes(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<AccountDto>>> {
@@ -702,11 +729,13 @@ pub async fn mutes(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<
     let rows =
         nodus_server_store::social::relations(state.store().pool(), &auth.0.account.id, "mute")
             .await?;
-    Ok(Json(
-        rows.iter()
-            .map(|row| AccountDto::from_row(row, state.instance()))
-            .collect(),
-    ))
+    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let pictures = state.store().batch().profile_pictures(&ids).run().await?;
+    Ok(Json(accounts_with_pictures(
+        &rows,
+        &pictures,
+        state.instance(),
+    )))
 }
 
 pub async fn relationships(

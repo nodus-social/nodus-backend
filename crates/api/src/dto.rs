@@ -12,7 +12,7 @@ use nodus_server_core::limits::{
 };
 use nodus_server_core::Id;
 use nodus_server_store::accounts::AccountRow;
-use nodus_server_store::hydrate::{PictureSize, ProfilePictures, RowMap};
+use nodus_server_store::hydrate::{BatchOutcome, PictureSize, ProfilePictures, RowMap};
 use nodus_server_store::media::MediaRow;
 use nodus_server_store::statuses::{ReactionCount, StatusRow};
 
@@ -328,6 +328,39 @@ impl AccountDto {
         dto.staff_role = staff_role_spellings(&row.staff_role).map(|(_, nodus)| nodus);
         dto
     }
+}
+
+/// Account documents for a list, each carrying the picture shapes its page's batch read.
+///
+/// An endpoint with an avatar on screen calls this rather than mapping
+/// [`AccountDto::from_row`] itself: a forgotten `with_pictures` call publishes
+/// `avatar_meta: null` for an account whose shape is known, which a client cannot tell
+/// from a genuinely unknown picture. Rows keep their order, including any the batch did
+/// not answer (whose metas stay `null`).
+#[must_use]
+pub fn accounts_with_pictures<'a, I>(
+    rows: I,
+    outcome: &BatchOutcome,
+    instance: &InstanceConfig,
+) -> Vec<AccountDto>
+where
+    I: IntoIterator<Item = &'a AccountRow>,
+{
+    rows.into_iter()
+        .map(|row| {
+            AccountDto::from_row(row, instance).with_pictures(outcome.profile_pictures.get(&row.id))
+        })
+        .collect()
+}
+
+/// The subject's own document (`staff_role` included) with the same picture shapes.
+#[must_use]
+pub fn own_account_with_pictures(
+    row: &AccountRow,
+    outcome: &BatchOutcome,
+    instance: &InstanceConfig,
+) -> AccountDto {
+    AccountDto::from_own_row(row, instance).with_pictures(outcome.profile_pictures.get(&row.id))
 }
 
 #[derive(Debug, Serialize)]
