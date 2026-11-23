@@ -13,7 +13,7 @@ use nodus_server_store::accounts::AccountRow;
 use nodus_server_store::social::{FollowOutcome, Relationship};
 
 use crate::auth::{Auth, RecoveryAuth};
-use crate::body::JsonOrForm;
+use crate::body::{JsonOrForm, OptionalJsonOrForm};
 use crate::dto::AccountDto;
 use crate::error::{ApiError, ApiResult};
 use crate::mastodon::PageQuery;
@@ -415,42 +415,51 @@ pub async fn unfollow(
     Ok(Json(RelationshipDto::new(&id, &relationship)))
 }
 
+/// The body `POST /api/v1/accounts/{id}/mute` accepts, in JSON or form encoding.
+#[derive(Debug, Default, Deserialize)]
+pub struct MuteRequest {
+    /// Mute notifications as well as statuses. Mastodon defaults this to `true`; an
+    /// absent member means the same thing here.
+    #[serde(default)]
+    pub notifications: Option<bool>,
+    /// Seconds until the mute should expire. Accepted for wire compatibility and ignored:
+    /// `account_relation` stores no expiry, so every mute is indefinite and `/api/v1/mutes`
+    /// reports no `expires_at`.
+    #[serde(default)]
+    pub duration: Option<i64>,
+}
+
+/// `POST /api/v1/accounts/{id}/block` — refuse the target and remove the follow edges
+/// in both directions.
+///
+/// Answers the same relationship object as `POST …/unfollow`. Blocking yourself is a
+/// client mistake, so it is refused with a message rather than stored as a row that the
+/// relationship query would never report.
 pub async fn block(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<RelationshipDto>> {
     auth.require_scope("write:blocks")?;
-    nodus_server_store::social::block(state.store().pool(), &auth.0.account.id, &id).await?;
+    refuse_self(&auth, &id, "block")?;
+    let target = target(&state, &id).await?;
+    nodus_server_store::social::block(state.store().pool(), &auth.0.account.id, &target.id).await?;
     let relationship =
         nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
             .await?;
     Ok(Json(RelationshipDto::new(&id, &relationship)))
 }
 
+/// `POST /api/v1/accounts/{id}/unblock` — idempotent: unblocking what was never blocked
+/// answers 200 with `blocking: false`.
 pub async fn unblock(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<RelationshipDto>> {
     auth.require_scope("write:blocks")?;
-    nodus_server_store::social::unblock(state.store().pool(), &auth.0.account.id, &id).await?;
-    let relationship =
-        nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
-            .await?;
-    Ok(Json(RelationshipDto::new(&id, &relationship)))
-}
-
-pub async fn mute(
-    State(state): State<AppState>,
-    auth: Auth,
-    Path(id): Path<String>,
-    axum::extract::RawForm(body): axum::extract::RawForm,
-) -> ApiResult<Json<RelationshipDto>> {
-    auth.require_scope("write:mutes")?;
-    let notifications = !url::form_urlencoded::parse(&body)
-        .any(|(key, value)| key == "notifications" && value == "false");
-    nodus_server_store::social::mute(state.store().pool(), &auth.0.account.id, &id, notifications)
+    let target = target(&state, &id).await?;
+    nodus_server_store::social::unblock(state.store().pool(), &auth.0.account.id, &target.id)
         .await?;
     let relationship =
         nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
@@ -458,13 +467,46 @@ pub async fn mute(
     Ok(Json(RelationshipDto::new(&id, &relationship)))
 }
 
+/// `POST /api/v1/accounts/{id}/mute` — silence the target, optionally keeping their
+/// notifications.
+///
+/// `duration` is accepted and ignored: there is no expiry column, so a mute lives until
+/// `POST …/unmute`. Mastodon's `expires_at` is therefore always absent from `/api/v1/mutes`,
+/// and a client that asked for a timed mute gets an indefinite one.
+pub async fn mute(
+    State(state): State<AppState>,
+    auth: Auth,
+    Path(id): Path<String>,
+    OptionalJsonOrForm(request): OptionalJsonOrForm<MuteRequest>,
+) -> ApiResult<Json<RelationshipDto>> {
+    auth.require_scope("write:mutes")?;
+    refuse_self(&auth, &id, "mute")?;
+    let target = target(&state, &id).await?;
+    let notifications = request.notifications.unwrap_or(true);
+    nodus_server_store::social::mute(
+        state.store().pool(),
+        &auth.0.account.id,
+        &target.id,
+        notifications,
+    )
+    .await?;
+    let relationship =
+        nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
+            .await?;
+    Ok(Json(RelationshipDto::new(&id, &relationship)))
+}
+
+/// `POST /api/v1/accounts/{id}/unmute` — idempotent: unmuting what was never muted
+/// answers 200 with `muting: false`.
 pub async fn unmute(
     State(state): State<AppState>,
     auth: Auth,
     Path(id): Path<String>,
 ) -> ApiResult<Json<RelationshipDto>> {
     auth.require_scope("write:mutes")?;
-    nodus_server_store::social::unmute(state.store().pool(), &auth.0.account.id, &id).await?;
+    let target = target(&state, &id).await?;
+    nodus_server_store::social::unmute(state.store().pool(), &auth.0.account.id, &target.id)
+        .await?;
     let relationship =
         nodus_server_store::social::relationship(state.store().pool(), &auth.0.account.id, &id)
             .await?;
@@ -518,6 +560,16 @@ fn parse_id_list(raw: &str) -> Vec<String> {
         .map(|(_, value)| value.into_owned())
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+/// Refuses a relationship verb whose target is the caller, naming the verb.
+fn refuse_self(auth: &Auth, id: &str, verb: &str) -> ApiResult<()> {
+    if auth.0.account.id == id {
+        return Err(ApiError::unprocessable(format!(
+            "You cannot {verb} yourself"
+        )));
+    }
+    Ok(())
 }
 
 async fn target(state: &AppState, id: &str) -> ApiResult<AccountRow> {

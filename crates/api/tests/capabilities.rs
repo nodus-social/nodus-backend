@@ -396,6 +396,16 @@ const CAPABILITIES: &[Capability] = &[
         owner: Owner::Api,
     },
     Capability {
+        name: "mutes",
+        path: "/api/v1/mutes",
+        owner: Owner::Api,
+    },
+    Capability {
+        name: "blocks",
+        path: "/api/v1/blocks",
+        owner: Owner::Api,
+    },
+    Capability {
         name: "domain_blocks",
         path: "/api/v1/domain_blocks",
         owner: Owner::Api,
@@ -792,8 +802,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        63,
-        "/api/v1/meta must answer 63 unique names: {advertised_names:?}"
+        65,
+        "/api/v1/meta must answer 65 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -803,10 +813,11 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        63,
-        "the published vocabulary is 63 unique names: 42 before the page split, the 20 page \
-         names (21 pages, `moderation_rules` already present, so no duplicate), and the \
-         personal domain list (`domain_blocks`)"
+        65,
+        "the published vocabulary is 65 unique names: 42 before the page split, the 20 page \
+         names (21 pages, `moderation_rules` already present, so no duplicate), the 2 \
+         relationship lists (`mutes`, `blocks`), and the personal domain list \
+         (`domain_blocks`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1440,13 +1451,13 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
     },
     SurfaceGroup {
         prefix: "/api/v1/blocks",
-        features: &[],
-        reason: "the actor's own block list; part of the account relationship core",
+        features: &["blocks"],
+        reason: "",
     },
     SurfaceGroup {
         prefix: "/api/v1/mutes",
-        features: &[],
-        reason: "the actor's own mute list; part of the account relationship core",
+        features: &["mutes"],
+        reason: "",
     },
     SurfaceGroup {
         prefix: "/api/v1/domain_blocks",
