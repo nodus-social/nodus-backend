@@ -341,6 +341,21 @@ pub async fn is_deleted(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
     .await
 }
 
+/// Whether the account's email address has been confirmed.
+///
+/// `None` means the account has no credential row at all — a remote account every time,
+/// and a bootstrap account on a fresh instance. Callers must treat that as "not gated":
+/// there is no address to confirm, so refusing the action would lock an operator out of
+/// their own instance.
+pub async fn credential_confirmed(pool: &PgPool, id: &str) -> Result<Option<bool>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT confirmed_at IS NOT NULL FROM account_credential WHERE account_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// One account by its canonical `ActivityPub` actor URL.
 pub async fn by_uri(pool: &PgPool, uri: &str) -> Result<Option<AccountRow>, sqlx::Error> {
     let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM account WHERE uri = $1");

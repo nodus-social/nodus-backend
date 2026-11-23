@@ -137,12 +137,7 @@ pub(crate) async fn require_confirmed_email(
     if !state.require_email_confirmation() {
         return Ok(());
     }
-    let confirmed: Option<bool> = sqlx::query_scalar(
-        "SELECT confirmed_at IS NOT NULL FROM account_credential WHERE account_id = $1",
-    )
-    .bind(account_id)
-    .fetch_optional(state.store().pool())
-    .await?;
+    let confirmed = nodus_server_store::accounts::credential_confirmed(state.store().pool(), account_id).await?;
     if matches!(confirmed, Some(false)) {
         return Err(ApiError::forbidden(
             "Confirm your email address before posting or following. \
