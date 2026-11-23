@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// have without losing the area's door — and a peer that serves them all must draw every
 /// one. New names are appended rather than sorted: clients compare the array, so a reorder
 /// is churn with no meaning.
-pub const FEATURES: [&str; 65] = [
+pub const FEATURES: [&str; 66] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -141,7 +141,13 @@ pub const FEATURES: [&str; 65] = [
     "blocks", // GET /api/v1/blocks; POST /api/v1/accounts/{id}/block, /unblock
     // The actor's own domain list: one account hiding a host from its timelines and
     // notifications. Distinct from the instance's `remote_blocks` and admin domain blocks.
+    // Published unconditionally like `mutes` and `blocks`: every account has the list, and a
+    // console decides whether to draw it before it knows who signed in.
     "domain_blocks", // GET|POST|DELETE /api/v1/domain_blocks and /api/v2/domain_blocks
+    // The tags a profile shows to other readers, distinct from `tags` (following a tag on
+    // one's own account): the public list is also served at
+    // `/api/v1/accounts/{id}/featured_tags`, and the owner's verbs manage it.
+    "featured_tags", // GET|POST /api/v1/featured_tags, /suggestions; DELETE /{id}
 ];
 
 /// The capability names this deployment can actually honour, as owned strings.

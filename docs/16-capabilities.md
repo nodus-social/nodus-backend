@@ -36,6 +36,20 @@ a named one none (`:1816-1825`). Renaming is breaking, adding is safe. `/api/v1/
 A page name cannot be proved by its prefix alone when a sibling page shares the route family, so
 page names have a second table and a second test — §5.
 
+### Not yet a capability: `notification_settings`
+
+The settings strip wants a Notifications tab, but this backend serves no notification policy to
+put behind it, so no name is published and the tab stays hidden on purpose. The inbox is a
+reader, not a setting: `GET /api/v1/notifications`, `/clear`, `/{id}` and `/{id}/dismiss`
+(`crates/api/src/notifications.rs:483-486`) read and acknowledge rows written by the follow,
+favourite, reblog and mention paths. `GET /api/v1/preferences`
+(`crates/api/src/preferences.rs:15-35`) answers Mastodon's posting and reading defaults only —
+no notification kind, no email channel. The closest thing is the `notifications` flag on one
+account's mute (`crates/api/src/accounts.rs:421-424`), which chooses whether that relationship's
+events reach the inbox: a per-relationship fact, not an account-wide policy. No migration stores
+one either. A `notification_settings` name with no route group would be a door onto a 404, and
+`FEATURES` is the promise, so it is withheld until a route group exists to answer it.
+
 ## 2. The one conditional name: `drive_share`
 
 61 names are published unconditionally; `drive_share` is not.

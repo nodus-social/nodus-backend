@@ -289,6 +289,13 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/tags/{name}/follow",
         owner: Owner::Api,
     },
+    // The profile's tag list. The public half is `/api/v1/accounts/{id}/featured_tags`, but
+    // the owner's list is what a settings tab asks for first, so that is the probe.
+    Capability {
+        name: "featured_tags",
+        path: "/api/v1/featured_tags",
+        owner: Owner::Api,
+    },
     // The administration pages. `admin` above is the door; these are the rooms behind it.
     // Each probe is the first route the page calls; the split and its handler family are
     // stated in `ADMIN_PAGES` below, where `every_admin_page_capability_is_backed` holds
@@ -802,8 +809,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        65,
-        "/api/v1/meta must answer 65 unique names: {advertised_names:?}"
+        66,
+        "/api/v1/meta must answer 66 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -813,11 +820,11 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        65,
-        "the published vocabulary is 65 unique names: 42 before the page split, the 20 page \
+        66,
+        "the published vocabulary is 66 unique names: 42 before the page split, the 20 page \
          names (21 pages, `moderation_rules` already present, so no duplicate), the 2 \
-         relationship lists (`mutes`, `blocks`), and the personal domain list \
-         (`domain_blocks`)"
+         relationship lists (`mutes`, `blocks`), the personal domain list \
+         (`domain_blocks`), and the profile's featured tags (`featured_tags`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1491,8 +1498,8 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
     },
     SurfaceGroup {
         prefix: "/api/v1/featured_tags",
-        features: &[],
-        reason: "profile featured tags; drawn by the profile, always served",
+        features: &["featured_tags"],
+        reason: "",
     },
     SurfaceGroup {
         prefix: "/api/v2/suggestions",
