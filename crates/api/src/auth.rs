@@ -4,12 +4,15 @@
 //! does not take it cannot accidentally require one. The extractor resolves the token
 //! once per request and hands the handler the account and its scopes.
 
-use axum::extract::FromRequestParts;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use sha2::{Digest, Sha256};
 
 use nodus_server_store::accounts::{verify_token, verify_token_any_state, Authenticated};
+use nodus_server_store::ip_block;
 
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -69,9 +72,21 @@ impl FromRequestParts<AppState> for Auth {
         let token = bearer(parts)?;
         let digest = hex_lower(&Sha256::digest(token.as_bytes()));
         let account = verify_token(state.store().pool(), &digest).await?;
-        account
-            .map(Self)
-            .ok_or_else(|| ApiError::unauthorized("The access token is invalid"))
+        let Some(account) = account else {
+            return Err(ApiError::unauthorized("The access token is invalid"));
+        };
+        // A `no_access` block follows the address, not the token: the address is what the
+        // block was written for, and a token issued before the block must stop working the
+        // same moment a fresh login would be refused.
+        if let Some(ConnectInfo(peer)) = parts.extensions.get::<ConnectInfo<SocketAddr>>() {
+            let prefix = nodus_auth::network_prefix(peer.ip());
+            if ip_block::no_access(state.store().pool(), &prefix).await? {
+                return Err(ApiError::forbidden(
+                    "This network is not permitted to use this instance",
+                ));
+            }
+        }
+        Ok(Self(account))
     }
 }
 

@@ -39,6 +39,31 @@ impl From<sqlx::Error> for RegisterError {
     }
 }
 
+/// What a live IP block says about the network a request came from.
+///
+/// Declared here rather than in the store crate because this service's only view of the
+/// blocks is this three-way answer; it never lists or edits them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpBlockVerdict {
+    /// No request from the network may reach the instance.
+    NoAccess,
+    /// Registration is refused; an existing login is unaffected.
+    SignUpBlock,
+    /// Registration is accepted into the approval queue.
+    RequiresApproval,
+}
+
+impl IpBlockVerdict {
+    fn from_severity(severity: &str) -> Option<Self> {
+        Some(match severity {
+            "no_access" => Self::NoAccess,
+            "sign_up_block" => Self::SignUpBlock,
+            "sign_up_requires_approval" => Self::RequiresApproval,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Credential {
     pub account_id: String,
@@ -131,16 +156,28 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
 
     fn revoke_token(&self, token_hash: &str) -> impl Future<Output = Result<(), Error>> + Send;
 
+    /// The strongest live block covering `prefix`, or `None` when the network is clear.
+    ///
+    /// `prefix` is the truncated address the session table would record. The block table
+    /// stores CIDRs, so the database does the containment test and the expiry filter in one
+    /// read: a lapsed block cannot be served from a cached decision.
+    fn ip_block_verdict(
+        &self,
+        prefix: &str,
+    ) -> impl Future<Output = Result<Option<IpBlockVerdict>, Error>> + Send;
+
     /// Creates a local account together with its password login.
     ///
     /// `confirmation` is queued in the same transaction as the account: the caller has
     /// already decided a real sender exists, and a confirmation that survives a rolled
     /// back registration would point at an account nobody has.
+    #[allow(clippy::too_many_arguments)]
     fn register_local(
         &self,
         username: &str,
         email: &str,
         password_hash: &str,
+        approved: bool,
         confirmation: Option<Confirmation>,
     ) -> impl Future<Output = Result<SessionAccount, RegisterError>> + Send;
 
@@ -254,6 +291,7 @@ impl PgAuthStore {
         username: &str,
         email: &str,
         password_hash: &str,
+        approved: bool,
         confirmation: Option<Confirmation>,
     ) -> Result<SessionAccount, RegisterError> {
         let mut tx = pool.begin().await?;
@@ -279,10 +317,12 @@ impl PgAuthStore {
 
         let id = ulid::Ulid::new().to_string();
         sqlx::query(
-            "INSERT INTO account (id, username, display_name, local) VALUES ($1, $2, $2, true)",
+            "INSERT INTO account (id, username, display_name, local, approved) \
+             VALUES ($1, $2, $2, true, $3)",
         )
         .bind(&id)
         .bind(username)
+        .bind(approved)
         .execute(&mut *tx)
         .await
         .map_err(name_clash)?;
@@ -370,9 +410,27 @@ impl AuthStore for PgAuthStore {
         username: &str,
         email: &str,
         password_hash: &str,
+        approved: bool,
         confirmation: Option<Confirmation>,
     ) -> Result<SessionAccount, RegisterError> {
-        Self::register_local_with(&self.pool, username, email, password_hash, confirmation).await
+        Self::register_local_with(&self.pool, username, email, password_hash, approved, confirmation)
+            .await
+    }
+
+    async fn ip_block_verdict(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<IpBlockVerdict>, Error> {
+        let severity: Option<String> = sqlx::query_scalar(
+            "SELECT severity FROM ip_block \
+             WHERE (expires_at IS NULL OR expires_at > now()) AND $1::inet <<= ip::inet \
+             ORDER BY CASE severity WHEN 'no_access' THEN 0 WHEN 'sign_up_block' THEN 1 ELSE 2 END \
+             LIMIT 1",
+        )
+        .bind(prefix)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(severity.as_deref().and_then(IpBlockVerdict::from_severity))
     }
 
     async fn confirm_email(&self, token: &str) -> Result<Option<String>, Error> {

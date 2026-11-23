@@ -30,6 +30,7 @@ pub mod forwarded;
 pub mod highlights;
 pub mod hydrate;
 pub mod invalidate;
+pub mod ip_block;
 pub mod jobs;
 pub mod lists;
 pub mod live;

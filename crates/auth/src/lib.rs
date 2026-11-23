@@ -28,7 +28,9 @@ use crate::domain::{
     CSRF_COOKIE,
 };
 use crate::outbox::Confirmation;
-use crate::store::{AuthStore, Credential, PgAuthStore, RegisterError, SessionAccount};
+use crate::store::{
+    AuthStore, Credential, IpBlockVerdict, PgAuthStore, RegisterError, SessionAccount,
+};
 
 pub mod domain;
 pub mod outbox;
@@ -92,7 +94,7 @@ fn session_device(headers: &HeaderMap, peer: Option<SocketAddr>) -> (String, Opt
 ///
 /// A session list answers "which network was this", and the host bits do not add to
 /// that answer. Thirty days of a full address is a location record; a prefix is not.
-fn network_prefix(address: IpAddr) -> String {
+pub fn network_prefix(address: IpAddr) -> String {
     match address {
         IpAddr::V4(address) => {
             let octets = address.octets();
@@ -297,6 +299,15 @@ async fn login_submit<S: AuthStore>(
     if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
+    if let Some(prefix) = peer.0.map(|address| network_prefix(address.ip())) {
+        if matches!(
+            state.store.ip_block_verdict(&prefix).await.ok().flatten(),
+            Some(IpBlockVerdict::NoAccess)
+        ) {
+            return (StatusCode::FORBIDDEN, "This network is not permitted to sign in.")
+                .into_response();
+        }
+    }
     let credential = state
         .store
         .credential_by_email(form.email.trim())
@@ -471,6 +482,41 @@ async fn register_page<S: AuthStore>(
     )
 }
 
+/// What the source network's block says about this attempt, if anything.
+async fn sign_up_verdict<S: AuthStore>(
+    state: &AppState<S>,
+    peer: Option<SocketAddr>,
+) -> Option<IpBlockVerdict> {
+    let prefix = peer.map(|address| network_prefix(address.ip()))?;
+    state
+        .store
+        .ip_block_verdict(&prefix)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The confirmation mail a registration must queue in its own transaction, when mail is
+/// configured at all.
+fn queued_confirmation<S: AuthStore>(
+    state: &AppState<S>,
+    registration: &Registration,
+) -> Option<Confirmation> {
+    state.email_confirmation.as_ref().map(|mail| {
+        let token = opaque_token();
+        Confirmation {
+            token_hash: token_hash(&token),
+            expires_at: Utc::now() + Duration::hours(CONFIRMATION_HOURS),
+            message: confirmation_message(
+                &mail.base_url,
+                &registration.username,
+                &registration.email,
+                &token,
+            ),
+        }
+    })
+}
+
 async fn register_submit<S: AuthStore>(
     State(state): State<AppState<S>>,
     jar: CookieJar,
@@ -488,6 +534,22 @@ async fn register_submit<S: AuthStore>(
     if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
         return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
     }
+    let verdict = sign_up_verdict(&state, peer.0).await;
+    if matches!(
+        verdict,
+        Some(IpBlockVerdict::NoAccess | IpBlockVerdict::SignUpBlock)
+    ) {
+        return registration_error(
+            &state,
+            jar,
+            &form,
+            "Registration is not available from this network.",
+        );
+    }
+    // An address that must be reviewed still registers: the account exists and the
+    // moderator's queue is where it waits. Refusing it here would put the decision in a
+    // block table instead of the approval queue that already exists for exactly this.
+    let approved = !matches!(verdict, Some(IpBlockVerdict::RequiresApproval));
     let registration = match normalized_registration(&form) {
         Ok(registration) => registration,
         Err(message) => return registration_error(&state, jar, &form, message),
@@ -499,25 +561,14 @@ async fn register_submit<S: AuthStore>(
         )
             .into_response();
     };
-    let confirmation = state.email_confirmation.as_ref().map(|mail| {
-        let token = opaque_token();
-        Confirmation {
-            token_hash: token_hash(&token),
-            expires_at: Utc::now() + Duration::hours(CONFIRMATION_HOURS),
-            message: confirmation_message(
-                &mail.base_url,
-                &registration.username,
-                &registration.email,
-                &token,
-            ),
-        }
-    });
+    let confirmation = queued_confirmation(&state, &registration);
     let account = match state
         .store
         .register_local(
             &registration.username,
             &registration.email,
             &password_hash,
+            approved,
             confirmation,
         )
         .await

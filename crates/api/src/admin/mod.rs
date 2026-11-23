@@ -15,6 +15,7 @@ pub mod blocklist;
 mod escalation;
 mod federation;
 mod forwarded;
+mod ip_blocks;
 mod media;
 mod moderation_rules;
 mod reports;
@@ -881,6 +882,7 @@ pub fn router() -> Router<AppState> {
         .merge(blocklist::router())
         .merge(federation::router())
         .merge(forwarded::router())
+        .merge(ip_blocks::router())
         .merge(scanners::router())
         .merge(media::router())
         .merge(rules::router())
