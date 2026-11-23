@@ -40,6 +40,7 @@ pub mod miauth;
 pub mod moderation;
 pub mod moderation_rules;
 pub mod nodeinfo;
+pub mod notification_policy;
 pub mod pauses;
 pub mod polls;
 pub mod remote_moderation;

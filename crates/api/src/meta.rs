@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// have without losing the area's door — and a peer that serves them all must draw every
 /// one. New names are appended rather than sorted: clients compare the array, so a reorder
 /// is churn with no meaning.
-pub const FEATURES: [&str; 67] = [
+pub const FEATURES: [&str; 68] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -106,8 +106,12 @@ pub const FEATURES: [&str; 67] = [
     "directory",          // GET /api/v1/directory
     "markers",            // GET|POST /api/v1/markers
     "preferences",        // GET /api/v1/preferences
-    "streaming",          // GET /api/v1/streaming (the SSE tail of the events table)
-    "tags",               // GET /api/v1/tags/{name}, /{name}/follow, /{name}/unfollow
+    // The settings tab the inbox never had: what to do with each notification kind, stored
+    // per account. Filtering by it is not implemented yet, so the name means "this policy
+    // can be read and written", not "this policy is honoured".
+    "notification_settings", // GET|PUT /api/v2/notifications/policy
+    "streaming",             // GET /api/v1/streaming (the SSE tail of the events table)
+    "tags",                  // GET /api/v1/tags/{name}, /{name}/follow, /{name}/unfollow
     // The administration pages the console draws. `admin` above says the area exists; these
     // say which page inside it is served, so a peer with a smaller console can omit a page
     // without omitting the area. The test table beside `tests/capabilities.rs` names the

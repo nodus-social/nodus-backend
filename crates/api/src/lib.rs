@@ -39,6 +39,7 @@ pub mod misskey;
 mod misskey_page;
 pub mod nodeinfo;
 pub mod nodus;
+pub mod notification_policy;
 pub mod notifications;
 pub mod outbox;
 pub mod pages;
@@ -176,6 +177,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(highlights::router())
         .merge(schedules::router())
         .merge(notifications::router())
+        .merge(notification_policy::router())
         .merge(streaming::router())
         .merge(collections::router())
         .merge(conversations::router())

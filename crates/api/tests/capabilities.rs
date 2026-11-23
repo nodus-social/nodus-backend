@@ -277,6 +277,11 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/preferences",
         owner: Owner::Api,
     },
+    Capability {
+        name: "notification_settings",
+        path: "/api/v2/notifications/policy",
+        owner: Owner::Api,
+    },
     // An SSE stream never returns a body to this probe, which `probe` treats as present at
     // its budget; a route that was deleted would answer 404 at once instead.
     Capability {
@@ -817,8 +822,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        67,
-        "/api/v1/meta must answer 67 unique names: {advertised_names:?}"
+        68,
+        "/api/v1/meta must answer 68 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -828,12 +833,13 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        67,
-        "the published vocabulary is 67 unique names: 42 before the page split, the 20 page \
+        68,
+        "the published vocabulary is 68 unique names: 42 before the page split, the 20 page \
          names (21 pages, `moderation_rules` already present, so no duplicate), the 2 \
          relationship lists (`mutes`, `blocks`), the personal domain list \
-         (`domain_blocks`), the profile's featured tags (`featured_tags`), and the \
-         backend-assembled pages (`pages`)"
+         (`domain_blocks`), the profile's featured tags (`featured_tags`), the \
+         backend-assembled pages (`pages`), and the notification policy \
+         (`notification_settings`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1139,6 +1145,7 @@ const ROUTE_SOURCES: &[(&str, &str)] = route_sources![
     "miauth.rs",
     "misskey.rs",
     "nodus.rs",
+    "notification_policy.rs",
     "notifications.rs",
     "polls.rs",
     "preferences.rs",
@@ -1396,6 +1403,13 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
     SurfaceGroup {
         prefix: "/api/v1/notifications",
         features: &["notifications"],
+        reason: "",
+    },
+    // The policy behind the Notifications settings tab, a separate family from the inbox it
+    // governs: reading and writing it works today, honouring it does not.
+    SurfaceGroup {
+        prefix: "/api/v2/notifications/policy",
+        features: &["notification_settings"],
         reason: "",
     },
     SurfaceGroup {

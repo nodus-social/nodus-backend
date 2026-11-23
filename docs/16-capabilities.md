@@ -1,11 +1,11 @@
 # Capabilities: one question, three vocabularies
 
 Before paint a client answers one question: *what does this server actually serve?* Three
-vocabularies answer it — the API's list (`crates/api/src/meta.rs:39`, 62 names), the SDK's typed
+vocabularies answer it — the API's list (`crates/api/src/meta.rs:39`, 68 names), the SDK's typed
 `Feature` set baselined per protocol (`sdk/crates/nodus/src/baseline.rs`), and the shell's doors
 (`web/crates/ui/src/capabilities.rs:56` `admits`). One name means one surface everywhere.
 
-The 62 names are not only routes: thirteen administration pages and eight moderation sections are
+The 68 names are not only routes: thirteen administration pages and eight moderation sections are
 names of their own, while `admin` and `moderation` went on meaning the *area* (§5). An area bit
 says the room exists; a page name says which screens inside it answer.
 
@@ -36,23 +36,25 @@ a named one none (`:1816-1825`). Renaming is breaking, adding is safe. `/api/v1/
 A page name cannot be proved by its prefix alone when a sibling page shares the route family, so
 page names have a second table and a second test — §5.
 
-### Not yet a capability: `notification_settings`
+### `notification_settings`: the Notifications tab
 
-The settings strip wants a Notifications tab, but this backend serves no notification policy to
-put behind it, so no name is published and the tab stays hidden on purpose. The inbox is a
-reader, not a setting: `GET /api/v1/notifications`, `/clear`, `/{id}` and `/{id}/dismiss`
-(`crates/api/src/notifications.rs:483-486`) read and acknowledge rows written by the follow,
-favourite, reblog and mention paths. `GET /api/v1/preferences`
-(`crates/api/src/preferences.rs:15-35`) answers Mastodon's posting and reading defaults only —
-no notification kind, no email channel. The closest thing is the `notifications` flag on one
-account's mute (`crates/api/src/accounts.rs:421-424`), which chooses whether that relationship's
-events reach the inbox: a per-relationship fact, not an account-wide policy. No migration stores
-one either. A `notification_settings` name with no route group would be a door onto a 404, and
-`FEATURES` is the promise, so it is withheld until a route group exists to answer it.
+The settings strip's Notifications tab now edits a stored policy: `GET|PUT
+/api/v2/notifications/policy` (`crates/api/src/notification_policy.rs`) speak Mastodon's flat map
+for the eight kinds `mention`, `favourite`, `reblog`, `follow`, `follow_request`, `report`,
+`pending_request` and `status`, each answered `accept`, `filter` or `drop`. `GET` answers every
+kind, filling in the default `accept` for an account that has never changed one. `PUT` names
+only the kinds it changes, so editing one switch does not send the rest back; an unknown kind or
+answer is a `422` naming it, and the answer message also lists the three allowed values. The
+row is one per `(account, kind)` in `notification_policy` (migration `0057`), so a missing row is
+the default rather than an error, and a new account needs no backfill.
+
+**Not yet honoured.** The inbox (`crates/api/src/notifications.rs:483-486`) does not consult the
+policy: a kind set to `filter` or `drop` still arrives. Filtering by policy is the next piece of
+work; until it lands the tab changes what is stored, not what is delivered.
 
 ## 2. The one conditional name: `drive_share`
 
-61 names are published unconditionally; `drive_share` is not.
+67 names are published unconditionally; `drive_share` is not.
 
 ```rust
 // crates/api/src/meta.rs:150-154
@@ -75,7 +77,7 @@ shadowed* by its router, and the lab's live check proves the sibling answers the
 (`crates/api/tests/capabilities.rs:20-24`). `/api/v1/nodus/events` is **410 Gone**, "replaced by
 `/api/v1/streaming`" (`crates/api/src/nodus.rs:87`).
 
-**The Caddy trap.** Both processes answer `/api/v1/meta` — the API with 62 names, the feed with 3.
+**The Caddy trap.** Both processes answer `/api/v1/meta` — the API with 68 names, the feed with 3.
 Put that path in the feed's matcher and the origin hands every same-origin client (shell, SSR
 host, e2e) three names, so the instance looks like it does nothing. Hence
 `integration/Caddyfile:49-55`, where the omission is deliberate:
