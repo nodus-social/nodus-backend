@@ -397,3 +397,92 @@ async fn bulk_resolve_closes_the_selected_reports_and_audits_each_one() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_from_a_report_closes_it_and_keeps_each_accounts_history() {
+    run_db_test(|store, app| async move {
+        let pool = store.pool();
+        let (_, token) = staff(pool, "bulk-case", "admin", &["admin:read", "admin:write"]).await;
+        let reporter = create_account(pool, "case-reporter").await;
+        let target = create_account(pool, "case-target").await;
+
+        let report = moderation::create_report(
+            pool,
+            &NewReport {
+                account_id: Some(&reporter),
+                target_account_id: &target,
+                status_ids: &[],
+                category: "spam",
+                comment: "",
+                rule_ids: &[],
+                activity_uri: None,
+            },
+        )
+        .await
+        .expect("create report");
+
+        let (status, body) = send(
+            &app,
+            &token,
+            "POST",
+            "/api/v1/admin/accounts/bulk",
+            Some(json!({
+                "ids": [target],
+                "action": "suspend",
+                "text": "spam run",
+                "report_id": report.id,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "batch refused: {body}");
+        assert_eq!(json_of(&body)["applied"], json!(1));
+
+        let resolved: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM report WHERE id = $1",
+        )
+        .bind(&report.id)
+        .fetch_one(pool)
+        .await
+        .expect("report state");
+        assert_eq!(resolved.as_deref(), Some("resolved"));
+
+        // Lifting the restriction must not erase the case: both decisions stay in the
+        // audit trail, and the report's own audit row is there too.
+        let (status, body) = send(
+            &app,
+            &token,
+            "POST",
+            "/api/v1/admin/accounts/bulk",
+            Some(json!({"ids": [target], "action": "unsuspend", "text": "appeal upheld"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "unsuspend refused: {body}");
+
+        let actions: Vec<String> = sqlx::query_scalar(
+            "SELECT action FROM audit_log WHERE target_id = $1 ORDER BY created_at",
+        )
+        .bind(&target)
+        .fetch_all(pool)
+        .await
+        .expect("account audit rows");
+        assert_eq!(actions, vec!["account_suspend", "account_unsuspend"]);
+        let report_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM audit_log \
+             WHERE action = 'resolve_report_with_note' AND target_id = $1",
+        )
+        .bind(&report.id)
+        .fetch_one(pool)
+        .await
+        .expect("report audit row");
+        assert_eq!(report_rows, 1);
+        let suspended: Option<String> = sqlx::query_scalar(
+            "SELECT suspended_at::text FROM account WHERE id = $1",
+        )
+        .bind(&target)
+        .fetch_one(pool)
+        .await
+        .expect("account state");
+        assert!(suspended.is_none(), "the account is no longer suspended");
+    })
+    .await;
+}

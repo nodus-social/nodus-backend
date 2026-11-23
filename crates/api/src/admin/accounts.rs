@@ -705,6 +705,9 @@ pub struct BulkActionForm {
     kind: String,
     #[serde(default, alias = "text")]
     reason: String,
+    /// The report the moderator is acting from, when there is one. Applied once for the
+    /// whole batch: every account in it was selected from the same case.
+    report_id: Option<String>,
     /// Accepted for compatibility; this instance does not send mail yet.
     #[serde(default, alias = "send_email_notification")]
     notify: bool,
@@ -717,6 +720,7 @@ async fn apply_bulk_one(
     id: &str,
     action: Action,
     reason: &str,
+    report_id: Option<&str>,
     notify: bool,
 ) -> Result<(), BulkFailure> {
     let Some(target) = moderation::admin_account_in(conn, id).await? else {
@@ -766,7 +770,7 @@ async fn apply_bulk_one(
         &json!({
             "type": action.as_str(),
             "text": reason,
-            "report_id": null,
+            "report_id": report_id,
             "email": notify,
         }),
     )
@@ -793,7 +797,17 @@ async fn bulk_action(
     let mut results = Vec::with_capacity(form.ids.len());
     let mut applied = 0i64;
     for id in &form.ids {
-        match apply_bulk_one(&mut tx, &auth, id, action, reason, form.notify).await {
+        match apply_bulk_one(
+            &mut tx,
+            &auth,
+            id,
+            action,
+            reason,
+            form.report_id.as_deref(),
+            form.notify,
+        )
+        .await
+        {
             Ok(()) => {
                 applied += 1;
                 results.push(BulkItemDto {
@@ -812,6 +826,38 @@ async fn bulk_action(
         }
     }
     tx.commit().await?;
+    if let Some(report_id) = form.report_id.as_deref() {
+        if moderation::resolve_report(
+            state.store().pool(),
+            report_id,
+            &auth.0.account.id,
+            reason,
+        )
+        .await?
+        .is_some()
+        {
+            // The same report audit row the single-account path writes, so a report closed
+            // through a batch still counts towards the dashboard's resolution figures.
+            let audit_action = if reason.is_empty() {
+                "resolve_report"
+            } else {
+                "resolve_report_with_note"
+            };
+            audit_write_detail(
+                &state,
+                &auth,
+                audit_action,
+                "report",
+                report_id,
+                json!({
+                    "note": reason,
+                    "action": action.as_str(),
+                    "accounts": form.ids.len(),
+                }),
+            )
+            .await?;
+        }
+    }
     Ok(Json(BulkResponseDto { results, applied }))
 }
 
