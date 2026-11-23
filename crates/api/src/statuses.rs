@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use nodus_server_core::limits::{PAGE_MAX_ACCOUNTS, STATUS_MAX_CHARS};
 use nodus_server_core::{Id, PageSize};
+use nodus_server_store::hydrate::{ProfilePictures, RowMap};
 use nodus_server_store::social::ViewerFlags;
 use nodus_server_store::statuses::{InteractionAudience, NewStatus, StatusRow};
 
@@ -716,23 +717,38 @@ pub async fn context(
     let _ = visible_status(&state, auth.as_ref(), &id).await?;
     let (ancestors, descendants) =
         nodus_server_store::statuses::context(state.store().pool(), &id).await?;
-    let mut context = ContextDto {
-        ancestors: Vec::new(),
-        descendants: Vec::new(),
-    };
+    let mut visible_ancestors = Vec::with_capacity(ancestors.len());
     for row in ancestors {
         if can_view(&state, auth.as_ref(), &row).await? {
-            context
-                .ancestors
-                .push(dto(&state, &row, auth.as_ref()).await?);
+            visible_ancestors.push(row);
         }
     }
+    let mut visible_descendants = Vec::with_capacity(descendants.len());
     for row in descendants {
         if can_view(&state, auth.as_ref(), &row).await? {
-            context
-                .descendants
-                .push(dto(&state, &row, auth.as_ref()).await?);
+            visible_descendants.push(row);
         }
+    }
+    // The audience gate above stays one row at a time; the picture shapes for the whole
+    // thread are one read, however many posts the thread holds.
+    let pictures = pictures_for_rows(
+        &state,
+        visible_ancestors.iter().chain(visible_descendants.iter()),
+    )
+    .await?;
+    let mut context = ContextDto {
+        ancestors: Vec::with_capacity(visible_ancestors.len()),
+        descendants: Vec::with_capacity(visible_descendants.len()),
+    };
+    for row in &visible_ancestors {
+        context
+            .ancestors
+            .push(dto_with_pictures(&state, row, auth.as_ref(), Some(&pictures)).await?);
+    }
+    for row in &visible_descendants {
+        context
+            .descendants
+            .push(dto_with_pictures(&state, row, auth.as_ref(), Some(&pictures)).await?);
     }
     Ok(Json(context))
 }
@@ -751,11 +767,16 @@ pub async fn account_statuses(
     let params = query.params()?;
     let page =
         nodus_server_store::statuses::account_page(state.store().pool(), &id, params).await?;
-    let mut items = Vec::with_capacity(page.items.len());
+    let mut visible = Vec::with_capacity(page.items.len());
     for row in page.items {
         if can_view(&state, auth.as_ref(), &row).await? {
-            items.push(dto(&state, &row, auth.as_ref()).await?);
+            visible.push(row);
         }
+    }
+    let pictures = pictures_for_rows(&state, &visible).await?;
+    let mut items = Vec::with_capacity(visible.len());
+    for row in &visible {
+        items.push(dto_with_pictures(&state, row, auth.as_ref(), Some(&pictures)).await?);
     }
     let mut response = Json(items).into_response();
     if let Some(next) = page.next_max_id {
@@ -775,25 +796,88 @@ pub async fn account_statuses(
     Ok(response)
 }
 
+/// One status, with the author's picture shapes read for this status alone.
+///
+/// A caller that paints several statuses should read the pictures once with
+/// [`pictures_for_rows`] and use [`dto_with_pictures`], so the extra read does not follow
+/// the row count.
 pub(crate) async fn dto(
     state: &AppState,
     row: &StatusRow,
     viewer: Option<&Auth>,
+) -> ApiResult<StatusDto> {
+    dto_with_pictures(state, row, viewer, None).await
+}
+
+/// Every picture shape the statuses in `rows` will paint, in one batch.
+///
+/// The map is keyed by account id and covers the author of every row plus the author of
+/// every boost's original, which a row names only as a status id. An account with no
+/// picture is absent from the map, never a padded entry: the DTO leaves both metas null.
+pub(crate) async fn pictures_for_rows<'a, I>(
+    state: &AppState,
+    rows: I,
+) -> ApiResult<RowMap<ProfilePictures>>
+where
+    I: IntoIterator<Item = &'a StatusRow>,
+{
+    let mut account_ids = Vec::new();
+    let mut reblog_ids = Vec::new();
+    for row in rows {
+        account_ids.push(row.account_id.clone());
+        if let Some(original_id) = &row.reblog_of_id {
+            reblog_ids.push(original_id.clone());
+        }
+    }
+    reblog_ids.sort_unstable();
+    reblog_ids.dedup();
+    if !reblog_ids.is_empty() {
+        let originals =
+            nodus_server_store::statuses::by_ids(state.store().pool(), &reblog_ids).await?;
+        account_ids.extend(originals.into_iter().map(|row| row.account_id));
+    }
+    account_ids.sort_unstable();
+    account_ids.dedup();
+    if account_ids.is_empty() {
+        return Ok(RowMap::new());
+    }
+    let pictures = state
+        .store()
+        .batch()
+        .profile_pictures(&account_ids)
+        .run()
+        .await?;
+    Ok(pictures.profile_pictures)
+}
+
+/// The same document as [`dto`], painted from an already-read picture map.
+///
+/// `None` is the single-status path and reads this author's picture here; `Some` trusts
+/// the caller's batch for both the author and any boosted author.
+pub(crate) async fn dto_with_pictures(
+    state: &AppState,
+    row: &StatusRow,
+    viewer: Option<&Auth>,
+    pictures: Option<&RowMap<ProfilePictures>>,
 ) -> ApiResult<StatusDto> {
     let account = state
         .store()
         .account(&row.account_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    let author_pictures = state
-        .store()
-        .batch()
-        .profile_pictures(std::slice::from_ref(&account.id))
-        .run()
-        .await?;
     let media = nodus_server_store::media::by_status(state.store().pool(), &row.id).await?;
     let mut dto = StatusDto::from_row_with_media(row, &account, state.instance(), &media);
-    dto.apply_account_pictures(&author_pictures.profile_pictures);
+    if let Some(pictures) = pictures {
+        dto.account.apply_pictures(pictures.get(&account.id));
+    } else {
+        let author_pictures = state
+            .store()
+            .batch()
+            .profile_pictures(std::slice::from_ref(&account.id))
+            .run()
+            .await?;
+        dto.apply_account_pictures(&author_pictures.profile_pictures);
+    }
     let viewer_id = viewer.map(|auth| auth.0.account.id.as_str());
     decorate(state, &mut dto, &row.id, viewer_id).await?;
     if let Some(original_id) = &row.reblog_of_id {
@@ -807,19 +891,25 @@ pub(crate) async fn dto(
                 .ok_or_else(|| ApiError::not_found("Record not found"))?;
             let original_media =
                 nodus_server_store::media::by_status(state.store().pool(), &original.id).await?;
-            let original_pictures = state
-                .store()
-                .batch()
-                .profile_pictures(std::slice::from_ref(&original_account.id))
-                .run()
-                .await?;
             let mut boost = StatusDto::from_row_with_media(
                 &original,
                 &original_account,
                 state.instance(),
                 &original_media,
             );
-            boost.apply_account_pictures(&original_pictures.profile_pictures);
+            if let Some(pictures) = pictures {
+                boost
+                    .account
+                    .apply_pictures(pictures.get(&original_account.id));
+            } else {
+                let original_pictures = state
+                    .store()
+                    .batch()
+                    .profile_pictures(std::slice::from_ref(&original_account.id))
+                    .run()
+                    .await?;
+                boost.apply_account_pictures(&original_pictures.profile_pictures);
+            }
             decorate(state, &mut boost, &original.id, viewer_id).await?;
             dto.reblog = Some(Box::new(boost));
         }

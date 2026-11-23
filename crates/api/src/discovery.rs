@@ -120,10 +120,11 @@ pub async fn search(
             limit,
         )
         .await?;
+        let pictures = statuses::pictures_for_rows(&state, &rows).await?;
         for row in &rows {
             result
                 .statuses
-                .push(statuses::dto(&state, row, viewer).await?);
+                .push(statuses::dto_with_pictures(&state, row, viewer, Some(&pictures)).await?);
         }
     }
     if want == "all" || want == "hashtags" {
@@ -237,9 +238,12 @@ pub async fn trending_statuses(
         i64::from(nodus_server_core::limits::PAGE_DEFAULT),
     )
     .await?;
+    let pictures = statuses::pictures_for_rows(&state, &rows).await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
-        items.push(statuses::dto(&state, row, auth.0.as_ref()).await?);
+        items.push(
+            statuses::dto_with_pictures(&state, row, auth.0.as_ref(), Some(&pictures)).await?,
+        );
     }
     Ok(Json(items))
 }

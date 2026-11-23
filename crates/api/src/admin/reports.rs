@@ -102,11 +102,17 @@ pub(super) async fn report_dto(
     accounts: &RowMap<AccountRow>,
 ) -> ApiResult<ReportDto> {
     let pool = state.store().pool();
-    let mut hydrated = Vec::with_capacity(row.status_ids.len());
+    let mut rows = Vec::with_capacity(row.status_ids.len());
     for id in &row.status_ids {
         if let Some(status) = statuses::by_id(pool, id).await? {
-            hydrated.push(crate::statuses::dto(state, &status, None).await?);
+            rows.push(status);
         }
+    }
+    let pictures = crate::statuses::pictures_for_rows(state, &rows).await?;
+    let mut hydrated = Vec::with_capacity(rows.len());
+    for status in &rows {
+        hydrated
+            .push(crate::statuses::dto_with_pictures(state, status, None, Some(&pictures)).await?);
     }
     // The instance files some reports itself (a content-set match), so a report may have
     // no reporter account; the console renders the field as optional either way.

@@ -83,9 +83,10 @@ async fn page(
         }
     };
 
+    let pictures = statuses::pictures_for_rows(state, &rows).await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
-        items.push(statuses::dto(state, row, Some(auth)).await?);
+        items.push(statuses::dto_with_pictures(state, row, Some(auth), Some(&pictures)).await?);
     }
 
     let mut response = axum::Json(items).into_response();

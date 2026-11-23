@@ -82,8 +82,16 @@ pub async fn list(
         );
     }
 
-    let mut items = Vec::with_capacity(rows.len());
+    // One read per thread's last status, then one picture batch for all of them, so a
+    // page of twenty conversations does not read twenty profiles.
+    let mut last_statuses = Vec::with_capacity(rows.len());
     for row in &rows {
+        last_statuses.push(nodus_server_store::statuses::by_id(pool, &row.last_status_id).await?);
+    }
+    let pictures = statuses::pictures_for_rows(&state, last_statuses.iter().flatten()).await?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for (row, last_status_row) in rows.iter().zip(&last_statuses) {
         let participants = by_root.get(&row.root_id).map_or(&[][..], Vec::as_slice);
         let accounts = match &participant_outcome {
             Some(outcome) => {
@@ -95,11 +103,12 @@ pub async fn list(
             }
             None => Vec::new(),
         };
-        let last_status =
-            match nodus_server_store::statuses::by_id(pool, &row.last_status_id).await? {
-                Some(status) => Some(statuses::dto(&state, &status, Some(&auth)).await?),
-                None => None,
-            };
+        let last_status = match last_status_row {
+            Some(status) => Some(
+                statuses::dto_with_pictures(&state, status, Some(&auth), Some(&pictures)).await?,
+            ),
+            None => None,
+        };
         // Unread means the newest status arrived after the reader last opened the thread
         // and is not their own. A muted thread is still listed but stops asking for
         // attention, which is what muting a conversation is for.
