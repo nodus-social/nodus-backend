@@ -256,6 +256,16 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
         &self,
         token_hash: &str,
     ) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// Counts one wrong answer against the challenge.
+    ///
+    /// Returns `true` while the challenge survives. At `limit` failures the row is deleted
+    /// in the same transaction, so `false` means the password must be entered again.
+    fn record_failed_2fa_attempt(
+        &self,
+        token_hash: &str,
+        limit: i32,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
 }
 
 #[derive(Clone)]
@@ -482,14 +492,18 @@ impl AuthStore for PgAuthStore {
         approved: bool,
         confirmation: Option<Confirmation>,
     ) -> Result<SessionAccount, RegisterError> {
-        Self::register_local_with(&self.pool, username, email, password_hash, approved, confirmation)
-            .await
+        Self::register_local_with(
+            &self.pool,
+            username,
+            email,
+            password_hash,
+            approved,
+            confirmation,
+        )
+        .await
     }
 
-    async fn ip_block_verdict(
-        &self,
-        prefix: &str,
-    ) -> Result<Option<IpBlockVerdict>, Error> {
+    async fn ip_block_verdict(&self, prefix: &str) -> Result<Option<IpBlockVerdict>, Error> {
         let severity: Option<String> = sqlx::query_scalar(
             "SELECT severity FROM ip_block \
              WHERE (expires_at IS NULL OR expires_at > now()) AND $1::inet <<= ip::inet \
@@ -774,7 +788,11 @@ impl AuthStore for PgAuthStore {
         Ok(result.rows_affected() == 1)
     }
 
-    async fn consume_recovery_code(&self, account_id: &str, code_hash: &str) -> Result<bool, Error> {
+    async fn consume_recovery_code(
+        &self,
+        account_id: &str,
+        code_hash: &str,
+    ) -> Result<bool, Error> {
         let result = sqlx::query(
             "UPDATE account_recovery_code SET used_at = now() \
              WHERE account_id = $1 AND code_hash = $2 AND used_at IS NULL",
@@ -821,7 +839,7 @@ impl AuthStore for PgAuthStore {
              VALUES ($1, $2, $3) \
              ON CONFLICT (account_id) DO UPDATE \
              SET token_hash = excluded.token_hash, expires_at = excluded.expires_at, \
-                 created_at = now()",
+                 attempts = 0, created_at = now()",
         )
         .bind(account_id)
         .bind(token_hash)
@@ -848,6 +866,37 @@ impl AuthStore for PgAuthStore {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn record_failed_2fa_attempt(&self, token_hash: &str, limit: i32) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        // The row lock is the whole point: the count is read, compared and bumped while
+        // every other guess on this challenge waits, so parallel wrong answers cannot all
+        // observe the same count and slip past the limit.
+        let attempts: Option<i32> = sqlx::query_scalar(
+            "SELECT attempts FROM auth_2fa_challenge \
+             WHERE token_hash = $1 AND expires_at > now() FOR UPDATE",
+        )
+        .bind(token_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(attempts) = attempts else {
+            return Ok(false);
+        };
+        if attempts + 1 >= limit {
+            sqlx::query("DELETE FROM auth_2fa_challenge WHERE token_hash = $1")
+                .bind(token_hash)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE auth_2fa_challenge SET attempts = attempts + 1 WHERE token_hash = $1")
+            .bind(token_hash)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 }
 

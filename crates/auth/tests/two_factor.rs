@@ -8,7 +8,7 @@
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::Router;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use nodus_auth::store::{AuthStore, PgAuthStore};
 use nodus_auth::totp;
@@ -163,11 +163,7 @@ async fn send(app: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, S
         .await
         .expect("body")
         .to_bytes();
-    (
-        status,
-        headers,
-        String::from_utf8_lossy(&body).into_owned(),
-    )
+    (status, headers, String::from_utf8_lossy(&body).into_owned())
 }
 
 /// The named cookie's value, if the response set it.
@@ -184,8 +180,23 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 
 fn current_code(secret: &str, offset: i64) -> String {
     let step = i64::try_from(totp::step_at(Utc::now().timestamp())).expect("step") + offset;
-    totp::code_at(secret, u64::try_from(step).expect("step"))
-        .expect("code")
+    totp::code_at(secret, u64::try_from(step).expect("step")).expect("code")
+}
+
+/// The challenge's spent-attempt count and deadline, or `None` once the row is gone.
+async fn challenge_row(pool: &PgPool, account_id: &str) -> Option<(i32, DateTime<Utc>)> {
+    sqlx::query_as("SELECT attempts, expires_at FROM auth_2fa_challenge WHERE account_id = $1")
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await
+        .expect("challenge row")
+}
+
+fn redirect_target(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 /// Signs in with the password and returns the challenge cookie.
@@ -225,10 +236,7 @@ async fn answer_challenge(app: &Router, challenge: &str, code: &str) -> (StatusC
 #[tokio::test]
 async fn a_confirmed_factor_stops_the_password_from_issuing_a_session() {
     run_db_test(|pool| async move {
-        let app = nodus_auth::router(AppState::new(
-            PgAuthStore::new(pool.clone()),
-            config(),
-        ));
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
         let account_id = create_account(&pool).await;
         activate(&pool, &account_id, &totp::generate_secret(), &[]).await;
 
@@ -246,10 +254,7 @@ async fn a_confirmed_factor_stops_the_password_from_issuing_a_session() {
 #[tokio::test]
 async fn a_wrong_code_is_refused_and_issues_no_session() {
     run_db_test(|pool| async move {
-        let app = nodus_auth::router(AppState::new(
-            PgAuthStore::new(pool.clone()),
-            config(),
-        ));
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
         let account_id = create_account(&pool).await;
         let secret = totp::generate_secret();
         activate(&pool, &account_id, &secret, &[]).await;
@@ -266,10 +271,7 @@ async fn a_wrong_code_is_refused_and_issues_no_session() {
 #[tokio::test]
 async fn a_code_already_spent_in_its_window_is_replayed_nowhere() {
     run_db_test(|pool| async move {
-        let app = nodus_auth::router(AppState::new(
-            PgAuthStore::new(pool.clone()),
-            config(),
-        ));
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
         let account_id = create_account(&pool).await;
         let secret = totp::generate_secret();
         activate(&pool, &account_id, &secret, &[]).await;
@@ -278,13 +280,19 @@ async fn a_code_already_spent_in_its_window_is_replayed_nowhere() {
         let (_, first) = login(&app).await;
         let (status, headers) = answer_challenge(&app, &first.expect("challenge"), &code).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
-        assert!(cookie(&headers, "nodus_auth").is_some(), "first use succeeds");
+        assert!(
+            cookie(&headers, "nodus_auth").is_some(),
+            "first use succeeds"
+        );
 
         // A fresh challenge, the same window: the step is already spent.
         let (_, second) = login(&app).await;
         let (status, headers) = answer_challenge(&app, &second.expect("challenge"), &code).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(cookie(&headers, "nodus_auth").is_none(), "replay is refused");
+        assert!(
+            cookie(&headers, "nodus_auth").is_none(),
+            "replay is refused"
+        );
     })
     .await;
 }
@@ -292,23 +300,18 @@ async fn a_code_already_spent_in_its_window_is_replayed_nowhere() {
 #[tokio::test]
 async fn a_recovery_code_works_exactly_once() {
     run_db_test(|pool| async move {
-        let app = nodus_auth::router(AppState::new(
-            PgAuthStore::new(pool.clone()),
-            config(),
-        ));
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
         let account_id = create_account(&pool).await;
         let recovery = "abcd-efgh-ijkl-mnop";
-        activate(
-            &pool,
-            &account_id,
-            &totp::generate_secret(),
-            &[recovery],
-        )
-        .await;
+        activate(&pool, &account_id, &totp::generate_secret(), &[recovery]).await;
 
         let (_, first) = login(&app).await;
         let (status, headers) = answer_challenge(&app, &first.expect("challenge"), recovery).await;
-        assert_eq!(status, StatusCode::SEE_OTHER, "an unused recovery code works");
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "an unused recovery code works"
+        );
         assert!(cookie(&headers, "nodus_auth").is_some());
 
         let (_, second) = login(&app).await;
@@ -325,10 +328,7 @@ async fn a_recovery_code_works_exactly_once() {
 #[tokio::test]
 async fn regenerating_recovery_codes_invalidates_the_old_set() {
     run_db_test(|pool| async move {
-        let app = nodus_auth::router(AppState::new(
-            PgAuthStore::new(pool.clone()),
-            config(),
-        ));
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
         let account_id = create_account(&pool).await;
         let old = "abcd-efgh-ijkl-mnop";
         activate(&pool, &account_id, &totp::generate_secret(), &[old]).await;
@@ -369,10 +369,7 @@ async fn regenerating_recovery_codes_invalidates_the_old_set() {
 #[tokio::test]
 async fn enrolment_needs_a_code_before_it_gates_anything() {
     run_db_test(|pool| async move {
-        let app = nodus_auth::router(AppState::new(
-            PgAuthStore::new(pool.clone()),
-            config(),
-        ));
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
         create_account(&pool).await;
 
         // Without a factor the password alone signs in.
@@ -380,11 +377,7 @@ async fn enrolment_needs_a_code_before_it_gates_anything() {
         assert!(challenge.is_none(), "nothing to challenge yet");
 
         let (csrf_cookie, _csrf_token) = csrf();
-        let (status, headers, body) = send(
-            &app,
-            get("/auth/2fa/enroll", &csrf_cookie),
-        )
-        .await;
+        let (status, headers, body) = send(&app, get("/auth/2fa/enroll", &csrf_cookie)).await;
         assert_eq!(status, StatusCode::SEE_OTHER, "enrolment needs a session");
         assert!(headers.get(header::LOCATION).is_some());
         assert!(!body.contains("otpauth://"));
@@ -452,7 +445,201 @@ async fn enrolment_needs_a_code_before_it_gates_anything() {
             "ten codes are shown at enrolment"
         );
         let (_, challenge) = login(&app).await;
-        assert!(challenge.is_some(), "now the password stops at the challenge");
+        assert!(
+            challenge.is_some(),
+            "now the password stops at the challenge"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_fourth_attempt_with_the_right_code_still_signs_in() {
+    run_db_test(|pool| async move {
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
+        let account_id = create_account(&pool).await;
+        let secret = totp::generate_secret();
+        activate(&pool, &account_id, &secret, &[]).await;
+        let (_, challenge) = login(&app).await;
+        let challenge = challenge.expect("challenge");
+
+        for attempt in 1..=3 {
+            let (status, headers) = answer_challenge(&app, &challenge, "000000").await;
+            assert_eq!(status, StatusCode::OK, "miss {attempt} re-renders the form");
+            assert!(cookie(&headers, "nodus_auth").is_none());
+        }
+        assert_eq!(
+            challenge_row(&pool, &account_id).await.map(|row| row.0),
+            Some(3)
+        );
+
+        // The fourth answer is right and the budget is nowhere near spent.
+        let (status, headers) = answer_challenge(&app, &challenge, &current_code(&secret, 1)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(cookie(&headers, "nodus_auth").is_some());
+        assert!(
+            challenge_row(&pool, &account_id).await.is_none(),
+            "a success consumes the challenge"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_sixth_attempt_finds_no_challenge_and_issues_no_session() {
+    run_db_test(|pool| async move {
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
+        let account_id = create_account(&pool).await;
+        let secret = totp::generate_secret();
+        activate(&pool, &account_id, &secret, &[]).await;
+        let (_, challenge) = login(&app).await;
+        let challenge = challenge.expect("challenge");
+
+        for attempt in 1..=4 {
+            let (status, headers) = answer_challenge(&app, &challenge, "000000").await;
+            assert_eq!(status, StatusCode::OK, "miss {attempt} keeps the form");
+            assert!(cookie(&headers, "nodus_auth").is_none());
+        }
+
+        // The fifth miss spends the budget and sends the user back to the password.
+        let (status, headers) = answer_challenge(&app, &challenge, "000000").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(redirect_target(&headers).as_deref(), Some("/auth/login"));
+        assert!(cookie(&headers, "nodus_auth").is_none());
+        assert!(
+            challenge_row(&pool, &account_id).await.is_none(),
+            "the row is deleted at the limit"
+        );
+
+        // The sixth answer is correct but the cookie now names nothing.
+        let (status, headers) = answer_challenge(&app, &challenge, &current_code(&secret, 1)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(redirect_target(&headers).as_deref(), Some("/auth/login"));
+        assert!(cookie(&headers, "nodus_auth").is_none());
+
+        // Only a fresh password challenge starts over, and it begins with a full budget.
+        let (status, fresh) = login(&app).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, headers) = answer_challenge(
+            &app,
+            &fresh.expect("fresh challenge"),
+            &current_code(&secret, 1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(cookie(&headers, "nodus_auth").is_some());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_wrong_code_neither_extends_the_window_nor_refreshes_the_cookie() {
+    run_db_test(|pool| async move {
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
+        let account_id = create_account(&pool).await;
+        activate(&pool, &account_id, &totp::generate_secret(), &[]).await;
+        let (_, challenge) = login(&app).await;
+        let challenge = challenge.expect("challenge");
+        let (_, before) = challenge_row(&pool, &account_id)
+            .await
+            .expect("challenge row");
+
+        let (status, headers) = answer_challenge(&app, &challenge, "000000").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            cookie(&headers, "nodus_2fa").is_none(),
+            "a miss must not reissue the challenge cookie"
+        );
+
+        let (attempts, after) = challenge_row(&pool, &account_id)
+            .await
+            .expect("challenge row");
+        assert_eq!(attempts, 1);
+        assert_eq!(after, before, "a miss must not move the deadline");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_guesses_draw_on_the_same_budget() {
+    run_db_test(|pool| async move {
+        let app = nodus_auth::router(AppState::new(PgAuthStore::new(pool.clone()), config()));
+        let account_id = create_account(&pool).await;
+        let recovery = "abcd-efgh-ijkl-mnop";
+        activate(&pool, &account_id, &totp::generate_secret(), &[recovery]).await;
+        let (_, challenge) = login(&app).await;
+        let challenge = challenge.expect("challenge");
+
+        // Three digit-pad misses and one recovery-shaped miss leave one attempt in the
+        // budget; the next recovery-shaped guess spends it, so both share one counter.
+        for code in ["000000", "000000", "000000", "zzzz-zzzz-zzzz-zzzz"] {
+            let (status, headers) = answer_challenge(&app, &challenge, code).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(cookie(&headers, "nodus_auth").is_none());
+        }
+        let (status, headers) = answer_challenge(&app, &challenge, "zzzz-zzzz-zzzz-zzzz").await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert_eq!(redirect_target(&headers).as_deref(), Some("/auth/login"));
+        assert!(challenge_row(&pool, &account_id).await.is_none());
+
+        // The one valid recovery code arrives too late and mints no session.
+        let (status, headers) = answer_challenge(&app, &challenge, recovery).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(cookie(&headers, "nodus_auth").is_none());
+
+        // It was the budget, not the code: a fresh challenge accepts it.
+        let (_, fresh) = login(&app).await;
+        let (status, headers) = answer_challenge(&app, &fresh.expect("challenge"), recovery).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(cookie(&headers, "nodus_auth").is_some());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn concurrent_wrong_answers_cannot_exceed_the_limit() {
+    run_db_test(|pool| async move {
+        let account_id = create_account(&pool).await;
+        // No router and no real token: the property under test is that the read-check-bump
+        // cannot lose an update when many answers land on one challenge at once.
+        let store = PgAuthStore::new(pool.clone());
+        let token_hash = "race-token-hash";
+        store
+            .create_2fa_challenge(
+                token_hash,
+                &account_id,
+                Utc::now() + chrono::Duration::minutes(5),
+            )
+            .await
+            .expect("challenge");
+
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .record_failed_2fa_attempt(token_hash, nodus_auth::CHALLENGE_ATTEMPTS)
+                    .await
+                    .expect("record")
+            }));
+        }
+        let mut survived = 0_usize;
+        for task in tasks {
+            if task.await.expect("task") {
+                survived += 1;
+            }
+        }
+        // Exactly limit-1 answers may come back `true`: the last slot deletes the row. A
+        // lost-update race would let several tasks read the same count and all pass.
+        let expected = usize::try_from(nodus_auth::CHALLENGE_ATTEMPTS - 1).expect("limit");
+        assert_eq!(
+            survived, expected,
+            "concurrent guesses overspent the budget"
+        );
+        assert!(
+            challenge_row(&pool, &account_id).await.is_none(),
+            "the row is deleted exactly once"
+        );
     })
     .await;
 }

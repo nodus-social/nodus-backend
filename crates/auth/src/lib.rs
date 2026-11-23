@@ -55,6 +55,12 @@ const TWO_FACTOR_COOKIE: &str = "nodus_2fa";
 /// Long enough to open an authenticator app, short enough that a stolen challenge is not
 /// a standing key. The database row enforces the same deadline.
 const CHALLENGE_MINUTES: i64 = 5;
+/// Five wrong codes consume the challenge. The ±1 step window holds three valid codes in a
+/// million, so five guesses leave an attacker about one chance in sixty thousand; a sixth
+/// only keeps a stolen password useful longer. The lockout ends with the challenge rather
+/// than the account (see `0065_two_factor_attempts.sql`), so it cannot be used to deny the
+/// owner a login.
+pub const CHALLENGE_ATTEMPTS: i32 = 5;
 /// Long enough to survive a mail queue and a weekend, short enough to be worthless later.
 const CONFIRMATION_HOURS: i64 = 48;
 const CODE_MINUTES: i64 = 5;
@@ -238,8 +244,14 @@ pub fn router<S: AuthStore>(state: AppState<S>) -> Router {
         )
         .route("/auth/logout", post(logout::<S>))
         .route("/auth/confirm/{token}", get(confirm_page::<S>))
-        .route("/auth/2fa", get(two_factor_page::<S>).post(two_factor_submit::<S>))
-        .route("/auth/2fa/enroll", get(enrol_page::<S>).post(enrol_submit::<S>))
+        .route(
+            "/auth/2fa",
+            get(two_factor_page::<S>).post(two_factor_submit::<S>),
+        )
+        .route(
+            "/auth/2fa/enroll",
+            get(enrol_page::<S>).post(enrol_submit::<S>),
+        )
         .route("/auth/2fa/recovery", post(regenerate_recovery::<S>))
         .route("/auth/session", get(session::<S>))
         .route(
@@ -314,7 +326,10 @@ async fn login_submit<S: AuthStore>(
             state.store.ip_block_verdict(&prefix).await.ok().flatten(),
             Some(IpBlockVerdict::NoAccess)
         ) {
-            return (StatusCode::FORBIDDEN, "This network is not permitted to sign in.")
+            return (
+                StatusCode::FORBIDDEN,
+                "This network is not permitted to sign in.",
+            )
                 .into_response();
         }
     }
@@ -357,11 +372,7 @@ async fn login_submit<S: AuthStore>(
         let expiry = Utc::now() + Duration::minutes(CHALLENGE_MINUTES);
         if state
             .store
-            .create_2fa_challenge(
-                &token_hash(&challenge),
-                &credential.account_id,
-                expiry,
-            )
+            .create_2fa_challenge(&token_hash(&challenge), &credential.account_id, expiry)
             .await
             .is_err()
         {
@@ -543,12 +554,7 @@ async fn sign_up_verdict<S: AuthStore>(
     peer: Option<SocketAddr>,
 ) -> Option<IpBlockVerdict> {
     let prefix = peer.map(|address| network_prefix(address.ip()))?;
-    state
-        .store
-        .ip_block_verdict(&prefix)
-        .await
-        .ok()
-        .flatten()
+    state.store.ip_block_verdict(&prefix).await.ok().flatten()
 }
 
 /// The confirmation mail a registration must queue in its own transaction, when mail is
@@ -869,13 +875,20 @@ async fn two_factor_page<S: AuthStore>(
         .flatten()
         .is_none()
     {
-        return (jar.remove(expired_two_factor_cookie()), Redirect::to("/auth/login"))
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            Redirect::to("/auth/login"),
+        )
             .into_response();
     }
     let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
     (
         jar,
-        Html(render_two_factor(query.return_to.as_deref(), None, &csrf_token)),
+        Html(render_two_factor(
+            query.return_to.as_deref(),
+            None,
+            &csrf_token,
+        )),
     )
         .into_response()
 }
@@ -902,7 +915,10 @@ async fn two_factor_submit<S: AuthStore>(
         .ok()
         .flatten()
     else {
-        return (jar.remove(expired_two_factor_cookie()), Redirect::to("/auth/login"))
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            Redirect::to("/auth/login"),
+        )
             .into_response();
     };
     let Some(totp_state) = state
@@ -913,7 +929,10 @@ async fn two_factor_submit<S: AuthStore>(
         .flatten()
         .filter(|state| state.confirmed)
     else {
-        return (jar.remove(expired_two_factor_cookie()), Redirect::to("/auth/login"))
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            Redirect::to("/auth/login"),
+        )
             .into_response();
     };
 
@@ -938,16 +957,7 @@ async fn two_factor_submit<S: AuthStore>(
             .unwrap_or(false),
     };
     if !accepted {
-        let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
-        return (
-            jar,
-            Html(render_two_factor(
-                form.return_to.as_deref(),
-                Some("That code did not work. Try the next one, or a recovery code."),
-                &csrf_token,
-            )),
-        )
-            .into_response();
+        return refuse_two_factor(&state, jar, form.return_to.as_deref(), &challenge_hash).await;
     }
 
     // Only the request that removes the challenge may issue the session: a concurrent
@@ -958,7 +968,10 @@ async fn two_factor_submit<S: AuthStore>(
         .await
         .unwrap_or(false)
     {
-        return (jar.remove(expired_two_factor_cookie()), Redirect::to("/auth/login"))
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            Redirect::to("/auth/login"),
+        )
             .into_response();
     }
     let Ok(cookie) = issue_session(&state, &account_id, &headers, peer).await else {
@@ -979,6 +992,41 @@ async fn two_factor_submit<S: AuthStore>(
         .into_response()
 }
 
+/// Answers a wrong code while spending one of the challenge's attempts.
+///
+/// The count and the decision to burn the row happen under one row lock, so parallel
+/// guesses cannot each read the same count and exceed the limit. Once the row is gone the
+/// next answer needs a fresh password, which is the only thing that mints a new challenge.
+async fn refuse_two_factor<S: AuthStore>(
+    state: &AppState<S>,
+    jar: CookieJar,
+    return_to: Option<&str>,
+    challenge_hash: &str,
+) -> Response {
+    let survives = state
+        .store
+        .record_failed_2fa_attempt(challenge_hash, CHALLENGE_ATTEMPTS)
+        .await
+        .unwrap_or(false);
+    if !survives {
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            Redirect::to("/auth/login"),
+        )
+            .into_response();
+    }
+    let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    (
+        jar,
+        Html(render_two_factor(
+            return_to,
+            Some("That code did not work. Try the next one, or a recovery code."),
+            &csrf_token,
+        )),
+    )
+        .into_response()
+}
+
 async fn enrol_page<S: AuthStore>(State(state): State<AppState<S>>, jar: CookieJar) -> Response {
     let Some(account) = current_account(&state, &jar).await else {
         return Redirect::to("/auth/login").into_response();
@@ -995,7 +1043,9 @@ async fn enrol_page<S: AuthStore>(State(state): State<AppState<S>>, jar: CookieJ
     }
     // Reuse an unfinished secret: reloading the page must not silently invalidate the
     // QR the user already scanned.
-    let secret = if let Some(state) = totp_state { state.secret } else {
+    let secret = if let Some(state) = totp_state {
+        state.secret
+    } else {
         let secret = totp::generate_secret();
         if state
             .store
@@ -1014,7 +1064,13 @@ async fn enrol_page<S: AuthStore>(State(state): State<AppState<S>>, jar: CookieJ
     let uri = totp::provisioning_uri(&state.config.domain, &account.username, &secret);
     (
         jar,
-        Html(render_enrolment(&account.username, &secret, &uri, None, &csrf_token)),
+        Html(render_enrolment(
+            &account.username,
+            &secret,
+            &uri,
+            None,
+            &csrf_token,
+        )),
     )
         .into_response()
 }
@@ -1045,11 +1101,8 @@ async fn enrol_submit<S: AuthStore>(
     }
     let step = totp::step_at(Utc::now().timestamp());
     let Some(step) = totp::verify(&totp_state.secret, &form.code, step, None) else {
-        let uri = totp::provisioning_uri(
-            &state.config.domain,
-            &account.username,
-            &totp_state.secret,
-        );
+        let uri =
+            totp::provisioning_uri(&state.config.domain, &account.username, &totp_state.secret);
         return (
             jar,
             Html(render_enrolment(
@@ -1065,7 +1118,10 @@ async fn enrol_submit<S: AuthStore>(
     let codes: Vec<String> = (0..totp::RECOVERY_CODES)
         .map(|_| totp::generate_recovery_code())
         .collect();
-    let hashes: Vec<String> = codes.iter().map(|code| totp::recovery_code_hash(code)).collect();
+    let hashes: Vec<String> = codes
+        .iter()
+        .map(|code| totp::recovery_code_hash(code))
+        .collect();
     if state
         .store
         .confirm_totp(&account.account_id, step, &hashes)
@@ -1106,7 +1162,10 @@ async fn regenerate_recovery<S: AuthStore>(
     let codes: Vec<String> = (0..totp::RECOVERY_CODES)
         .map(|_| totp::generate_recovery_code())
         .collect();
-    let hashes: Vec<String> = codes.iter().map(|code| totp::recovery_code_hash(code)).collect();
+    let hashes: Vec<String> = codes
+        .iter()
+        .map(|code| totp::recovery_code_hash(code))
+        .collect();
     // The delete and the insert share a transaction, so the old set stops working at the
     // same moment the new one appears.
     if state
@@ -1121,11 +1180,7 @@ async fn regenerate_recovery<S: AuthStore>(
         )
             .into_response();
     }
-    (
-        jar,
-        Html(render_recovery_codes(&codes)),
-    )
-        .into_response()
+    (jar, Html(render_recovery_codes(&codes))).into_response()
 }
 
 fn render_two_factor(return_to: Option<&str>, error: Option<&str>, csrf_token: &str) -> String {

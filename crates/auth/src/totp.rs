@@ -57,7 +57,8 @@ pub fn code_at(secret: &str, step: u64) -> Option<String> {
 #[must_use]
 pub fn verify(secret: &str, code: &str, current_step: u64, after_step: Option<i64>) -> Option<i64> {
     let code = code.trim();
-    if code.len() != usize::try_from(DIGITS).unwrap_or(6) || !code.bytes().all(|b| b.is_ascii_digit())
+    if code.len() != usize::try_from(DIGITS).unwrap_or(6)
+        || !code.bytes().all(|b| b.is_ascii_digit())
     {
         return None;
     }
@@ -82,9 +83,8 @@ pub fn verify(secret: &str, code: &str, current_step: u64, after_step: Option<i6
 #[must_use]
 pub fn provisioning_uri(issuer: &str, account: &str, secret: &str) -> String {
     let label = format!("{issuer}:{account}");
-    let encode = |value: &str| {
-        url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>()
-    };
+    let encode =
+        |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
     format!(
         "otpauth://totp/{}?secret={}&issuer={}&algorithm=SHA1&digits={DIGITS}&period={STEP_SECONDS}",
         encode(&label),
@@ -131,7 +131,10 @@ mod tests {
     #[test]
     fn rfc6238_vector_matches() {
         assert_eq!(step_at(59), 1);
-        assert_eq!(code_at("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 1).as_deref(), Some("287082"));
+        assert_eq!(
+            code_at("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 1).as_deref(),
+            Some("287082")
+        );
     }
 
     #[test]
@@ -139,8 +142,19 @@ mod tests {
         let secret = generate_secret();
         let current = step_at(1_700_000_000);
         let code = code_at(&secret, current).expect("code");
-        assert_eq!(verify(&secret, &code, current, None), Some(i64::try_from(current).unwrap()));
-        assert_eq!(verify(&secret, &code, current, Some(i64::try_from(current).unwrap())), None);
+        assert_eq!(
+            verify(&secret, &code, current, None),
+            Some(i64::try_from(current).unwrap())
+        );
+        assert_eq!(
+            verify(
+                &secret,
+                &code,
+                current,
+                Some(i64::try_from(current).unwrap())
+            ),
+            None
+        );
         let next = code_at(&secret, current + 1).expect("next code");
         assert!(verify(&secret, &next, current, None).is_some());
         let previous = code_at(&secret, current - 1).expect("previous code");
@@ -157,6 +171,9 @@ mod tests {
             recovery_code_hash(&code.to_lowercase().replace('-', " ")),
             recovery_code_hash(&code)
         );
-        assert_ne!(recovery_code_hash(&code), recovery_code_hash(&generate_recovery_code()));
+        assert_ne!(
+            recovery_code_hash(&code),
+            recovery_code_hash(&generate_recovery_code())
+        );
     }
 }
