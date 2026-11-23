@@ -51,6 +51,7 @@ pub mod schedules;
 pub mod social;
 pub mod stats;
 pub mod statuses;
+pub mod style_public;
 pub mod tags;
 pub mod writer;
 

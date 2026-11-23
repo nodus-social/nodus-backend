@@ -55,6 +55,7 @@ pub mod schedules;
 pub mod state;
 pub mod statuses;
 pub mod streaming;
+pub mod style_public;
 pub mod suggestions;
 pub mod tags;
 pub mod user_blocks;
@@ -185,6 +186,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(conversations::router())
         .merge(discovery::router())
         .merge(preferences::router())
+        .merge(style_public::router())
         .merge(markers::router())
         .merge(drive::router())
         .merge(polls::router())

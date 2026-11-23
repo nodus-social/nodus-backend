@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// have without losing the area's door — and a peer that serves them all must draw every
 /// one. New names are appended rather than sorted: clients compare the array, so a reorder
 /// is churn with no meaning.
-pub const FEATURES: [&str; 71] = [
+pub const FEATURES: [&str; 72] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -158,6 +158,12 @@ pub const FEATURES: [&str; 71] = [
     // The shell's Export tab downloads it; the projection is itself the contract (see
     // `crate::accounts::export`: no credential leaves in an export).
     "exports", // GET /api/v1/accounts/{id}/export
+    // The banners an account publishes for its profile. The owner's whole style — nav
+    // layout, rail modules, categories — stays private client metadata; only these three
+    // regions cross the boundary, so a viewer can draw the banners without learning the
+    // arrangement. The read lives at `/api/v1/accounts/{id}/style_public`, under the core
+    // accounts group, so this name is for the owner's write.
+    "style_public", // PUT /api/v1/style/public
     // Two abilities of the SHELL, not of this API. Upstream Mastodon has no JSON API for
     // either — both live in its HTML settings — and this instance follows: a session is
     // reviewed and signed out with the credential the login minted, and a second factor

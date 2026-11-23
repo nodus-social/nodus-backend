@@ -283,6 +283,13 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v2/notifications/policy",
         owner: Owner::Api,
     },
+    // A PUT-only publish; the probe's GET answers 405 at once, which is how a registered
+    // path behind a grant is expected to answer.
+    Capability {
+        name: "style_public",
+        path: "/api/v1/style/public",
+        owner: Owner::Api,
+    },
     // An SSE stream never returns a body to this probe, which `probe` treats as present at
     // its budget; a route that was deleted would answer 404 at once instead.
     Capability {
@@ -862,8 +869,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        71,
-        "/api/v1/meta must answer 71 unique names: {advertised_names:?}"
+        72,
+        "/api/v1/meta must answer 72 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -873,14 +880,15 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        71,
-        "the published vocabulary is 71 unique names: 42 before the page split, the 20 page \
+        72,
+        "the published vocabulary is 72 unique names: 42 before the page split, the 20 page \
          names (21 pages, `moderation_rules` already present, so no duplicate), the 2 \
          relationship lists (`mutes`, `blocks`), the personal domain list \
          (`domain_blocks`), the profile's featured tags (`featured_tags`), the \
          backend-assembled pages (`pages`), the notification policy \
-         (`notification_settings`), the account export (`exports`), and the two abilities \
-         the shell serves itself (`sessions`, `two_factor`)"
+         (`notification_settings`), the account export (`exports`), the published profile \
+         banners (`style_public`), and the two abilities the shell serves itself \
+         (`sessions`, `two_factor`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1255,6 +1263,7 @@ const ROUTE_SOURCES: &[(&str, &str)] = route_sources![
     "polls.rs",
     "preferences.rs",
     "schedules.rs",
+    "style_public.rs",
     "streaming.rs",
     "suggestions.rs",
     "tags.rs",
@@ -1550,6 +1559,11 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
     SurfaceGroup {
         prefix: "/api/v1/streaming",
         features: &["streaming"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/style",
+        features: &["style_public"],
         reason: "",
     },
     SurfaceGroup {
