@@ -35,6 +35,7 @@ use crate::store::{
 pub mod domain;
 pub mod outbox;
 pub mod store;
+pub mod totp;
 
 /// Hashes a bootstrap password with Argon2id's default parameters.
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
@@ -48,6 +49,12 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
 
 pub const SESSION_COOKIE: &str = "nodus_auth";
 const SESSION_DAYS: i64 = 30;
+/// The password was accepted but the second factor has not been; the cookie is not a
+/// session and no token is issued until it is exchanged.
+const TWO_FACTOR_COOKIE: &str = "nodus_2fa";
+/// Long enough to open an authenticator app, short enough that a stolen challenge is not
+/// a standing key. The database row enforces the same deadline.
+const CHALLENGE_MINUTES: i64 = 5;
 /// Long enough to survive a mail queue and a weekend, short enough to be worthless later.
 const CONFIRMATION_HOURS: i64 = 48;
 const CODE_MINUTES: i64 = 5;
@@ -231,6 +238,9 @@ pub fn router<S: AuthStore>(state: AppState<S>) -> Router {
         )
         .route("/auth/logout", post(logout::<S>))
         .route("/auth/confirm/{token}", get(confirm_page::<S>))
+        .route("/auth/2fa", get(two_factor_page::<S>).post(two_factor_submit::<S>))
+        .route("/auth/2fa/enroll", get(enrol_page::<S>).post(enrol_submit::<S>))
+        .route("/auth/2fa/recovery", post(regenerate_recovery::<S>))
         .route("/auth/session", get(session::<S>))
         .route(
             "/.well-known/oauth-authorization-server",
@@ -334,31 +344,76 @@ async fn login_submit<S: AuthStore>(
         return (StatusCode::INTERNAL_SERVER_ERROR, "credential missing").into_response();
     };
 
-    let session = opaque_token();
-    let expiry = Utc::now() + Duration::days(SESSION_DAYS);
-    let (user_agent, ip) = session_device(&headers, peer.0);
-    if state
+    // A confirmed authenticator moves the login to a challenge: the password alone must
+    // not mint a session, and the challenge expires independently of this request.
+    let totp = state
         .store
-        .create_session(
-            &token_hash(&session),
-            &credential.account_id,
-            expiry,
-            &user_agent,
-            ip.as_deref(),
-        )
+        .totp_state(&credential.account_id)
         .await
-        .is_err()
-    {
+        .ok()
+        .flatten();
+    if totp.is_some_and(|state| state.confirmed) {
+        let challenge = opaque_token();
+        let expiry = Utc::now() + Duration::minutes(CHALLENGE_MINUTES);
+        if state
+            .store
+            .create_2fa_challenge(
+                &token_hash(&challenge),
+                &credential.account_id,
+                expiry,
+            )
+            .await
+            .is_err()
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "challenge could not be stored",
+            )
+                .into_response();
+        }
+        let redirect = with_return("/auth/2fa", form.return_to.as_deref());
+        return (
+            jar.add(two_factor_cookie(challenge, state.config.secure_cookies)),
+            Redirect::to(&redirect),
+        )
+            .into_response();
+    }
+
+    let Ok(cookie) = issue_session(&state, &credential.account_id, &headers, peer).await else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "session could not be stored",
         )
             .into_response();
-    }
-    let cookie = session_cookie(session, expiry, state.config.secure_cookies);
+    };
     let rotated_csrf = csrf_cookie(opaque_token(), state.config.secure_cookies);
     let target = safe_return_to(form.return_to.as_deref()).unwrap_or("/");
     (jar.add(cookie).add(rotated_csrf), Redirect::to(target)).into_response()
+}
+
+/// Mints the only thing a completed login produces: an opaque session token whose hash is
+/// stored. Both the password-only path and the second-factor path end here.
+async fn issue_session<S: AuthStore>(
+    state: &AppState<S>,
+    account_id: &str,
+    headers: &HeaderMap,
+    peer: Peer,
+) -> Result<Cookie<'static>, ()> {
+    let session = opaque_token();
+    let expiry = Utc::now() + Duration::days(SESSION_DAYS);
+    let (user_agent, ip) = session_device(headers, peer.0);
+    state
+        .store
+        .create_session(
+            &token_hash(&session),
+            account_id,
+            expiry,
+            &user_agent,
+            ip.as_deref(),
+        )
+        .await
+        .map_err(|_| ())?;
+    Ok(session_cookie(session, expiry, state.config.secure_cookies))
 }
 
 #[derive(Debug, Deserialize)]
@@ -769,6 +824,415 @@ async fn session<S: AuthStore>(
         username: account.username,
         display_name: account.display_name,
     }))
+}
+
+fn two_factor_cookie(value: String, secure: bool) -> Cookie<'static> {
+    let mut cookie = Cookie::new(TWO_FACTOR_COOKIE, value);
+    // The challenge is only useful under the auth routes; a wider path would carry it to
+    // every page for no reason.
+    cookie.set_path("/auth");
+    cookie.set_http_only(true);
+    cookie.set_same_site(SameSite::Lax);
+    cookie.set_secure(secure);
+    cookie.set_max_age(time::Duration::minutes(CHALLENGE_MINUTES));
+    cookie
+}
+
+fn expired_two_factor_cookie() -> Cookie<'static> {
+    let mut cookie = Cookie::new(TWO_FACTOR_COOKIE, "");
+    cookie.set_path("/auth");
+    cookie.set_max_age(Some(time::Duration::ZERO));
+    cookie
+}
+
+#[derive(Debug, Deserialize)]
+struct TwoFactorForm {
+    code: String,
+    return_to: Option<String>,
+    #[serde(default)]
+    csrf_token: String,
+}
+
+async fn two_factor_page<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let Some(challenge) = jar.get(TWO_FACTOR_COOKIE).map(Cookie::value) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    if state
+        .store
+        .challenge_account(&token_hash(challenge))
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return (jar.remove(expired_two_factor_cookie()), Redirect::to("/auth/login"))
+            .into_response();
+    }
+    let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    (
+        jar,
+        Html(render_two_factor(query.return_to.as_deref(), None, &csrf_token)),
+    )
+        .into_response()
+}
+
+async fn two_factor_submit<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    peer: Peer,
+    Form(form): Form<TwoFactorForm>,
+) -> Response {
+    let (jar, _csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    let Some(challenge) = jar.get(TWO_FACTOR_COOKIE).map(Cookie::value) else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let challenge_hash = token_hash(challenge);
+    let Some(account_id) = state
+        .store
+        .challenge_account(&challenge_hash)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (jar.remove(expired_two_factor_cookie()), Redirect::to("/auth/login"))
+            .into_response();
+    };
+    let Some(totp_state) = state
+        .store
+        .totp_state(&account_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|state| state.confirmed)
+    else {
+        return (jar.remove(expired_two_factor_cookie()), Redirect::to("/auth/login"))
+            .into_response();
+    };
+
+    let step = totp::step_at(Utc::now().timestamp());
+    let accepted = match totp::verify(
+        &totp_state.secret,
+        &form.code,
+        step,
+        totp_state.last_used_step,
+    ) {
+        // The step is recorded in the same UPDATE that admits it, so a replay in the same
+        // window loses the race rather than issuing a second session.
+        Some(step) => state
+            .store
+            .advance_totp_step(&account_id, step)
+            .await
+            .unwrap_or(false),
+        None => state
+            .store
+            .consume_recovery_code(&account_id, &totp::recovery_code_hash(&form.code))
+            .await
+            .unwrap_or(false),
+    };
+    if !accepted {
+        let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+        return (
+            jar,
+            Html(render_two_factor(
+                form.return_to.as_deref(),
+                Some("That code did not work. Try the next one, or a recovery code."),
+                &csrf_token,
+            )),
+        )
+            .into_response();
+    }
+
+    // Only the request that removes the challenge may issue the session: a concurrent
+    // request that saw the same challenge row fails here.
+    if !state
+        .store
+        .delete_2fa_challenge(&challenge_hash)
+        .await
+        .unwrap_or(false)
+    {
+        return (jar.remove(expired_two_factor_cookie()), Redirect::to("/auth/login"))
+            .into_response();
+    }
+    let Ok(cookie) = issue_session(&state, &account_id, &headers, peer).await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session could not be stored",
+        )
+            .into_response();
+    };
+    let rotated_csrf = csrf_cookie(opaque_token(), state.config.secure_cookies);
+    let target = safe_return_to(form.return_to.as_deref()).unwrap_or("/");
+    (
+        jar.add(cookie)
+            .add(rotated_csrf)
+            .remove(expired_two_factor_cookie()),
+        Redirect::to(target),
+    )
+        .into_response()
+}
+
+async fn enrol_page<S: AuthStore>(State(state): State<AppState<S>>, jar: CookieJar) -> Response {
+    let Some(account) = current_account(&state, &jar).await else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    let totp_state = state
+        .store
+        .totp_state(&account.account_id)
+        .await
+        .ok()
+        .flatten();
+    if totp_state.as_ref().is_some_and(|state| state.confirmed) {
+        return (jar, Html(render_enrolled(&csrf_token))).into_response();
+    }
+    // Reuse an unfinished secret: reloading the page must not silently invalidate the
+    // QR the user already scanned.
+    let secret = if let Some(state) = totp_state { state.secret } else {
+        let secret = totp::generate_secret();
+        if state
+            .store
+            .start_totp_enrolment(&account.account_id, &secret)
+            .await
+            .is_err()
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "enrolment could not be stored",
+            )
+                .into_response();
+        }
+        secret
+    };
+    let uri = totp::provisioning_uri(&state.config.domain, &account.username, &secret);
+    (
+        jar,
+        Html(render_enrolment(&account.username, &secret, &uri, None, &csrf_token)),
+    )
+        .into_response()
+}
+
+async fn enrol_submit<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    Form(form): Form<TwoFactorForm>,
+) -> Response {
+    let Some(account) = current_account(&state, &jar).await else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let (jar, csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    let Some(totp_state) = state
+        .store
+        .totp_state(&account.account_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return Redirect::to("/auth/2fa/enroll").into_response();
+    };
+    if totp_state.confirmed {
+        return (jar, Html(render_enrolled(&csrf_token))).into_response();
+    }
+    let step = totp::step_at(Utc::now().timestamp());
+    let Some(step) = totp::verify(&totp_state.secret, &form.code, step, None) else {
+        let uri = totp::provisioning_uri(
+            &state.config.domain,
+            &account.username,
+            &totp_state.secret,
+        );
+        return (
+            jar,
+            Html(render_enrolment(
+                &account.username,
+                &totp_state.secret,
+                &uri,
+                Some("That code did not match. Check the app's clock and try again."),
+                &csrf_token,
+            )),
+        )
+            .into_response();
+    };
+    let codes: Vec<String> = (0..totp::RECOVERY_CODES)
+        .map(|_| totp::generate_recovery_code())
+        .collect();
+    let hashes: Vec<String> = codes.iter().map(|code| totp::recovery_code_hash(code)).collect();
+    if state
+        .store
+        .confirm_totp(&account.account_id, step, &hashes)
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "enrolment could not be confirmed",
+        )
+            .into_response();
+    }
+    (jar, Html(render_recovery_codes(&codes))).into_response()
+}
+
+async fn regenerate_recovery<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    Form(form): Form<TwoFactorForm>,
+) -> Response {
+    let Some(account) = current_account(&state, &jar).await else {
+        return Redirect::to("/auth/login").into_response();
+    };
+    let (jar, _csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
+        return (StatusCode::FORBIDDEN, "invalid CSRF token").into_response();
+    }
+    let Some(_totp_state) = state
+        .store
+        .totp_state(&account.account_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|state| state.confirmed)
+    else {
+        return Redirect::to("/auth/2fa/enroll").into_response();
+    };
+    let codes: Vec<String> = (0..totp::RECOVERY_CODES)
+        .map(|_| totp::generate_recovery_code())
+        .collect();
+    let hashes: Vec<String> = codes.iter().map(|code| totp::recovery_code_hash(code)).collect();
+    // The delete and the insert share a transaction, so the old set stops working at the
+    // same moment the new one appears.
+    if state
+        .store
+        .replace_recovery_codes(&account.account_id, &hashes)
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "recovery codes could not be replaced",
+        )
+            .into_response();
+    }
+    (
+        jar,
+        Html(render_recovery_codes(&codes)),
+    )
+        .into_response()
+}
+
+fn render_two_factor(return_to: Option<&str>, error: Option<&str>, csrf_token: &str) -> String {
+    let return_to = return_to.unwrap_or_default().to_owned();
+    let csrf_token = csrf_token.to_owned();
+    let error = error.map(str::to_owned);
+    shell(
+        "Two-factor · Nodus",
+        None,
+        view! {
+            <h1>"Two-factor authentication"</h1>
+            <p class="muted">
+                "Enter the six-digit code from your authenticator app, or one of your recovery codes."
+            </p>
+            {error.map(|message| view! { <p class="error">{message}</p> })}
+            <form method="post" action="/auth/2fa">
+                <input type="hidden" name="return_to" value=return_to/>
+                <input type="hidden" name="csrf_token" value=csrf_token/>
+                <label for="code">"Code"</label>
+                <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code"
+                    autofocus required/>
+                <div class="actions">
+                    <button type="submit">"Continue"</button>
+                </div>
+            </form>
+        },
+    )
+}
+
+fn render_enrolment(
+    username: &str,
+    secret: &str,
+    uri: &str,
+    error: Option<&str>,
+    csrf_token: &str,
+) -> String {
+    let username = username.to_owned();
+    let secret = secret.to_owned();
+    let uri = uri.to_owned();
+    let csrf_token = csrf_token.to_owned();
+    let error = error.map(str::to_owned);
+    shell(
+        "Set up two-factor · Nodus",
+        None,
+        view! {
+            <h1>"Set up two-factor authentication"</h1>
+            <p class="muted">
+                "Add this secret to your authenticator app, then enter the code it shows. "
+                "The factor is not required until you confirm it."
+            </p>
+            <p>"Account: "<strong>{username}</strong></p>
+            <p>"Secret: "<code>{secret}</code></p>
+            <p class="muted">"Or open this link on the device with the app:"</p>
+            <p><code class="break">{uri}</code></p>
+            {error.map(|message| view! { <p class="error">{message}</p> })}
+            <form method="post" action="/auth/2fa/enroll">
+                <input type="hidden" name="csrf_token" value=csrf_token/>
+                <label for="code">"Code from the app"</label>
+                <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code"
+                    autofocus required/>
+                <div class="actions">
+                    <button type="submit">"Turn on two-factor"</button>
+                </div>
+            </form>
+        },
+    )
+}
+
+fn render_enrolled(csrf_token: &str) -> String {
+    let csrf_token = csrf_token.to_owned();
+    shell(
+        "Two-factor · Nodus",
+        None,
+        view! {
+            <h1>"Two-factor authentication is on"</h1>
+            <p class="muted">
+                "Signing in now asks for a code after your password. Keep the recovery codes "
+                "somewhere you can reach without your phone."
+            </p>
+            <form method="post" action="/auth/2fa/recovery">
+                <input type="hidden" name="csrf_token" value=csrf_token/>
+                <button type="submit" class="secondary">"Replace recovery codes"</button>
+            </form>
+            <p class="muted">"Replacing them invalidates every code shown before."</p>
+        },
+    )
+}
+
+fn render_recovery_codes(codes: &[String]) -> String {
+    let codes: Vec<String> = codes.to_vec();
+    shell(
+        "Recovery codes · Nodus",
+        None,
+        view! {
+            <h1>"Save your recovery codes"</h1>
+            <p class="error">
+                "These are shown once. Each works one time, in place of an authenticator code."
+            </p>
+            <ul>
+                {codes
+                    .into_iter()
+                    .map(|code| view! { <li><code>{code}</code></li> })
+                    .collect_view()}
+            </ul>
+            <p><a href="/">"Continue"</a></p>
+        },
+    )
 }
 
 async fn authorize<S: AuthStore>(

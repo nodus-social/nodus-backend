@@ -84,6 +84,15 @@ pub struct ClientApp {
 }
 
 #[derive(Debug, Clone)]
+pub struct TotpState {
+    pub secret: String,
+    /// NULL until the user proved an authenticator produces codes for `secret`.
+    pub confirmed: bool,
+    /// The last step a code was accepted for, which is the replay floor.
+    pub last_used_step: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionAccount {
     pub account_id: String,
     pub username: String,
@@ -187,6 +196,66 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
         &self,
         token_hash: &str,
     ) -> impl Future<Output = Result<Option<String>, Error>> + Send;
+
+    fn totp_state(
+        &self,
+        account_id: &str,
+    ) -> impl Future<Output = Result<Option<TotpState>, Error>> + Send;
+
+    /// Stores an unconfirmed secret, replacing any earlier unfinished attempt.
+    fn start_totp_enrolment(
+        &self,
+        account_id: &str,
+        secret: &str,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Turns the stored secret into a required factor and installs its recovery codes.
+    fn confirm_totp(
+        &self,
+        account_id: &str,
+        last_used_step: i64,
+        recovery_hashes: &[String],
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// Records `step` as spent, returning false when it was already at or below the floor.
+    fn advance_totp_step(
+        &self,
+        account_id: &str,
+        step: i64,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// Spends one unused recovery code; false means unknown or already used.
+    fn consume_recovery_code(
+        &self,
+        account_id: &str,
+        code_hash: &str,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// Replaces the whole set, so codes shown before the call stop working.
+    fn replace_recovery_codes(
+        &self,
+        account_id: &str,
+        recovery_hashes: &[String],
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    fn create_2fa_challenge(
+        &self,
+        token_hash: &str,
+        account_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// The account behind a live challenge; `None` when unknown or expired.
+    fn challenge_account(
+        &self,
+        token_hash: &str,
+    ) -> impl Future<Output = Result<Option<String>, Error>> + Send;
+
+    /// Consumes the challenge, returning false when another request already did.
+    fn delete_2fa_challenge(
+        &self,
+        token_hash: &str,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
 }
 
 #[derive(Clone)]
@@ -625,6 +694,160 @@ impl AuthStore for PgAuthStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn totp_state(&self, account_id: &str) -> Result<Option<TotpState>, Error> {
+        let row = sqlx::query_as::<_, (String, bool, Option<i64>)>(
+            "SELECT secret, confirmed_at IS NOT NULL, last_used_step \
+             FROM account_totp WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(secret, confirmed, last_used_step)| TotpState {
+            secret,
+            confirmed,
+            last_used_step,
+        }))
+    }
+
+    async fn start_totp_enrolment(&self, account_id: &str, secret: &str) -> Result<(), Error> {
+        // A new secret invalidates the previous enrolment's codes; leaving the old
+        // confirmed flag would gate logins behind a secret the user can no longer see, so
+        // a restart deliberately returns the row to unconfirmed.
+        sqlx::query(
+            "INSERT INTO account_totp (account_id, secret, confirmed_at, last_used_step) \
+             VALUES ($1, $2, NULL, NULL) \
+             ON CONFLICT (account_id) DO UPDATE \
+             SET secret = excluded.secret, confirmed_at = NULL, last_used_step = NULL",
+        )
+        .bind(account_id)
+        .bind(secret)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn confirm_totp(
+        &self,
+        account_id: &str,
+        last_used_step: i64,
+        recovery_hashes: &[String],
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE account_totp SET confirmed_at = now(), last_used_step = $2 \
+             WHERE account_id = $1 AND confirmed_at IS NULL",
+        )
+        .bind(account_id)
+        .bind(last_used_step)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM account_recovery_code WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        for hash in recovery_hashes {
+            sqlx::query(
+                "INSERT INTO account_recovery_code (account_id, code_hash) VALUES ($1, $2) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(account_id)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn advance_totp_step(&self, account_id: &str, step: i64) -> Result<bool, Error> {
+        let result = sqlx::query(
+            "UPDATE account_totp SET last_used_step = $2 \
+             WHERE account_id = $1 AND confirmed_at IS NOT NULL \
+               AND (last_used_step IS NULL OR last_used_step < $2)",
+        )
+        .bind(account_id)
+        .bind(step)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn consume_recovery_code(&self, account_id: &str, code_hash: &str) -> Result<bool, Error> {
+        let result = sqlx::query(
+            "UPDATE account_recovery_code SET used_at = now() \
+             WHERE account_id = $1 AND code_hash = $2 AND used_at IS NULL",
+        )
+        .bind(account_id)
+        .bind(code_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn replace_recovery_codes(
+        &self,
+        account_id: &str,
+        recovery_hashes: &[String],
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM account_recovery_code WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        for hash in recovery_hashes {
+            sqlx::query(
+                "INSERT INTO account_recovery_code (account_id, code_hash) VALUES ($1, $2) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(account_id)
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn create_2fa_challenge(
+        &self,
+        token_hash: &str,
+        account_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO auth_2fa_challenge (account_id, token_hash, expires_at) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (account_id) DO UPDATE \
+             SET token_hash = excluded.token_hash, expires_at = excluded.expires_at, \
+                 created_at = now()",
+        )
+        .bind(account_id)
+        .bind(token_hash)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn challenge_account(&self, token_hash: &str) -> Result<Option<String>, Error> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT account_id FROM auth_2fa_challenge \
+             WHERE token_hash = $1 AND expires_at > now()",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn delete_2fa_challenge(&self, token_hash: &str) -> Result<bool, Error> {
+        let result = sqlx::query("DELETE FROM auth_2fa_challenge WHERE token_hash = $1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
     }
 }
 
