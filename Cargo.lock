@@ -2602,6 +2602,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nodus-protocol"
+version = "0.1.0"
+dependencies = [
+ "nodus-client-core",
+ "nodus-shared",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "nodus-prune"
 version = "0.1.0"
 dependencies = [
@@ -2639,6 +2650,7 @@ dependencies = [
  "nodus-auth",
  "nodus-client-core",
  "nodus-federation",
+ "nodus-protocol",
  "nodus-server-core",
  "nodus-server-federation",
  "nodus-server-media",

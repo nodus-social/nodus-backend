@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// have without losing the area's door — and a peer that serves them all must draw every
 /// one. New names are appended rather than sorted: clients compare the array, so a reorder
 /// is churn with no meaning.
-pub const FEATURES: [&str; 68] = [
+pub const FEATURES: [&str; 71] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -154,6 +154,20 @@ pub const FEATURES: [&str; 68] = [
     // The backend-assembled page payloads: a profile with its statuses, a status with its
     // thread. The shell gates its one-call profile and thread screens on this name.
     "pages", // GET /api/v1/pages/profile/{id}, /api/v1/pages/status/{id}
+    // Everything this instance holds about one account, in one document a person can keep.
+    // The shell's Export tab downloads it; the projection is itself the contract (see
+    // `crate::accounts::export`: no credential leaves in an export).
+    "exports", // GET /api/v1/accounts/{id}/export
+    // Two abilities of the SHELL, not of this API. Upstream Mastodon has no JSON API for
+    // either — both live in its HTML settings — and this instance follows: a session is
+    // reviewed and signed out with the credential the login minted, and a second factor
+    // (TOTP enrolment, verification and recovery codes) is proved by the shell's own
+    // login. They are published because the handshake is how a console decides whether to
+    // draw those settings sections at all; leaving them out hid both on every instance,
+    // including this one. `tests/capabilities.rs` declares them in `SHELL_CAPABILITIES`
+    // with the sentence each one stands on, so neither can go unpublished unnoticed.
+    "sessions",
+    "two_factor",
 ];
 
 /// The capability names this deployment can actually honour, as owned strings.

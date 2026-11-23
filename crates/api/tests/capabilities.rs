@@ -32,6 +32,7 @@ use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
 
+use nodus_protocol::Feature;
 use nodus_server_api::{router, AppState, InstanceConfig};
 use nodus_server_store::Store;
 
@@ -309,6 +310,13 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/pages/profile/{id}",
         owner: Owner::Api,
     },
+    // One account's whole record in one document. The probe is anonymous, so the grant in
+    // front of the handler answers 401 — a route, not a document.
+    Capability {
+        name: "exports",
+        path: "/api/v1/accounts/{id}/export",
+        owner: Owner::Api,
+    },
     // The administration pages. `admin` above is the door; these are the rooms behind it.
     // Each probe is the first route the page calls; the split and its handler family are
     // stated in `ADMIN_PAGES` below, where `every_admin_page_capability_is_backed` holds
@@ -429,6 +437,38 @@ const CAPABILITIES: &[Capability] = &[
         name: "domain_blocks",
         path: "/api/v1/domain_blocks",
         owner: Owner::Api,
+    },
+];
+
+/// One published name whose surface is the shell's own, with no API route behind it.
+struct ShellCapability {
+    name: &'static str,
+    /// What serves it instead, and why this API has no route for it.
+    served_by: &'static str,
+}
+
+/// The names no API route answers, stated rather than skipped.
+///
+/// Every other published name is proved by [`CAPABILITIES`] plus the router. These two
+/// describe abilities of the shell's own account screens, and upstream Mastodon has no JSON
+/// API for either (both live in its HTML settings): a session is reviewed and signed out
+/// with the credential the login minted, and the second factor is proved by the login
+/// itself. `SHELL_CAPABILITIES` is not a silencer — each row must say what serves the name,
+/// must be published by `FEATURES`, and must not be claimed by a routed group. Leaving the
+/// two out of `FEATURES` instead is exactly what hid the shell's Sessions and Two-factor
+/// tabs on every instance.
+const SHELL_CAPABILITIES: &[ShellCapability] = &[
+    ShellCapability {
+        name: "sessions",
+        served_by: "the shell's Sessions tab: the browsers and apps signed in to the account \
+                    are signed out with the credential the login minted, not with a route this \
+                    API serves",
+    },
+    ShellCapability {
+        name: "two_factor",
+        served_by: "the shell's own login proves the second factor: TOTP enrolment, \
+                    verification and recovery codes; a JSON 2FA API does not exist upstream \
+                    either, because Mastodon keeps it in HTML settings",
     },
 ];
 
@@ -822,8 +862,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        68,
-        "/api/v1/meta must answer 68 unique names: {advertised_names:?}"
+        71,
+        "/api/v1/meta must answer 71 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -833,19 +873,46 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        68,
-        "the published vocabulary is 68 unique names: 42 before the page split, the 20 page \
+        71,
+        "the published vocabulary is 71 unique names: 42 before the page split, the 20 page \
          names (21 pages, `moderation_rules` already present, so no duplicate), the 2 \
          relationship lists (`mutes`, `blocks`), the personal domain list \
          (`domain_blocks`), the profile's featured tags (`featured_tags`), the \
-         backend-assembled pages (`pages`), and the notification policy \
-         (`notification_settings`)"
+         backend-assembled pages (`pages`), the notification policy \
+         (`notification_settings`), the account export (`exports`), and the two abilities \
+         the shell serves itself (`sessions`, `two_factor`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
         .iter()
         .map(|capability| capability.name.to_owned())
+        .chain(
+            SHELL_CAPABILITIES
+                .iter()
+                .map(|capability| capability.name.to_owned()),
+        )
         .collect();
+
+    for shell in SHELL_CAPABILITIES {
+        assert!(
+            nodus_server_api::meta::FEATURES.contains(&shell.name),
+            "`{}` is declared shell-served but FEATURES does not publish it",
+            shell.name
+        );
+        assert!(
+            !CAPABILITIES
+                .iter()
+                .any(|capability| capability.name == shell.name),
+            "`{}` is declared shell-served and also probed as an API path; one name is one \
+             surface",
+            shell.name
+        );
+        assert!(
+            shell.served_by.len() > 60,
+            "`{}` is declared shell-served without saying what serves it",
+            shell.name
+        );
+    }
 
     let unbacked: Vec<&String> = published.difference(&tabled).collect();
     assert!(
@@ -867,6 +934,44 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
             "`{name}` is not snake_case"
         );
     }
+}
+
+/// The server and the client SDK must name the same surfaces, in both directions.
+///
+/// `Feature` in `sdk/crates/nodus/src/feature.rs` is the vocabulary the shell gates its
+/// panels on, and [`nodus_server_api::meta::FEATURES`] is what an instance publishes. The
+/// two lists are meant to be one list; nothing made them one, so the SDK defined
+/// `sessions`, `two_factor` and `exports` while no instance published them and the shell
+/// hid those sections everywhere. A name the SDK knows and `FEATURES` forgets fails here,
+/// and so does a name `FEATURES` publishes that no client can decode.
+#[test]
+fn the_published_vocabulary_is_the_sdk_vocabulary() {
+    let published: BTreeSet<&str> = nodus_server_api::meta::FEATURES.iter().copied().collect();
+    let vocabulary: BTreeSet<&str> = Feature::ALL
+        .iter()
+        .map(|feature| feature.as_str())
+        .collect();
+
+    assert_eq!(
+        nodus_server_api::meta::FEATURES.len(),
+        Feature::COUNT,
+        "FEATURES carries {} names where the SDK's vocabulary carries {}",
+        nodus_server_api::meta::FEATURES.len(),
+        Feature::COUNT
+    );
+
+    let unpublished: Vec<&str> = vocabulary.difference(&published).copied().collect();
+    assert!(
+        unpublished.is_empty(),
+        "the SDK defines capability name(s) FEATURES never publishes, so the shell gates a \
+         section on a name no instance answers and hides it everywhere:\n  {unpublished:#?}"
+    );
+    let undecodable: Vec<&str> = published.difference(&vocabulary).copied().collect();
+    assert!(
+        undecodable.is_empty(),
+        "FEATURES publishes capability name(s) the SDK has no `Feature` for, so a client \
+         reads them as unknown:\n  {undecodable:#?}"
+    );
 }
 
 #[tokio::test]
@@ -1519,6 +1624,14 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
         features: &[],
         reason: "the follow-request inbox of a locked account; core account route",
     },
+    // The export is the one route under the account prefix that is a capability of its own:
+    // the profile routes are assumed by every client, but a console only draws Export when
+    // the account can actually be taken away in one document.
+    SurfaceGroup {
+        prefix: "/api/v1/accounts/{id}/export",
+        features: &["exports"],
+        reason: "",
+    },
     SurfaceGroup {
         prefix: "/api/v1/featured_tags",
         features: &["featured_tags"],
@@ -1912,6 +2025,39 @@ async fn every_routed_surface_group_is_named_in_both_directions() {
         unnamed.is_empty(),
         "advertised capability name(s) with no routed group in SURFACE_GROUPS:\n  {unnamed:#?}"
     );
+
+    // A published name is answered in one of three places: a routed group here, the sibling
+    // `nodus-feed` process (`Owner::Feeds`), or the shell itself (`SHELL_CAPABILITIES`).
+    // This is the check the class of drift needed: a name the SDK knows and the shell gates
+    // on must reach a client, and a name that reaches a client must have something behind
+    // it.
+    let shell: BTreeSet<&str> = SHELL_CAPABILITIES
+        .iter()
+        .map(|capability| capability.name)
+        .collect();
+    let feeds: BTreeSet<&str> = CAPABILITIES
+        .iter()
+        .filter(|capability| capability.owner == Owner::Feeds)
+        .map(|capability| capability.name)
+        .collect();
+    let orphans: Vec<&str> = published
+        .iter()
+        .copied()
+        .filter(|name| {
+            !grouped.contains(name) && !shell.contains(name) && !feeds.contains(name)
+        })
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "published capability name(s) with no routed group, no shell declaration and no feed \
+         owner:\n  {orphans:#?}"
+    );
+    for name in &shell {
+        assert!(
+            !grouped.contains(name),
+            "`{name}` is declared shell-served, but a routed group claims it"
+        );
+    }
 
     for capability in CAPABILITIES
         .iter()

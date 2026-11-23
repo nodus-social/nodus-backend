@@ -63,6 +63,10 @@ nodus-federation = { path = "../../../server-sdk/crates/federation", features = 
 # The contract tests decode responses into the shipped client's own types, so a field
 # this server stops sending fails here instead of in somebody's browser.
 nodus-client-core = { path = "../../../sdk/crates/client-core", version = "0.1.0", default-features = false }
+# The capability vocabulary is the SDK's `Feature` set; the handshake publishes it. Asserting
+# the two lists equal is what stops a shell-gated name (`two_factor`) from going unpublished
+# and hiding a settings section on every instance.
+nodus-protocol = { path = "../../../sdk/crates/nodus", version = "0.1.0" }
 
 [lints]
 workspace = true

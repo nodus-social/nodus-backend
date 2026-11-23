@@ -1,13 +1,14 @@
 # Capabilities: one question, three vocabularies
 
 Before paint a client answers one question: *what does this server actually serve?* Three
-vocabularies answer it — the API's list (`crates/api/src/meta.rs:39`, 68 names), the SDK's typed
+vocabularies answer it — the API's list (`crates/api/src/meta.rs:39`, 71 names), the SDK's typed
 `Feature` set baselined per protocol (`sdk/crates/nodus/src/baseline.rs`), and the shell's doors
 (`web/crates/ui/src/capabilities.rs:56` `admits`). One name means one surface everywhere.
 
-The 68 names are not only routes: thirteen administration pages and eight moderation sections are
+The 71 names are not only routes: thirteen administration pages and eight moderation sections are
 names of their own, while `admin` and `moderation` went on meaning the *area* (§5). An area bit
-says the room exists; a page name says which screens inside it answer.
+says the room exists; a page name says which screens inside it answer. Two of the 71 are abilities
+of the shell with no route behind them (§1, "The shell's own two").
 
 ## 1. The publication rule
 
@@ -16,8 +17,8 @@ it should not draw, a command it should not offer. Naming is not "the route exis
 `/api/v1/instance` is a route every client calls either way.
 
 `crates/api/tests/capabilities.rs::every_routed_surface_group_is_named_in_both_directions`
-(`:1757`) parses the router's `.route(...)` literals, groups them by prefix in `SURFACE_GROUPS`
-(`:1198`), and refuses:
+(`:1933`) parses the router's `.route(...)` literals, groups them by prefix in `SURFACE_GROUPS`
+(`:1344`), and refuses:
 
 | It fails when | Why that is a bug |
 | --- | --- |
@@ -28,9 +29,11 @@ it should not draw, a command it should not offer. Naming is not "the route exis
 
 An advertised API name with no group fails too, as does a group claiming one of the feed's three
 names (§3); the allowlist is no silencer — an unnamed group needs a `reason` over 20 characters,
-a named one none (`:1816-1825`). Renaming is breaking, adding is safe. `/api/v1/meta` and
+a named one none (`:1990-2000`). A published name must be claimed by a routed group, owned by the
+sibling feed process, or declared in `SHELL_CAPABILITIES`; a fourth state does not exist
+(`:2043-2059`). Renaming is breaking, adding is safe. `/api/v1/meta` and
 `/api/v1/nodus/capabilities` both answer from `features(share_links)`
-(`crates/api/src/meta.rs:150-154`), so the two documents cannot disagree
+(`crates/api/src/meta.rs:184-188`), so the two documents cannot disagree
 (`crates/api/tests/capabilities.rs::the_handshake_and_the_protocol_screen_publish_one_vocabulary`).
 
 A page name cannot be proved by its prefix alone when a sibling page shares the route family, so
@@ -57,12 +60,34 @@ the row: `drop` writes nothing (so no stream event is published), `filter` write
 `moderation` — always arrive; `follow_request`, `report` and `pending_request` have no write
 path yet, and `status` is mapped but no row is created for it.
 
+### The shell's own two: `two_factor` and `sessions`
+
+Two of the 71 names describe an ability of the **shell**, not of this API: `two_factor` — a second
+proof at sign-in, with the TOTP enrolment, verification and recovery codes that belong beside it —
+and `sessions`, the browsers and apps signed in to the account. Neither has a JSON endpoint, here
+or upstream: Mastodon keeps both in its HTML settings, and so does this instance — the second
+factor is proved and a session is signed out by the shell's own login, with the credential that
+login minted. `crates/api/tests/capabilities.rs::SHELL_CAPABILITIES` (`:460`) is where that is
+stated, one sentence per name saying what serves it, because a silent omission is what hid both
+settings sections on every instance.
+
+They are published because the settings strip gates its sections on them
+(`web/crates/pages/src/pages/settings/nav.rs`, `SettingsSection::gate`: `TwoFactor` →
+`Feature::TwoFactor`, `Sessions` → `Feature::Sessions`). A client that reads the name may draw the
+section; a client that does not must not, and must conclude this instance's login does not offer
+that ability at all. **Absence is not "no opinion"**: before these names were published the
+handshake said nothing and the shell hid both tabs, so an instance that does serve them looked
+like one that does not.
+
+`exports` is not in this group: `GET /api/v1/accounts/{id}/export` is an ordinary API route, and
+the shell's Export tab downloads it.
+
 ## 2. The one conditional name: `drive_share`
 
-67 names are published unconditionally; `drive_share` is not.
+70 names are published unconditionally; `drive_share` is not.
 
 ```rust
-// crates/api/src/meta.rs:150-154
+// crates/api/src/meta.rs:184-188
 FEATURES.iter().filter(|name| **name != "drive_share" || share_links)
 ```
 
@@ -82,7 +107,7 @@ shadowed* by its router, and the lab's live check proves the sibling answers the
 (`crates/api/tests/capabilities.rs:20-24`). `/api/v1/nodus/events` is **410 Gone**, "replaced by
 `/api/v1/streaming`" (`crates/api/src/nodus.rs:87`).
 
-**The Caddy trap.** Both processes answer `/api/v1/meta` — the API with 68 names, the feed with 3.
+**The Caddy trap.** Both processes answer `/api/v1/meta` — the API with 71 names, the feed with 3.
 Put that path in the feed's matcher and the origin hands every same-origin client (shell, SSR
 host, e2e) three names, so the instance looks like it does nothing. Hence
 `integration/Caddyfile:49-55`, where the omission is deliberate:
@@ -323,8 +348,10 @@ it lists *other* accounts; role opens the door, scope limits what the token does
 2. **If it is a page inside an area**, add an `AdminPage` row (`crates/api/tests/capabilities.rs:1591`)
    and a `Surface` row: a page-only prefix claimed by a group, or the modules plus a reason over
    20 characters (§5).
-3. **Table it**: a `Capability` row (name, probe path, owner) at `crates/api/tests/capabilities.rs:57`
-   **and** a covering `SurfaceGroup` in `SURFACE_GROUPS` (`:1198`).
+3. **Table it**: a `Capability` row (name, probe path, owner) at `crates/api/tests/capabilities.rs:58`
+   **and** a covering `SurfaceGroup` in `SURFACE_GROUPS` (`:1344`). When the shell serves the
+   ability itself and the API cannot (upstream has no route either), add a `SHELL_CAPABILITIES`
+   row instead, with the sentence saying what serves it (§1).
 4. **Type it**: `Feature` variant, then `COUNT`, `ALL`, `feature/wire.rs`, `feature/index.rs`.
 5. **Decide it** in `sdk/crates/nodus/src/baseline/decision.rs:90` for all three protocols, and add
    its probe row to §4.
