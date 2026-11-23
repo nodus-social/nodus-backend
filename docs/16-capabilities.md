@@ -66,6 +66,12 @@ One of the 72 names describes an ability of the **shell**, not of this API: `two
 second proof at sign-in, with the TOTP enrolment, verification and recovery codes that belong
 beside it. It has no JSON endpoint here or upstream: Mastodon keeps it in its HTML settings, and
 so does this instance — the second factor is proved by the shell's own login.
+That login is a password login: `POST /auth/login` (`crates/auth/src/lib.rs`) verifies the
+password, and an account with a confirmed secret gets a challenge at `GET|POST /auth/2fa`
+instead of a session. Enrolment (`GET|POST /auth/2fa/enroll`), the recovery codes and the
+off switch are on that same HTML page, under the `nodus_auth` cookie and a CSRF form token;
+the web settings tab links to it rather than redrawing it
+(`web/crates/pages/src/pages/settings/two_factor.rs`).
 `crates/api/tests/capabilities.rs::SHELL_CAPABILITIES` is where that is stated, saying what
 serves the name, because a silent omission is what hid the Two-factor settings section on every
 instance.
