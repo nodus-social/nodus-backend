@@ -24,6 +24,8 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 
 use nodus_server_api::webpush;
+use nodus_server_core::Id;
+use nodus_server_store::statuses::{self, NewStatus};
 use nodus_server_store::{push, social};
 
 use support::{create_account, run_db_test, test_vapid};
@@ -170,12 +172,36 @@ async fn a_mention_payload_decrypts_and_a_follow_only_subscriber_is_skipped() {
     run_db_test(|store, _app| async move {
         let recipient = create_account(store.pool(), "push-delivery-mention").await;
         let actor = create_account(store.pool(), "push-delivery-actor").await;
+        let status = Id::new().to_string();
+        statuses::create(
+            store.pool(),
+            &NewStatus {
+                id: &status,
+                account_id: &actor,
+                content: "A very particular sentence",
+                content_html: "A very particular sentence",
+                content_source: None,
+                content_format: "html",
+                spoiler_text: "",
+                visibility: "public",
+                sensitive: false,
+                in_reply_to_id: None,
+                in_reply_to_account_id: None,
+                reblog_of_id: None,
+                language: None,
+            },
+            &[],
+            &[recipient.clone()],
+            &[],
+        )
+        .await
+        .expect("status");
         social::notify_with_note(
             store.pool(),
             &recipient,
             "mention",
             &actor,
-            None,
+            Some(&status),
             Some("A very particular sentence"),
         )
         .await
@@ -235,25 +261,82 @@ async fn a_mention_payload_decrypts_and_a_follow_only_subscriber_is_skipped() {
 
         let plaintext = decrypt(&secret, &auth, &requests[0].body);
         let payload: Value = serde_json::from_slice(&plaintext).expect("payload JSON");
-        let actor_name: String =
-            sqlx::query_scalar("SELECT display_name FROM account WHERE id = $1")
+        let (actor_name, actor_username): (String, String) =
+            sqlx::query_as("SELECT display_name, username FROM account WHERE id = $1")
                 .bind(&actor)
                 .fetch_one(store.pool())
                 .await
-                .expect("actor display name");
+                .expect("actor name and username");
+        // The whole object, not one field: a payload with a missing tag or a relative
+        // route is still a payload a browser shows and cannot route.
+        let expected = json!({
+            "title": actor_name,
+            "body": "A very particular sentence",
+            "tag": format!("mention:{status}"),
+            "data": { "url": format!("/@{actor_username}/{status}") },
+            "icon": "/icon.png",
+        });
         assert_eq!(
-            payload["title"].as_str(),
-            Some(actor_name.as_str()),
-            "title is the actor's name: {payload}"
-        );
-        assert_eq!(
-            payload["body"].as_str(),
-            Some("A very particular sentence"),
-            "body is the notification's note: {payload}"
+            payload, expected,
+            "the mention payload is exactly this: {payload}"
         );
 
         let subscriptions = push::list(store.pool(), &recipient).await.expect("list");
         assert_eq!(subscriptions.len(), 3, "one failure must not remove a row");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_follow_payload_tags_the_account_and_points_at_the_profile() {
+    run_db_test(|store, _app| async move {
+        let recipient = create_account(store.pool(), "push-delivery-follow").await;
+        let actor = create_account(store.pool(), "push-delivery-follow-actor").await;
+        social::notify_with_note(store.pool(), &recipient, "follow", &actor, None, None)
+            .await
+            .expect("notification");
+
+        let (secret, p256dh, auth) = browser_keys();
+        let (endpoint, bodies) = stub(StatusCode::CREATED).await;
+        push::upsert(
+            store.pool(),
+            &recipient,
+            &endpoint,
+            &p256dh,
+            &auth,
+            &alerts(false, true),
+            None,
+        )
+        .await
+        .expect("subscription");
+
+        webpush::deliver_due(store.pool(), &test_vapid(), 100)
+            .await
+            .expect("deliver");
+        let requests = bodies.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 1, "one delivered push");
+
+        let plaintext = decrypt(&secret, &auth, &requests[0].body);
+        let payload: Value = serde_json::from_slice(&plaintext).expect("payload JSON");
+        let (actor_name, actor_username): (String, String) =
+            sqlx::query_as("SELECT display_name, username FROM account WHERE id = $1")
+                .bind(&actor)
+                .fetch_one(store.pool())
+                .await
+                .expect("actor name and username");
+        // A follow has no status: it tags and routes on the account, which is why its
+        // payload differs from a mention's.
+        let expected = json!({
+            "title": actor_name,
+            "body": "You have a new follower",
+            "tag": format!("follow:{actor}"),
+            "data": { "url": format!("/@{actor_username}") },
+            "icon": "/icon.png",
+        });
+        assert_eq!(
+            payload, expected,
+            "the follow payload is exactly this: {payload}"
+        );
     })
     .await;
 }

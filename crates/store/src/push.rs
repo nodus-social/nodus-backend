@@ -179,14 +179,22 @@ pub struct OutboxRow {
     pub kind: String,
 }
 
-/// The words a push shows: the actor's name, the note a note-kind carries, and the
-/// first part of a status. All optional because a status or account may have been
-/// deleted between the notification and the send.
+/// The words a push shows and the identifiers a push has to route and coalesce on: the
+/// actor's name and username, the note a note-kind carries, the first part of a status,
+/// and the notification's own target (`status_id` for status kinds, `from_account_id`
+/// for account kinds). All optional except `id` because a status or account may have
+/// been deleted between the notification and the send.
 #[derive(Debug, Clone, FromRow)]
 pub struct NoticeRow {
+    pub id: String,
+    pub from_account_id: String,
+    pub status_id: Option<String>,
     pub note: Option<String>,
     pub actor: Option<String>,
+    pub actor_username: Option<String>,
     pub status_text: Option<String>,
+    /// The username of the status's author, which is who a status permalink names.
+    pub status_author: Option<String>,
 }
 
 /// Queues one notification for the push sender.
@@ -252,10 +260,13 @@ pub async fn notice(
     notification_id: &str,
 ) -> Result<Option<NoticeRow>, sqlx::Error> {
     sqlx::query_as::<_, NoticeRow>(
-        "SELECT n.note, a.display_name AS actor, left(s.content, 280) AS status_text \
+        "SELECT n.id, n.from_account_id, n.status_id, n.note, \
+                a.display_name AS actor, a.username AS actor_username, \
+                left(s.content, 280) AS status_text, author.username AS status_author \
            FROM notification n \
            LEFT JOIN account a ON a.id = n.from_account_id \
            LEFT JOIN status s ON s.id = n.status_id \
+           LEFT JOIN account author ON author.id = s.account_id \
           WHERE n.id = $1 AND n.account_id = $2",
     )
     .bind(notification_id)

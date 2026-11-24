@@ -202,9 +202,22 @@ pub async fn run(pool: PgPool, vapid: Vapid) {
     }
 }
 
-/// The small JSON a service worker shows. `access_token` is omitted: a push subscription
-/// has no per-device token, and inventing one would make a client present a credential
-/// this instance never issued.
+/// The JSON a service worker shows. `access_token` is omitted: a push subscription has no
+/// per-device token, and inventing one would make a client present a credential this
+/// instance never issued.
+///
+/// `tag` exists so a browser coalesces replacements instead of stacking them: two
+/// notifications about the same thing share a tag and the second REPLACES the first; two
+/// notifications about different things never share one, because a shared tag would
+/// silently swallow the older notification. The target is the status for status kinds and
+/// the actor's account for follow kinds; a kind with no target id in this row (an appeal,
+/// a moderation notice, an admin report) uses the notification's own id, which can never
+/// collide with another notification.
+///
+/// `renotify` is deliberately absent. With a tag keyed to the target, a replacement is
+/// another event about the same post or account — another favourite of the same post, a
+/// second boost, the same account following again — not a new item; alerting again for
+/// each one would turn a popular post into a stream of buzzes.
 fn payload_for(kind: &str, notice: &push::NoticeRow) -> serde_json::Value {
     let body = notice
         .note
@@ -216,7 +229,51 @@ fn payload_for(kind: &str, notice: &push::NoticeRow) -> serde_json::Value {
     serde_json::json!({
         "title": notice.actor.as_deref().unwrap_or("Nodus"),
         "body": body,
+        "tag": tag(kind, notice),
+        "data": { "url": target_url(kind, notice) },
+        "icon": crate::assets::ICON_PATH,
     })
+}
+
+/// The replacement key. Two notifications with the same key are about the same target and
+/// the newer one wins in the browser; keys for different targets must not meet.
+fn tag(kind: &str, notice: &push::NoticeRow) -> String {
+    match kind {
+        "mention" | "favourite" | "reblog" | "poll" | "status" | "update" => notice
+            .status_id
+            .as_deref()
+            .map_or_else(|| notification_tag(notice), |id| format!("{kind}:{id}")),
+        "follow" | "follow_request" | "admin.sign_up" => {
+            format!("{kind}:{}", notice.from_account_id)
+        }
+        // An appeal, a moderation notice and an admin report carry no target id in this
+        // row; the notification id is unique, so these never coalesce with anything.
+        _ => notification_tag(notice),
+    }
+}
+
+fn notification_tag(notice: &push::NoticeRow) -> String {
+    format!("notification:{}", notice.id)
+}
+
+/// The path a click opens. A status notification opens the status's permalink (whichever
+/// account wrote it), a follow opens the actor's profile, and a notice with no target page
+/// opens the notification list. The path is relative because no base URL is known here;
+/// the web client resolves it against its own origin.
+fn target_url(kind: &str, notice: &push::NoticeRow) -> String {
+    match kind {
+        "mention" | "favourite" | "reblog" | "poll" | "status" | "update" => {
+            match (notice.status_author.as_deref(), notice.status_id.as_deref()) {
+                (Some(author), Some(id)) => format!("/@{author}/{id}"),
+                _ => "/notifications".to_owned(),
+            }
+        }
+        "follow" | "follow_request" => notice
+            .actor_username
+            .as_deref()
+            .map_or_else(|| "/notifications".to_owned(), |name| format!("/@{name}")),
+        _ => "/notifications".to_owned(),
+    }
 }
 
 fn sentence(kind: &str) -> &'static str {
