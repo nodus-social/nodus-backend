@@ -149,8 +149,11 @@ So: routing is by account. Ids stay opaque. The only thing that must become rout
 
 ## 2. Table classification
 
-72 tables, each with the migration that creates it. The tiebreak rule, stated so it can be
-argued with:
+83 tables at `e7ce483`, each with the migration that creates it. The survey that produced
+this roster saw 72; the eleven added since — 2FA, password reset, push, email, IP blocks —
+are recorded in §2.5, and the guard test (`crates/api/tests/sharding_invariants.rs`) now
+holds the numbers in this file to the migrations rather than to memory. The tiebreak rule,
+stated so it can be argued with:
 
 - **SHARD-AFFINE** — the row belongs to exactly one account; its primary read and its
   primary write both key on that account; no other account's request path reads its rows.
@@ -165,7 +168,7 @@ argued with:
 Any table where this rule gives an uncomfortable answer is marked `UNRESOLVED` or called out
 under §2.4 rather than quietly filed.
 
-### 2.1 SHARD-AFFINE (28)
+### 2.1 SHARD-AFFINE (36)
 
 | table | created | why (≤12 words) |
 |---|---|---|
@@ -198,7 +201,7 @@ under §2.4 rather than quietly filed.
 | `status_tag` | `0001:92` | Tag of one post; row ships with the author. |
 | `tag_follow` | `0053` | Owner's tag subscriptions; indexed by tag for the follower read. |
 
-### 2.2 GLOBAL-REPLICATED (26)
+### 2.2 GLOBAL-REPLICATED (29)
 
 | table | created | why (≤12 words) |
 |---|---|---|
@@ -281,6 +284,40 @@ under §2.4 rather than quietly filed.
 6. **`job` / `scan`.** Global queues with polymorphic `subject_id` and no FK. The subjects
    are on shards, the queue is not. Correct as designed, but every job payload must be
    readable without a join, because the worker may be on a different shard from the subject.
+
+### 2.5 The eleven tables added after the survey
+
+The survey predates the account-safety and push work, so these rows are decisions rather
+than findings: the bucket follows §2's rule applied to the schema as it now stands, and the
+reason is written because a bucket with no reason is a guess. `migration` is where each row
+is created.
+
+| table | created | bucket | why (≤12 words) |
+|---|---|---|---|
+| `email_confirmation` | `0065` | SHARD-AFFINE | One account's pending address, read only by that account. |
+| `account_totp` | `0064` | SHARD-AFFINE | Confirmed factor for one account; read at its login. |
+| `account_recovery_code` | `0064` | SHARD-AFFINE | Recovery material for one account. |
+| `auth_2fa_challenge` | `0064` | SHARD-AFFINE | In-flight login for one account, consumed in seconds. |
+| `account_2fa_disable_attempt` | `0068` | SHARD-AFFINE | Budget for disabling one account's factor. |
+| `password_reset` | `0067` | SHARD-AFFINE | One account's single-use reset token. |
+| `push_subscription` | `0069` | SHARD-AFFINE | One account's browser endpoints; `(account_id, endpoint)` unique. |
+| `push_outbox` | `0070` | SHARD-AFFINE | Written in the notification's transaction, read by the sender. |
+| `email_outbox` | `0065` | GLOBAL-REPLICATED | Addressed before an account is confirmed; one SMTP egress.** |
+| `password_reset_attempt` | `0067` | GLOBAL-REPLICATED | Keyed by address, so it exists before an account is known.** |
+| `ip_block` | `0063` | GLOBAL-REPLICATED | Instance-wide address policy, evaluated at every door. |
+
+** The two rows that disagree with the "a queue every worker polls is global" reading are
+both here on purpose, and the tension is real: `push_outbox` is a queue too. It stays affine
+because its rows are written in the same transaction as the notification (so a shard-local
+write must not become a cross-shard one) and its ten-failure cap is account-scoped, while
+`email_outbox` is addressed by an email address rather than an account — the same "not yet
+known" case as §2.4.1 — and is drained by one egress worker. If a second egress is ever
+added per shard, that row moves and this paragraph is the thing to argue with.
+
+`miauth_session`, `password_reset_attempt` and `external_id` are now the three tables whose
+bucket is forced rather than chosen: each must answer a lookup before an account is in hand.
+That is what makes the routing layer need a "not yet known" case rather than a nullable
+column.
 
 ---
 
@@ -626,7 +663,28 @@ Cost means "how much design has to change", not lines of code.
 
 ## 6. The guard test
 
-**Name:** `crates/store/tests/shard_key.rs`.
+**Landed:** `crates/api/tests/sharding_invariants.rs` (`e7ce483`). It holds the SCHEMA half,
+which is the half a document can actually be wrong about:
+
+1. `no_table_mints_its_own_key_except_the_named_ones` — no table may take an
+   identity/serial/sequence default except the allowlisted `status_edit.id`, with a reason.
+2. `every_shipped_table_has_a_bucket` — every `CREATE TABLE` in the migrations must be
+   classified with a bucket and a reason, and a classification for a table that no longer
+   exists fails too.
+3. `every_cross_bucket_foreign_key_is_named` — every `REFERENCES` edge whose parent and
+   child sit in different buckets must be listed with the rule that justifies it.
+
+It reads `crates/store/migrations/*.sql` at test time rather than `include_str!`-ing a
+hand-written file list, precisely because that hand-maintenance is the failure mode this
+document was written to avoid. It caught the drift in this file on its first run: §2's
+roster said 72 tables (28 / 26 / 18) while the migrations held 83 (36 / 29 / 18), and the
+eleven missing rows are now in §2.5 rather than in a comment somewhere.
+
+**Not built:** the statement-level half below. It is still the plan, kept because the plan
+is the reason the schema half is not enough — a bucket roster cannot see a query that joins
+two buckets, and that is what actually breaks at shard time.
+
+**Planned name:** `crates/store/tests/shard_key.rs`.
 **Model:** `crates/api/tests/capabilities.rs` — const tables, `include_str!` of the sources,
 and an assertion in **both** directions (a declaration without a code fact fails, and a code
 fact without a declaration fails). The capabilities test's own limitation is the model's
