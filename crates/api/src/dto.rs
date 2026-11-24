@@ -652,6 +652,15 @@ pub struct ConfigurationDto {
     pub media_attachments: MediaDto,
     pub polls: serde_json::Value,
     pub translation: serde_json::Value,
+    /// The Web Push key, at `configuration.vapid.public_key` as in Mastodon. Absent when
+    /// this instance has no VAPID pair, rather than present and null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vapid: Option<VapidDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VapidDto {
+    pub public_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -675,7 +684,7 @@ impl ConfigurationDto {
     /// The one place where advertised limits come from the constants the server
     /// enforces, so a client cannot size a compose box for 5 000 characters.
     #[must_use]
-    pub fn build(instance: &InstanceConfig) -> Self {
+    pub fn build(instance: &InstanceConfig, vapid_public_key: Option<&str>) -> Self {
         Self {
             urls: serde_json::json!({ "streaming": instance.url("/api/v1/streaming") }),
             accounts: serde_json::json!({ "max_featured_tags": 10 }),
@@ -703,6 +712,9 @@ impl ConfigurationDto {
                 "min_expiration": 300, "max_expiration": 2_629_746
             }),
             translation: serde_json::json!({ "enabled": false }),
+            vapid: vapid_public_key.map(|public_key| VapidDto {
+                public_key: public_key.to_owned(),
+            }),
         }
     }
 }

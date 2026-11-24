@@ -74,7 +74,10 @@ pub async fn instance_v1(State(state): State<AppState>) -> ApiResult<Json<Instan
         registrations: instance.registrations_open,
         approval_required: false,
         invites_enabled: false,
-        configuration: ConfigurationDto::build(instance),
+        configuration: ConfigurationDto::build(
+            instance,
+            state.vapid().map(|vapid| vapid.public_key()),
+        ),
         rules: rules.into_iter().map(RuleDto::from_row).collect(),
     }))
 }
@@ -96,7 +99,10 @@ pub async fn instance_v2(State(state): State<AppState>) -> ApiResult<Json<Instan
             "versions": {}
         }),
         languages: vec!["en".to_owned()],
-        configuration: ConfigurationDto::build(instance),
+        configuration: ConfigurationDto::build(
+            instance,
+            state.vapid().map(|vapid| vapid.public_key()),
+        ),
         registrations: RegistrationsDto {
             enabled: instance.registrations_open,
             approval_required: false,

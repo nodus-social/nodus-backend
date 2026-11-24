@@ -121,7 +121,10 @@ pub async fn register(
         redirect_uri: app.redirect_uris.first().cloned().unwrap_or_default(),
         client_id: app.client_id,
         client_secret,
-        vapid_key: None,
+        // The browser needs this before it can call `pushManager.subscribe`, and it has
+        // no other unauthenticated place to ask: `GET /api/v1/push/subscription` answers
+        // 404 until a subscription exists. `None` when this instance has no key.
+        vapid_key: state.vapid().map(|vapid| vapid.public_key().to_owned()),
     }))
 }
 
