@@ -6,6 +6,7 @@
 //! binary nests this under `/api` so the SSR frontend owns everything else.
 
 pub mod abuse;
+pub mod account_move;
 pub mod accounts;
 pub mod activitypub;
 pub mod admin;
@@ -104,6 +105,15 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/api/v1/accounts/{id}/undelete", post(accounts::undelete))
         .route("/api/v1/accounts/{id}/export", get(accounts::export))
         .route("/api/v1/accounts/lookup", get(accounts::lookup))
+        .route("/api/v1/accounts/move", post(account_move::move_account))
+        .route(
+            "/api/v1/accounts/aliases",
+            get(account_move::list_aliases).post(account_move::add_alias),
+        )
+        .route(
+            "/api/v1/accounts/aliases/{id}",
+            axum::routing::delete(account_move::remove_alias),
+        )
         .route("/api/v1/accounts/{id}/followers", get(accounts::followers))
         .route("/api/v1/accounts/{id}/following", get(accounts::following))
         .route(

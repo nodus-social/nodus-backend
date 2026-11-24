@@ -461,6 +461,74 @@ pub async fn set_moved_to(
         .await
 }
 
+/// Adds one actor URI to a local account's `also_known_as` list.
+///
+/// The cap and the duplicate check live in the statement, not only in the handler: a
+/// retried request must not grow the list past the five a remote peer will read. `None`
+/// means the account is gone, already lists the URI, or has no room left.
+pub async fn add_alias(
+    pool: &PgPool,
+    id: &str,
+    alias: &str,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET also_known_as = array_append(also_known_as, $2), \
+             updated_at = now() \
+          WHERE id = $1 AND local AND deleted_at IS NULL \
+            AND cardinality(also_known_as) < 5 AND NOT ($2 = ANY(also_known_as)) \
+         RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(alias)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Removes one actor URI from a local account's `also_known_as` list.
+///
+/// `None` means the URI was not on the list, so a delete of somebody else's alias cannot
+/// answer as if it succeeded.
+pub async fn remove_alias(
+    pool: &PgPool,
+    id: &str,
+    alias: &str,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET also_known_as = array_remove(also_known_as, $2), \
+             updated_at = now() \
+          WHERE id = $1 AND local AND deleted_at IS NULL AND $2 = ANY(also_known_as) \
+         RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(alias)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Records that a local account moved to `moved_to`.
+///
+/// The `moved_to IS NULL` guard is what makes a second move a refusal rather than a
+/// redirect that silently replaces the first one. `None` means the account was already
+/// moved (or no longer exists).
+pub async fn record_move(
+    pool: &PgPool,
+    id: &str,
+    moved_to: &str,
+) -> Result<Option<AccountRow>, sqlx::Error> {
+    let sql = format!(
+        "UPDATE account SET moved_to = $2, updated_at = now() \
+          WHERE id = $1 AND local AND deleted_at IS NULL AND moved_to IS NULL \
+         RETURNING {ACCOUNT_COLUMNS}"
+    );
+    sqlx::query_as::<_, AccountRow>(&sql)
+        .bind(id)
+        .bind(moved_to)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Refreshes the profile of a remote actor we already know.
 ///
 /// Returns `None` when the URI names no remote account, so a peer cannot reach a local

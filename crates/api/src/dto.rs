@@ -185,6 +185,13 @@ pub struct AccountDto {
     pub emojis: Vec<serde_json::Value>,
     pub fields: Vec<serde_json::Value>,
     pub moved: Option<serde_json::Value>,
+    /// The same redirect under the store's spelling.
+    ///
+    /// `moved` is Mastodon's name for the field, and the shape clients already read. The
+    /// admin and export surfaces call the target `moved_to`, so the account document
+    /// carries that spelling too; both are the same Mastodon-shaped object, and both stay
+    /// `null` until the account actually moves.
+    pub moved_to: Option<serde_json::Value>,
     pub suspended: bool,
     pub limited: bool,
     /// The account's staff role in Mastodon's shape, `null` for a regular account.
@@ -290,6 +297,7 @@ impl AccountDto {
             emojis: Vec::new(),
             fields: row.fields.as_array().cloned().unwrap_or_default(),
             moved: row.moved_to.as_deref().map(moved_account),
+            moved_to: row.moved_to.as_deref().map(moved_account),
             suspended: row.suspended_at.is_some(),
             limited: false,
             role: staff_role_spellings(&row.staff_role).map(|(name, _)| AccountRoleDto { name }),

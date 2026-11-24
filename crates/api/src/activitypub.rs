@@ -1926,6 +1926,18 @@ fn actor_document(state: &AppState, account: &AccountRow) -> Actor {
     if let Some(attachment) = profile_attachment(&account.fields) {
         extra.insert("attachment".to_owned(), attachment);
     }
+    // Both terms are already in the shared ActivityStreams context. A peer checks the
+    // target's `alsoKnownAs` before accepting a `Move`, so a local target has to publish
+    // the list here; `movedTo` is the redirect the same peer reads after the move.
+    if !account.also_known_as.is_empty() {
+        extra.insert(
+            "alsoKnownAs".to_owned(),
+            serde_json::json!(account.also_known_as),
+        );
+    }
+    if let Some(moved_to) = account.moved_to.as_deref() {
+        extra.insert("movedTo".to_owned(), serde_json::json!(moved_to));
+    }
     Actor {
         id: actor.clone(),
         kind: "Person".to_owned(),
