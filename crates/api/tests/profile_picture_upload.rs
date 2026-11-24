@@ -118,7 +118,11 @@ async fn account(app: &Router, id: &str) -> Value {
 
 /// Waits for the background render and returns the account document that reports it.
 async fn shaped_picture(app: &Router, id: &str, meta: &str) -> Value {
-    for _ in 0..200 {
+    // 600 x 25ms = 15s, not 5s: the render is an in-process task, and under a full
+    // `cargo test --workspace` at 32 jobs it competes with every other sqlx test for the
+    // CPU and the database. Five seconds passed alone and flaked in the workspace run —
+    // the budget is about "eventually", not about how fast this box is today.
+    for _ in 0..600 {
         let document = account(app, id).await;
         if document[meta]["original"]["width"].as_i64().is_some() {
             return document;
