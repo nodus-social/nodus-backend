@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// have without losing the area's door — and a peer that serves them all must draw every
 /// one. New names are appended rather than sorted: clients compare the array, so a reorder
 /// is churn with no meaning.
-pub const FEATURES: [&str; 73] = [
+pub const FEATURES: [&str; 74] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -179,6 +179,10 @@ pub const FEATURES: [&str; 73] = [
     // delivery and encryption are not built yet, so the name says "this instance can hold
     // a subscription", which is exactly what the route does today.
     "push",
+    // The media library: a listing of every picture this account uploaded, with usage for
+    // each, and a remove route for what is unused. Shipped without a name in `86618da` — a
+    // screen nobody could reach — so the web child's tab stayed hidden.
+    "media_library", // GET /api/v1/media/library; DELETE /api/v1/media/library/{id}
 ];
 
 /// The capability names this deployment can actually honour, as owned strings.

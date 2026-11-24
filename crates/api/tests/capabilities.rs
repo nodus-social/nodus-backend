@@ -457,6 +457,11 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/auth/sessions",
         owner: Owner::Api,
     },
+    Capability {
+        name: "media_library",
+        path: "/api/v1/media/library",
+        owner: Owner::Api,
+    },
 ];
 
 /// One published name whose surface is the shell's own, with no API route behind it.
@@ -875,8 +880,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        73,
-        "/api/v1/meta must answer 73 unique names: {advertised_names:?}"
+        74,
+        "/api/v1/meta must answer 74 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -886,15 +891,15 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        73,
-        "the published vocabulary is 73 unique names: 42 before the page split, the 20 page \
+        74,
+        "the published vocabulary is 74 unique names: 42 before the page split, the 20 page \
          names (21 pages, `moderation_rules` already present, so no duplicate), the 2 \
          relationship lists (`mutes`, `blocks`), the personal domain list \
          (`domain_blocks`), the profile's featured tags (`featured_tags`), the \
          backend-assembled pages (`pages`), the notification policy \
          (`notification_settings`), the account export (`exports`), the published profile \
-         banners (`style_public`), the ability the shell serves itself (`two_factor`), and \
-         Web Push registration (`push`)"
+         banners (`style_public`), the ability the shell serves itself (`two_factor`), \
+         Web Push registration (`push`), and the media library (`media_library`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1479,6 +1484,11 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
     SurfaceGroup {
         prefix: "/media/share",
         features: &["drive_share"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/media/library",
+        features: &["media_library"],
         reason: "",
     },
     SurfaceGroup {
