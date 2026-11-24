@@ -131,6 +131,23 @@ async fn upload(app: &Router, token: &str, description: Option<&str>) -> (Status
     (status, serde_json::from_slice(&bytes).expect("json body"))
 }
 
+async fn post_status(app: &Router, token: &str, media_ids: &[&str]) -> (StatusCode, Value) {
+    let (status, bytes) = answer(
+        app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/statuses")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "status": "a picture", "media_ids": media_ids }).to_string(),
+            ))
+            .expect("status request"),
+    )
+    .await;
+    (status, serde_json::from_slice(&bytes).expect("json body"))
+}
+
 async fn library(app: &Router, token: &str) -> Value {
     let (status, bytes) = answer(
         app,
@@ -252,6 +269,126 @@ async fn the_same_bytes_from_one_account_reuse_the_attachment() {
 }
 
 #[tokio::test]
+async fn the_same_bytes_after_publishing_get_a_fresh_attachment() {
+    init_media_env();
+    run_db_test(|store, app| async move {
+        let pool = store.pool().clone();
+        let account = create_account(&pool, "republish").await;
+        let token = create_token(&pool, &account, &["write", "read"]).await;
+
+        let (_, first) = upload(&app, &token, None).await;
+        let first_id = first["id"].as_str().expect("id").to_owned();
+        wait_until_processed(&pool, &first_id).await;
+        let (first_code, first_post) = post_status(&app, &token, &[first_id.as_str()]).await;
+        assert_eq!(first_code, StatusCode::OK, "{first_post}");
+        let first_status = first_post["id"].as_str().expect("status id").to_owned();
+        let published = media::by_id(&pool, &first_id)
+            .await
+            .expect("read media row")
+            .expect("media row exists");
+        assert_eq!(published.status_id.as_deref(), Some(first_status.as_str()));
+
+        // The bytes are published, so a second upload must not answer the claimed row:
+        // an id that no status can attach again is not an upload.
+        let (second_code, second) = upload(&app, &token, None).await;
+        assert_eq!(second_code, StatusCode::OK, "{second}");
+        let second_id = second["id"].as_str().expect("id").to_owned();
+        assert_ne!(second_id, first_id, "{second}");
+        wait_until_processed(&pool, &second_id).await;
+
+        let (post_code, second_post) = post_status(&app, &token, &[second_id.as_str()]).await;
+        assert_eq!(post_code, StatusCode::OK, "{second_post}");
+        let second_status = second_post["id"].as_str().expect("status id").to_owned();
+        assert_ne!(second_status, first_status);
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status_id FROM media_attachment \
+             WHERE account_id = $1 AND digest = $2 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(&account)
+        .bind(hex(TINY_PNG))
+        .fetch_all(&pool)
+        .await
+        .expect("media rows for the digest");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, first_id);
+        assert_eq!(rows[0].1.as_deref(), Some(first_status.as_str()));
+        assert_eq!(rows[1].0, second_id);
+        assert_eq!(rows[1].1.as_deref(), Some(second_status.as_str()));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_published_attachment_is_never_reused() {
+    init_media_env();
+    run_db_test(|store, app| async move {
+        let pool = store.pool().clone();
+        let account = create_account(&pool, "claimed").await;
+        let token = create_token(&pool, &account, &["write", "read"]).await;
+
+        let (_, first) = upload(&app, &token, None).await;
+        let first_id = first["id"].as_str().expect("id").to_owned();
+        wait_until_processed(&pool, &first_id).await;
+        let (code, posted) = post_status(&app, &token, &[first_id.as_str()]).await;
+        assert_eq!(code, StatusCode::OK, "{posted}");
+
+        let (_, second) = upload(&app, &token, None).await;
+        let second_id = second["id"].as_str().expect("id").to_owned();
+        assert_ne!(second_id, first_id, "{second}");
+        let fresh = media::by_id(&pool, &second_id)
+            .await
+            .expect("read media row")
+            .expect("media row exists");
+        assert!(
+            fresh.status_id.is_none(),
+            "an upload hands back an unattached row: {fresh:?}"
+        );
+
+        // The library still shows the earlier picture and reports the new row as its
+        // duplicate; nothing collapsed the two rows.
+        let library = library(&app, &token).await;
+        assert_eq!(item(&library, &first_id)["duplicate_of"], Value::Null);
+        assert_eq!(item(&library, &second_id)["duplicate_of"], first_id);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unpublished_attachment_is_reused() {
+    init_media_env();
+    run_db_test(|store, app| async move {
+        let pool = store.pool().clone();
+        let account = create_account(&pool, "unclaimed").await;
+        let token = create_token(&pool, &account, &["write", "read"]).await;
+
+        let (_, first) = upload(&app, &token, None).await;
+        let id = first["id"].as_str().expect("id").to_owned();
+        wait_until_processed(&pool, &id).await;
+
+        let (second_code, second) = upload(&app, &token, None).await;
+        assert_eq!(second_code, StatusCode::OK, "{second}");
+        assert_eq!(second["id"], id.as_str(), "{second}");
+        let row = media::by_id(&pool, &id)
+            .await
+            .expect("read media row")
+            .expect("media row exists");
+        assert!(row.status_id.is_none());
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM media_attachment WHERE account_id = $1 AND digest = $2",
+        )
+        .bind(&account)
+        .bind(hex(TINY_PNG))
+        .fetch_one(&pool)
+        .await
+        .expect("row count");
+        assert_eq!(rows, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn a_reuse_files_the_bytes_in_the_drive_again() {
     init_media_env();
     run_db_test(|store, app| async move {
@@ -368,6 +505,34 @@ async fn a_different_description_on_reuse_is_refused() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(again["id"], id);
         assert_eq!(again["description"], "one");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_processing_row_is_not_reused() {
+    init_media_env();
+    run_db_test(|store, app| async move {
+        let pool = store.pool().clone();
+        let account = create_account(&pool, "processing").await;
+        let token = create_token(&pool, &account, &["write", "read"]).await;
+        let digest = hex(TINY_PNG);
+        // A render whose worker died leaves this state behind for good; a retry must
+        // render the bytes again instead of answering the row that never finishes.
+        let stuck_id = insert_row(&pool, &account, &digest, "processing").await;
+
+        let (status, uploaded) = upload(&app, &token, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let uploaded_id = uploaded["id"].as_str().expect("id").to_owned();
+        assert_ne!(uploaded_id, stuck_id);
+        wait_until_processed(&pool, &uploaded_id).await;
+
+        let stuck = media::by_id(&pool, &stuck_id)
+            .await
+            .expect("read media row")
+            .expect("media row exists");
+        assert_eq!(stuck.processing_state, "processing");
+        assert!(stuck.status_id.is_none());
     })
     .await;
 }

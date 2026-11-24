@@ -515,11 +515,16 @@ pub async fn original_digest_referenced(pool: &PgPool, digest: &str) -> Result<b
 
 /// The account's attachment for bytes it already holds, when a new upload may reuse it.
 ///
-/// `pending` and `failed` are not reusable: the first has no rendered variants yet and the
-/// second has no usable bytes, so handing either back would turn a retry into a broken
-/// picture. `processing` is reusable: its row exists and the render that is running will
-/// finish it. Remote rows are excluded because their digest is the peer's synthetic key,
-/// not a hash of bytes this instance stores.
+/// Reuse means "these bytes are here, finished, and nothing has claimed them yet", so the
+/// row must be `ready` and unattached; every other state fails one half of that.
+/// `pending` and `processing` have no rendered variants to show, and a render whose worker
+/// died leaves its row `processing` for good, so reusing it would answer every retry with
+/// the same picture that never becomes available. `failed` never will have usable bytes.
+/// A row with a `status_id` belongs to a post: `POST /api/v1/statuses` refuses to attach a
+/// claimed attachment, so offering it would turn the re-upload into a 200 followed by a
+/// 422. Several published rows for one digest are therefore all skipped, and the oldest
+/// unattached ready row wins. Remote rows are excluded because their digest is the peer's
+/// synthetic key, not a hash of bytes this instance stores.
 ///
 /// # Errors
 ///
@@ -532,7 +537,7 @@ pub async fn reusable(
     let sql = format!(
         "SELECT {MEDIA_COLUMNS} FROM media_attachment \
          WHERE account_id = $1 AND digest = $2 AND NOT remote \
-           AND processing_state NOT IN ('pending', 'failed') \
+           AND status_id IS NULL AND processing_state = 'ready' \
          ORDER BY created_at ASC, id ASC LIMIT 1"
     );
     sqlx::query_as::<_, MediaRow>(&sql)

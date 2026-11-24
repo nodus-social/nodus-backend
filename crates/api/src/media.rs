@@ -445,13 +445,11 @@ pub(crate) async fn ingest_upload(
         // The drive lists an attachment through a projection, not a copy, so a reuse that
         // finds no drive row for these bytes files them again: an owner who deleted the
         // file from the drive and re-uploads it would otherwise be handed an id its drive
-        // does not list. Only a `ready` row is re-filed; a `processing` row's render
-        // already owns the object it publishes its verdict onto, and a second object would
-        // never receive that verdict.
-        if existing.processing_state == "ready"
-            && drive::object_by_sha(state.store().pool(), &auth.0.account.id, &existing.digest)
-                .await?
-                .is_none()
+        // does not list. The reusable row is `ready`, so the object filed here is the one
+        // the finished render owns.
+        if drive::object_by_sha(state.store().pool(), &auth.0.account.id, &existing.digest)
+            .await?
+            .is_none()
         {
             if let Some(object_id) =
                 file_in_drive(state, &auth.0.account.id, filename, &existing).await
