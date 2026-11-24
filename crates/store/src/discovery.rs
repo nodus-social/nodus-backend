@@ -30,12 +30,19 @@ pub async fn search_accounts(
         _ => (trimmed, None),
     };
     let pattern = format!("%{name}%");
+    // Relevance, not reach. Someone typing `ada` means the account called that, not the
+    // best-followed account whose name merely contains it, so an exact username wins over
+    // a prefix match, which wins over a substring match; follower count only breaks ties
+    // inside a tier. `search_local` orders the same way; this one also has to compare
+    // against a remote username, so the comparison is on `username::text`.
     let sql = format!(
         "SELECT {} FROM account a \
           WHERE a.suspended_at IS NULL AND a.silenced_at IS NULL \
             AND (a.username::text ILIKE $1 OR a.display_name ILIKE $1) \
             AND ($2::text IS NULL OR LOWER(COALESCE(a.domain::text, $3)) = $2) \
-          ORDER BY a.followers_count DESC, a.username ASC LIMIT $4",
+          ORDER BY (LOWER(a.username::text) = LOWER($5)) DESC, \
+                   (a.username::text ILIKE $6) DESC, \
+                   a.followers_count DESC, a.username ASC LIMIT $4",
         crate::accounts::ACCOUNT_COLUMNS_ALIASED
     );
     sqlx::query_as::<_, AccountRow>(&sql)
@@ -43,6 +50,8 @@ pub async fn search_accounts(
         .bind(host)
         .bind(local_domain.to_ascii_lowercase())
         .bind(limit)
+        .bind(name.to_ascii_lowercase())
+        .bind(format!("{name}%"))
         .fetch_all(pool)
         .await
 }
@@ -53,33 +62,61 @@ pub async fn search_accounts(
 /// both find a post tagged that way), because a reader searching a tag is asking for the
 /// posts rather than for the tag's own page. `viewer` narrows to their own non-public
 /// posts as well; `None` means only public.
+///
+/// A boost is a pointer with an empty body, so a text query never wants the reblog row:
+/// `reblog_of_id IS NULL` keeps the original's one result slot.
+///
+/// Order is relevance first — an exact hashtag, then a post that opens with the term,
+/// then where in the body the term first appears, then the author's reach — with `s.id`
+/// only as the final stable tiebreak. Newest-first alone let a stranger's passing mention
+/// outrank the post named by the term.
+///
+/// Moderation is not re-derived here: the rows go through
+/// [`crate::statuses::hidden_status_ids`], the same gate the page handlers use, so this
+/// cannot drift from `public_page`. That is a second statement for the same reason it is
+/// one there — the predicate is written once, not copied.
 pub async fn search_statuses(
     pool: &PgPool,
     term: &str,
     viewer: Option<&str>,
     limit: i64,
 ) -> Result<Vec<StatusRow>, sqlx::Error> {
-    let pattern = format!("%{}%", term.trim());
+    let trimmed = term.trim();
+    let pattern = format!("%{trimmed}%");
     // A hashtag cannot contain whitespace, so a multi-word term only searches text.
-    let bare = term.trim().trim_start_matches('#');
+    let bare = trimmed.trim_start_matches('#');
     let tag_pattern =
         (!bare.is_empty() && !bare.contains(char::is_whitespace)).then(|| format!("%{bare}%"));
     let sql = format!(
         "SELECT {STATUS_COLUMNS} FROM status s \
+           JOIN account a ON a.id = s.account_id \
           WHERE s.deleted_at IS NULL AND s.reblog_of_id IS NULL \
             AND (s.content ILIKE $1 OR ($4::text IS NOT NULL AND EXISTS ( \
                   SELECT 1 FROM status_tag t \
                    WHERE t.status_id = s.id AND t.tag::text ILIKE $4))) \
             AND (s.visibility IN ('public', 'unlisted') OR s.account_id = $2) \
-          ORDER BY s.id DESC LIMIT $3"
+          ORDER BY ($4::text IS NOT NULL AND EXISTS ( \
+                      SELECT 1 FROM status_tag t \
+                       WHERE t.status_id = s.id AND LOWER(t.tag::text) = LOWER($5))) DESC, \
+                   (s.content ILIKE $6) DESC, \
+                   COALESCE(NULLIF(POSITION(LOWER($7) IN LOWER(s.content)), 0), 2147483647) ASC, \
+                   a.followers_count DESC, \
+                   s.id DESC LIMIT $3"
     );
-    sqlx::query_as::<_, StatusRow>(&sql)
+    let mut rows = sqlx::query_as::<_, StatusRow>(&sql)
         .bind(pattern)
         .bind(viewer)
         .bind(limit)
         .bind(tag_pattern)
+        .bind(bare.to_ascii_lowercase())
+        .bind(format!("{trimmed}%"))
+        .bind(trimmed.to_ascii_lowercase())
         .fetch_all(pool)
-        .await
+        .await?;
+    let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+    let hidden = crate::statuses::hidden_status_ids(pool, &ids, viewer).await?;
+    rows.retain(|row| !hidden.contains(&row.id));
+    Ok(rows)
 }
 
 /// A hashtag and how often it was used.
