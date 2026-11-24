@@ -45,6 +45,7 @@ pub mod notification_policy;
 pub mod pauses;
 pub mod polls;
 pub mod preferences;
+pub mod push;
 pub mod remote_moderation;
 pub mod rules;
 pub mod scanners;

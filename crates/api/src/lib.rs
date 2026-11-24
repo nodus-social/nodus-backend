@@ -47,6 +47,7 @@ pub mod poll_votes;
 pub mod polls;
 pub mod preferences;
 pub mod profile_fields;
+pub mod push;
 pub mod reactions;
 pub mod remote;
 pub mod rulewatch;
@@ -188,6 +189,7 @@ pub fn router(state: AppState) -> axum::Router {
         .merge(conversations::router())
         .merge(discovery::router())
         .merge(preferences::router())
+        .merge(push::router())
         .merge(style_public::router())
         .merge(markers::router())
         .merge(drive::router())

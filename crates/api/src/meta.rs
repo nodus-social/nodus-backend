@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// have without losing the area's door — and a peer that serves them all must draw every
 /// one. New names are appended rather than sorted: clients compare the array, so a reorder
 /// is churn with no meaning.
-pub const FEATURES: [&str; 72] = [
+pub const FEATURES: [&str; 73] = [
     // Recommender (`nodus-feed`), same origin: `/api/v1/feed/accounts`, `/api/v1/events`,
     // `/api/v1/sync/token`.
     "feed_accounts",
@@ -174,6 +174,11 @@ pub const FEATURES: [&str; 72] = [
     // with the sentence each one stands on, so neither can go unpublished unnoticed.
     "sessions",
     "two_factor",
+    // Web Push: the browser's own subscription store, `POST|GET|PUT|DELETE
+    // /api/v1/push/subscription`. Slice 1 publishes the surface a client registers on;
+    // delivery and encryption are not built yet, so the name says "this instance can hold
+    // a subscription", which is exactly what the route does today.
+    "push",
 ];
 
 /// The capability names this deployment can actually honour, as owned strings.

@@ -278,6 +278,13 @@ const CAPABILITIES: &[Capability] = &[
         path: "/api/v1/preferences",
         owner: Owner::Api,
     },
+    // Web Push registration: the browser's subscription (slice 1 has no sender behind it,
+    // so the surface is the store the client registers with).
+    Capability {
+        name: "push",
+        path: "/api/v1/push/subscription",
+        owner: Owner::Api,
+    },
     Capability {
         name: "notification_settings",
         path: "/api/v2/notifications/policy",
@@ -868,8 +875,8 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     let advertised_names = advertised(&document("/api/v1/meta").await);
     assert_eq!(
         advertised_names.len(),
-        72,
-        "/api/v1/meta must answer 72 unique names: {advertised_names:?}"
+        73,
+        "/api/v1/meta must answer 73 unique names: {advertised_names:?}"
     );
     let unique: BTreeSet<String> = advertised_names.iter().cloned().collect();
     assert_eq!(
@@ -879,14 +886,15 @@ async fn the_published_list_and_the_capability_table_are_the_same_set() {
     );
     assert_eq!(
         nodus_server_api::meta::FEATURES.len(),
-        72,
-        "the published vocabulary is 72 unique names: 42 before the page split, the 20 page \
+        73,
+        "the published vocabulary is 73 unique names: 42 before the page split, the 20 page \
          names (21 pages, `moderation_rules` already present, so no duplicate), the 2 \
          relationship lists (`mutes`, `blocks`), the personal domain list \
          (`domain_blocks`), the profile's featured tags (`featured_tags`), the \
          backend-assembled pages (`pages`), the notification policy \
          (`notification_settings`), the account export (`exports`), the published profile \
-         banners (`style_public`), and the ability the shell serves itself (`two_factor`)"
+         banners (`style_public`), the ability the shell serves itself (`two_factor`), and \
+         Web Push registration (`push`)"
     );
     let published: BTreeSet<String> = unique;
     let tabled: BTreeSet<String> = CAPABILITIES
@@ -1260,6 +1268,7 @@ const ROUTE_SOURCES: &[(&str, &str)] = route_sources![
     "notifications.rs",
     "polls.rs",
     "preferences.rs",
+    "push.rs",
     "schedules.rs",
     "sessions.rs",
     "style_public.rs",
@@ -1553,6 +1562,11 @@ const SURFACE_GROUPS: &[SurfaceGroup] = &[
     SurfaceGroup {
         prefix: "/api/v1/preferences",
         features: &["preferences"],
+        reason: "",
+    },
+    SurfaceGroup {
+        prefix: "/api/v1/push",
+        features: &["push"],
         reason: "",
     },
     SurfaceGroup {
