@@ -319,3 +319,68 @@ async fn an_unauthorised_caller_gets_401_on_all_four_verbs() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn web_push_off_501_with_message_but_delete_succeeds() {
+    support::run_db_test_without_vapid(|store, app| async move {
+        let (account, token) = token_for(&store, "push-off").await;
+
+        for method in ["GET", "POST", "PUT"] {
+            let body_value = match method {
+                "POST" => Some(body(ENDPOINT, "p256dh-test", "auth-test", true)),
+                "PUT" => Some(json!({"data": {"alerts": {"mention": false}}})),
+                _ => None,
+            };
+            let (status, body) = send(&app, &token, method, PATH, body_value).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "{method} with vapid: None must be 501: {body}"
+            );
+            assert!(
+                body.contains("Web Push is not configured on this instance")
+                    && body.contains("NODUS_VAPID_PUBLIC_KEY")
+                    && body.contains("NODUS_VAPID_PRIVATE_KEY"),
+                "{method} error must be a sentence naming both environment variables: {body}"
+            );
+        }
+
+        // A row written while the server still had a key must remain removable after the
+        // key is withdrawn, otherwise the client is stuck with a subscription nobody can
+        // delete.
+        push::upsert(
+            store.pool(),
+            &account,
+            ENDPOINT,
+            "p256dh-off",
+            "auth-off",
+            &json!({"mention": true}),
+            None,
+        )
+        .await
+        .expect("seed a subscription from before the key was withdrawn");
+
+        let (status, body) = send(
+            &app,
+            &token,
+            "DELETE",
+            PATH,
+            Some(json!({"subscription": {"endpoint": ENDPOINT}})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "DELETE with vapid: None must be 204: {body}"
+        );
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM push_subscription WHERE account_id = $1")
+                .bind(&account)
+                .fetch_one(store.pool())
+                .await
+                .expect("count rows");
+        assert_eq!(rows, 0, "DELETE with push off must remove the row");
+    })
+    .await;
+}

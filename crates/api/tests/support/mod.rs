@@ -60,12 +60,29 @@ where
     F: FnOnce(Store, Router) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
+    run_db_test_with_vapid(Some(test_vapid()), body).await;
+}
+
+/// Like [`run_db_test`], but the router has no VAPID key: the push subscription verbs take
+/// the "Web Push is off" path.
+pub async fn run_db_test_without_vapid<F, Fut>(body: F)
+where
+    F: FnOnce(Store, Router) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_db_test_with_vapid(None, body).await;
+}
+
+async fn run_db_test_with_vapid<F, Fut>(vapid: Option<Arc<Vapid>>, body: F)
+where
+    F: FnOnce(Store, Router) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let Some((admin, schema, store)) = isolated_store().await else {
         return;
     };
     // The auth pages live in their own router, the way the server mounts them.
-    let api =
-        root_router(AppState::new(store.clone(), instance_config()).with_vapid(Some(test_vapid())));
+    let api = root_router(AppState::new(store.clone(), instance_config()).with_vapid(vapid));
     let auth = nodus_auth::router(nodus_auth::AppState::new(
         nodus_auth::store::PgAuthStore::new(store.pool().clone()),
         nodus_auth::Config {

@@ -179,6 +179,10 @@ pub async fn update(
 }
 
 /// `DELETE /api/v1/push/subscription` — `204` even when there was nothing to remove.
+///
+/// Deleting a subscription must succeed even when push is off: a client trying to undo a
+/// subscription on a server that stopped advertising the key should succeed, otherwise the
+/// row becomes undeletable.
 pub async fn destroy(
     State(state): State<AppState>,
     auth: Auth,
@@ -186,7 +190,7 @@ pub async fn destroy(
     body: Bytes,
 ) -> ApiResult<StatusCode> {
     auth.require_scope("push")?;
-    require_vapid(&state)?;
+    // No require_vapid: DELETE must work even when push is off.
     let input = parse_body(&headers, &body)?;
     let endpoint = required(&input.subscription.endpoint, "subscription[endpoint]")?;
     push::delete(state.store().pool(), &auth.0.account.id, endpoint).await?;
