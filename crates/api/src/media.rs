@@ -442,6 +442,32 @@ pub(crate) async fn ingest_upload(
                 "This picture is already in your library with a different description",
             ));
         }
+        // The drive lists an attachment through a projection, not a copy, so a reuse that
+        // finds no drive row for these bytes files them again: an owner who deleted the
+        // file from the drive and re-uploads it would otherwise be handed an id its drive
+        // does not list. Only a `ready` row is re-filed; a `processing` row's render
+        // already owns the object it publishes its verdict onto, and a second object would
+        // never receive that verdict.
+        if existing.processing_state == "ready"
+            && drive::object_by_sha(state.store().pool(), &auth.0.account.id, &existing.digest)
+                .await?
+                .is_none()
+        {
+            if let Some(object_id) =
+                file_in_drive(state, &auth.0.account.id, filename, &existing).await
+            {
+                if let Err(error) = drive::set_state(
+                    state.store().pool(),
+                    &auth.0.account.id,
+                    object_id,
+                    ProcessingState::Ready,
+                )
+                .await
+                {
+                    tracing::warn!(%error, %object_id, "could not mirror a media state onto the drive");
+                }
+            }
+        }
         return Ok(existing);
     }
 
@@ -503,38 +529,8 @@ pub(crate) async fn ingest_upload(
     media::insert(state.store().pool(), &row).await?;
 
     // The same bytes now have a drive row too, so an upload can be listed, renamed, or
-    // shared like any other file. A failure here must not fail the upload: the bytes and
-    // the catalogue row are already stored, and the attachment does not depend on it.
-    let name = crate::drive::clean_filename(filename);
-    let name = if name.is_empty() {
-        "upload".to_owned()
-    } else {
-        name
-    };
-    let object_id = match drive::create_object(
-        state.store().pool(),
-        &auth.0.account.id,
-        None,
-        &name,
-        &row.content_type,
-        &row.digest,
-        row.size,
-    )
-    .await
-    {
-        Ok(object) => {
-            if let Err(error) =
-                media::set_projected_object(state.store().pool(), &id, object.id).await
-            {
-                tracing::warn!(%error, %id, "could not record an upload's drive projection");
-            }
-            Some(object.id)
-        }
-        Err(error) => {
-            tracing::warn!(%error, %id, "could not file an upload in the drive");
-            None
-        }
-    };
+    // shared like any other file.
+    let object_id = file_in_drive(state, &auth.0.account.id, filename, &row).await;
 
     let plan = plan_with_permissions(
         kind,
@@ -574,6 +570,49 @@ pub(crate) async fn ingest_upload(
     });
 
     Ok(row)
+}
+
+/// Files one catalogue row in the account's drive, answering the object it created.
+///
+/// The drive row is a projection, not a copy: it names the digest the store already holds.
+/// A failure here must not fail the upload — the bytes and the catalogue row are already
+/// stored, and the attachment does not depend on the listing.
+async fn file_in_drive(
+    state: &AppState,
+    account: &str,
+    filename: &str,
+    row: &MediaRow,
+) -> Option<Uuid> {
+    let name = crate::drive::clean_filename(filename);
+    let name = if name.is_empty() {
+        "upload".to_owned()
+    } else {
+        name
+    };
+    match drive::create_object(
+        state.store().pool(),
+        account,
+        None,
+        &name,
+        &row.content_type,
+        &row.digest,
+        row.size,
+    )
+    .await
+    {
+        Ok(object) => {
+            if let Err(error) =
+                media::set_projected_object(state.store().pool(), &row.id, object.id).await
+            {
+                tracing::warn!(%error, id = %row.id, "could not record an upload's drive projection");
+            }
+            Some(object.id)
+        }
+        Err(error) => {
+            tracing::warn!(%error, id = %row.id, "could not file an upload in the drive");
+            None
+        }
+    }
 }
 
 /// Copies the pipeline's verdict onto the drive row, so a listing does not show a file

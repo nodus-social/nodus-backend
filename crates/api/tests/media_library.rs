@@ -252,6 +252,60 @@ async fn the_same_bytes_from_one_account_reuse_the_attachment() {
 }
 
 #[tokio::test]
+async fn a_reuse_files_the_bytes_in_the_drive_again() {
+    init_media_env();
+    run_db_test(|store, app| async move {
+        let pool = store.pool().clone();
+        let account = create_account(&pool, "refile").await;
+        let token = create_token(&pool, &account, &["write", "read"]).await;
+
+        let (_, first) = upload(&app, &token, None).await;
+        let id = first["id"].as_str().expect("id").to_owned();
+        wait_until_processed(&pool, &id).await;
+
+        // Deleting from the drive removes the listing and keeps the picture: the bytes are
+        // still named by the attachment, so `release_digest` leaves the blob in place.
+        let object_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM drive_object WHERE account_id = $1 AND sha256 = $2")
+                .bind(&account)
+                .bind(hex(TINY_PNG))
+                .fetch_one(&pool)
+                .await
+                .expect("drive projection");
+        let (deleted, _) = answer(
+            &app,
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/drive/files/{object_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("delete request"),
+        )
+        .await;
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+
+        // The second upload answers the same attachment, and the drive lists it again: an
+        // upload that is not findable in the drive is what this pins.
+        let (second_status, second) = upload(&app, &token, None).await;
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(second["id"], id);
+
+        let (state, filename): (String, String) = sqlx::query_as(
+            "SELECT processing_state, filename FROM drive_object \
+             WHERE account_id = $1 AND sha256 = $2",
+        )
+        .bind(&account)
+        .bind(hex(TINY_PNG))
+        .fetch_one(&pool)
+        .await
+        .expect("the re-upload is filed in the drive");
+        assert_eq!(state, "ready");
+        assert_eq!(filename, "tiny.png");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn the_same_bytes_from_two_accounts_are_not_reused() {
     init_media_env();
     run_db_test(|store, app| async move {
