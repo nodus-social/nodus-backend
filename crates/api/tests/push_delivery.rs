@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
 use axum::body::Bytes;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use base64::Engine;
@@ -56,16 +56,26 @@ fn browser_keys() -> (SecretKey, String, String) {
     (secret, b64(&public), b64(&auth))
 }
 
-/// An HTTP endpoint that records every body it receives and always answers `status`.
-async fn stub(status: StatusCode) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
-    let bodies = Arc::new(Mutex::new(Vec::new()));
-    let recorded = bodies.clone();
+/// One request a push service would have received.
+#[derive(Clone)]
+struct Captured {
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+/// An HTTP endpoint that records every request it receives and always answers `status`.
+async fn stub(status: StatusCode) -> (String, Arc<Mutex<Vec<Captured>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
     let app = Router::new().route(
         "/push",
-        post(move |body: Bytes| {
+        post(move |headers: HeaderMap, body: Bytes| {
             let recorded = recorded.clone();
             async move {
-                recorded.lock().expect("bodies").push(body.to_vec());
+                recorded.lock().expect("requests").push(Captured {
+                    headers,
+                    body: body.to_vec(),
+                });
                 (status, "")
             }
         }),
@@ -77,7 +87,34 @@ async fn stub(status: StatusCode) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (format!("http://{address}/push"), bodies)
+    (format!("http://{address}/push"), requests)
+}
+
+/// Splits `vapid t=<jwt>,k=<server key>` into its two parts.
+fn vapid_parts(value: &str) -> (&str, &str) {
+    let rest = value
+        .strip_prefix("vapid ")
+        .unwrap_or_else(|| panic!("Authorization is not a vapid header: {value}"));
+    let (token, key) = rest
+        .rsplit_once(",k=")
+        .unwrap_or_else(|| panic!("vapid header has no k= part: {value}"));
+    let token = token
+        .strip_prefix("t=")
+        .unwrap_or_else(|| panic!("vapid header has no t= part: {value}"));
+    (token, key)
+}
+
+/// The claims of an unverified JWT, which is all the audience check needs.
+fn jwt_claims(token: &str) -> Value {
+    let payload = token
+        .split('.')
+        .nth(1)
+        .unwrap_or_else(|| panic!("JWT has no payload: {token}"));
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .unwrap_or_else(|error| panic!("JWT payload is not base64url: {error}"));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("JWT payload is not JSON: {error}"))
 }
 
 /// RFC 8291's decryption, written independently of [`webpush::encrypt`] so the test cannot
@@ -189,25 +226,128 @@ async fn a_mention_payload_decrypts_and_a_follow_only_subscriber_is_skipped() {
         assert_eq!(report.sent, 1, "one live endpoint was reached");
         assert_eq!(report.failed, 1, "the 500 endpoint was counted, not fatal");
 
-        let bodies = live_bodies.lock().expect("live bodies").clone();
-        assert_eq!(bodies.len(), 1, "the live endpoint got exactly one push");
+        let requests = live_bodies.lock().expect("live requests").clone();
+        assert_eq!(requests.len(), 1, "the live endpoint got exactly one push");
         assert!(
-            quiet_bodies.lock().expect("quiet bodies").is_empty(),
+            quiet_bodies.lock().expect("quiet requests").is_empty(),
             "a follow-only subscriber must not receive a mention"
         );
 
-        let plaintext = decrypt(&secret, &auth, &bodies[0]);
+        let plaintext = decrypt(&secret, &auth, &requests[0].body);
         let payload: Value = serde_json::from_slice(&plaintext).expect("payload JSON");
-        assert!(
-            payload["body"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("A very particular sentence"),
-            "payload: {payload}"
+        let actor_name: String =
+            sqlx::query_scalar("SELECT display_name FROM account WHERE id = $1")
+                .bind(&actor)
+                .fetch_one(store.pool())
+                .await
+                .expect("actor display name");
+        assert_eq!(
+            payload["title"].as_str(),
+            Some(actor_name.as_str()),
+            "title is the actor's name: {payload}"
+        );
+        assert_eq!(
+            payload["body"].as_str(),
+            Some("A very particular sentence"),
+            "body is the notification's note: {payload}"
         );
 
         let subscriptions = push::list(store.pool(), &recipient).await.expect("list");
         assert_eq!(subscriptions.len(), 3, "one failure must not remove a row");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_request_carries_the_headers_a_push_service_requires() {
+    run_db_test(|store, _app| async move {
+        let recipient = create_account(store.pool(), "push-delivery-headers").await;
+        let actor = create_account(store.pool(), "push-delivery-headers-actor").await;
+        social::notify_with_note(
+            store.pool(),
+            &recipient,
+            "mention",
+            &actor,
+            None,
+            Some("Headers"),
+        )
+        .await
+        .expect("notification");
+
+        let (_, p256dh, auth) = browser_keys();
+        let (endpoint, requests) = stub(StatusCode::CREATED).await;
+        push::upsert(
+            store.pool(),
+            &recipient,
+            &endpoint,
+            &p256dh,
+            &auth,
+            &alerts(true, false),
+            None,
+        )
+        .await
+        .expect("subscription");
+
+        webpush::deliver_due(store.pool(), &test_vapid(), 100)
+            .await
+            .expect("deliver");
+        let requests = requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 1, "one delivered push");
+        let headers = &requests[0].headers;
+
+        let ttl = headers
+            .get("TTL")
+            .and_then(|value| value.to_str().ok())
+            .expect("a push service requires TTL");
+        assert!(!ttl.trim().is_empty(), "TTL must carry a value");
+        assert_eq!(
+            headers
+                .get("Content-Encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("aes128gcm"),
+            "the body is RFC 8291 aes128gcm"
+        );
+        assert_eq!(
+            headers
+                .get("Content-Type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream"),
+            "an encrypted push body is opaque bytes"
+        );
+
+        let authorization = headers
+            .get("Authorization")
+            .and_then(|value| value.to_str().ok())
+            .expect("a push service requires VAPID authorization");
+        let (token, key) = vapid_parts(authorization);
+        assert_eq!(
+            key,
+            test_vapid().public_key(),
+            "k= is the instance's VAPID public key"
+        );
+
+        let claims = jwt_claims(token);
+        let origin = endpoint
+            .strip_suffix("/push")
+            .expect("stub endpoint has a /push path");
+        assert_eq!(
+            claims["aud"].as_str(),
+            Some(origin),
+            "aud must be the endpoint's origin, not the full endpoint URL: {claims}"
+        );
+        assert_ne!(
+            claims["aud"].as_str(),
+            Some(endpoint.as_str()),
+            "a full-URL audience is the common way push silently fails"
+        );
+        assert!(
+            claims["exp"].as_u64().is_some_and(|exp| exp > 0),
+            "the JWT carries an expiry: {claims}"
+        );
+        assert!(
+            claims["sub"].as_str().is_some_and(|sub| !sub.is_empty()),
+            "the JWT carries the instance's subject: {claims}"
+        );
     })
     .await;
 }
