@@ -214,10 +214,10 @@ pub async fn run(pool: PgPool, vapid: Vapid) {
 /// a moderation notice, an admin report) uses the notification's own id, which can never
 /// collide with another notification.
 ///
-/// `renotify` is deliberately absent. With a tag keyed to the target, a replacement is
-/// another event about the same post or account — another favourite of the same post, a
-/// second boost, the same account following again — not a new item; alerting again for
-/// each one would turn a popular post into a stream of buzzes.
+/// `renotify` makes a replacement alert again. Chrome replaces a same-tag notification
+/// silently unless the new one sets it, so without it only the first favourite of a post
+/// is ever heard. It is set for the kinds where a replacement is a new event and omitted
+/// for the kinds where it is a duplicate of one fact. See [`renotify`].
 fn payload_for(kind: &str, notice: &push::NoticeRow) -> serde_json::Value {
     let body = notice
         .note
@@ -226,13 +226,35 @@ fn payload_for(kind: &str, notice: &push::NoticeRow) -> serde_json::Value {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map_or_else(|| sentence(kind).to_owned(), str::to_owned);
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "title": notice.actor.as_deref().unwrap_or("Nodus"),
         "body": body,
         "tag": tag(kind, notice),
         "data": { "url": target_url(kind, notice) },
         "icon": crate::assets::ICON_PATH,
-    })
+    });
+    if renotify(kind) {
+        payload["renotify"] = serde_json::Value::Bool(true);
+    }
+    payload
+}
+
+/// Whether a same-tag replacement should alert again.
+///
+/// `mention`: another reply is a different person's words — news.
+/// `favourite`: another favouriter is a different person — news.
+/// `reblog`: another booster is a different person — news.
+/// `follow`: two notices about the same follower repeat one fact — not news, stay silent.
+/// Every other kind keeps the conservative answer, alert: inheriting silence would drop a
+/// notification the reader never saw, which is worse than one extra buzz.
+fn renotify(kind: &str) -> bool {
+    match kind {
+        // A second notice about the same follower repeats one fact.
+        "follow" => false,
+        // Mention, favourite and reblog (and any kind added later): a replacement is a
+        // new event from a different person, and silence would drop it.
+        _ => true,
+    }
 }
 
 /// The replacement key. Two notifications with the same key are about the same target and
@@ -345,4 +367,33 @@ fn decode(value: &str) -> Result<Vec<u8>, String> {
         .decode(value)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bare_notice() -> push::NoticeRow {
+        push::NoticeRow {
+            id: "notification:1".to_owned(),
+            from_account_id: "actor".to_owned(),
+            status_id: None,
+            note: None,
+            actor: None,
+            actor_username: None,
+            status_text: None,
+            status_author: None,
+        }
+    }
+
+    /// A kind the match has never seen must alert, not inherit the silent replacement a
+    /// missing `renotify` gives.
+    #[test]
+    fn an_unknown_kind_alerts_rather_than_replacing_silently() {
+        let payload = payload_for("kind.added.later", &bare_notice());
+        assert_eq!(
+            payload.get("renotify"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
 }

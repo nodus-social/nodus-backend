@@ -275,6 +275,7 @@ async fn a_mention_payload_decrypts_and_a_follow_only_subscriber_is_skipped() {
             "tag": format!("mention:{status}"),
             "data": { "url": format!("/@{actor_username}/{status}") },
             "icon": "/icon.png",
+            "renotify": true,
         });
         assert_eq!(
             payload, expected,
@@ -325,7 +326,9 @@ async fn a_follow_payload_tags_the_account_and_points_at_the_profile() {
                 .await
                 .expect("actor name and username");
         // A follow has no status: it tags and routes on the account, which is why its
-        // payload differs from a mention's.
+        // payload differs from a mention's. It also has no `renotify`: a second notice
+        // about the same follower repeats one fact and must not buzz again, and the whole
+        // object below proves the key is absent.
         let expected = json!({
             "title": actor_name,
             "body": "You have a new follower",
@@ -336,6 +339,100 @@ async fn a_follow_payload_tags_the_account_and_points_at_the_profile() {
         assert_eq!(
             payload, expected,
             "the follow payload is exactly this: {payload}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_favourite_payload_replaces_the_banner_and_alerts_again() {
+    run_db_test(|store, _app| async move {
+        let recipient = create_account(store.pool(), "push-delivery-favourite").await;
+        let actor = create_account(store.pool(), "push-delivery-favourite-actor").await;
+        let status = Id::new().to_string();
+        statuses::create(
+            store.pool(),
+            &NewStatus {
+                id: &status,
+                account_id: &recipient,
+                content: "Favourited twice, heard twice",
+                content_html: "Favourited twice, heard twice",
+                content_source: None,
+                content_format: "html",
+                spoiler_text: "",
+                visibility: "public",
+                sensitive: false,
+                in_reply_to_id: None,
+                in_reply_to_account_id: None,
+                reblog_of_id: None,
+                language: None,
+            },
+            &[],
+            &[],
+            &[],
+        )
+        .await
+        .expect("status");
+        social::notify_with_note(
+            store.pool(),
+            &recipient,
+            "favourite",
+            &actor,
+            Some(&status),
+            None,
+        )
+        .await
+        .expect("notification");
+
+        let (secret, p256dh, auth) = browser_keys();
+        let (endpoint, bodies) = stub(StatusCode::CREATED).await;
+        let mut alerts = alerts(false, false);
+        alerts["favourite"] = json!(true);
+        push::upsert(
+            store.pool(),
+            &recipient,
+            &endpoint,
+            &p256dh,
+            &auth,
+            &alerts,
+            None,
+        )
+        .await
+        .expect("subscription");
+
+        webpush::deliver_due(store.pool(), &test_vapid(), 100)
+            .await
+            .expect("deliver");
+        let requests = bodies.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 1, "one delivered push");
+
+        let plaintext = decrypt(&secret, &auth, &requests[0].body);
+        let payload: Value = serde_json::from_slice(&plaintext).expect("payload JSON");
+        let (actor_name,): (String,) =
+            sqlx::query_as("SELECT display_name FROM account WHERE id = $1")
+                .bind(&actor)
+                .fetch_one(store.pool())
+                .await
+                .expect("actor name");
+        let (recipient_username,): (String,) =
+            sqlx::query_as("SELECT username FROM account WHERE id = $1")
+                .bind(&recipient)
+                .fetch_one(store.pool())
+                .await
+                .expect("recipient username");
+        // A favourite coalesces on the status, so a second favouriter replaces the first
+        // banner; `renotify` is what makes that replacement sound instead of vanishing.
+        let expected = json!({
+            "title": actor_name,
+            "body": "Favourited twice, heard twice",
+            "tag": format!("favourite:{status}"),
+            "data": { "url": format!("/@{recipient_username}/{status}") },
+            "icon": "/icon.png",
+            "renotify": true,
+        });
+        assert_eq!(
+            payload, expected,
+            "the favourite payload is exactly this: {payload}"
         );
     })
     .await;
