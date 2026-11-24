@@ -61,6 +61,7 @@ pub mod style_public;
 pub mod suggestions;
 pub mod tags;
 pub mod user_blocks;
+pub mod webpush;
 
 pub use run::run;
 pub use state::{AppState, FederationKey, InstanceConfig};

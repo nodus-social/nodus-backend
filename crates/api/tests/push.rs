@@ -50,6 +50,11 @@ async fn a_subscription_round_trips() {
         assert_eq!(status, StatusCode::OK, "POST: {body}");
         let created = json_of(&body);
         assert_eq!(created["endpoint"], ENDPOINT, "answer: {created}");
+        assert_eq!(
+            created["server_key"],
+            support::test_vapid().public_key(),
+            "clients build a subscription from the key the endpoint hands back"
+        );
         assert!(!created["id"].as_str().unwrap_or_default().is_empty());
         assert_eq!(created["alerts"]["mention"], true);
         assert_eq!(created["alerts"]["reblog"], false);
@@ -63,6 +68,7 @@ async fn a_subscription_round_trips() {
         let fetched = json_of(&body);
         assert_eq!(fetched["id"], created["id"]);
         assert_eq!(fetched["endpoint"], ENDPOINT);
+        assert_eq!(fetched["server_key"], created["server_key"]);
         assert_eq!(fetched["alerts"], created["alerts"]);
     })
     .await;

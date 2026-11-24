@@ -134,6 +134,24 @@ pub async fn delete(pool: &PgPool, account_id: &str, endpoint: &str) -> Result<b
     Ok(result.rows_affected() == 1)
 }
 
+/// Records a delivery the push service accepted. A success also clears the failure count:
+/// the endpoint works, and ten old transient errors must not retire it on the next one.
+pub async fn record_success(
+    pool: &PgPool,
+    account_id: &str,
+    endpoint: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE push_subscription SET last_success_at = now(), failure_count = 0 \
+          WHERE account_id = $1 AND endpoint = $2",
+    )
+    .bind(account_id)
+    .bind(endpoint)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Counts one failed delivery. The row survives on purpose: a stale endpoint is identified
 /// (its count is high) and retired by the delivery slice, not by the failure that noticed it.
 pub async fn record_failure(
@@ -148,6 +166,100 @@ pub async fn record_failure(
     ))
     .bind(account_id)
     .bind(endpoint)
+    .fetch_optional(pool)
+    .await
+}
+
+/// One notification waiting to be pushed.
+#[derive(Debug, Clone, FromRow)]
+pub struct OutboxRow {
+    pub id: String,
+    pub account_id: String,
+    pub notification_id: String,
+    pub kind: String,
+}
+
+/// The words a push shows: the actor's name, the note a note-kind carries, and the
+/// first part of a status. All optional because a status or account may have been
+/// deleted between the notification and the send.
+#[derive(Debug, Clone, FromRow)]
+pub struct NoticeRow {
+    pub note: Option<String>,
+    pub actor: Option<String>,
+    pub status_text: Option<String>,
+}
+
+/// Queues one notification for the push sender.
+///
+/// Called after the notification row commits. The queue is deliberately not part of the
+/// notification's statement: a failure here is logged by the caller and loses only the
+/// push, while the notification itself stays readable in the app.
+pub async fn enqueue(
+    pool: &PgPool,
+    account_id: &str,
+    notification_id: &str,
+    kind: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO push_outbox (id, account_id, notification_id, kind) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(nodus_server_core::Id::new().to_string())
+    .bind(account_id)
+    .bind(notification_id)
+    .bind(kind)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The oldest unsent rows, up to `limit`.
+pub async fn due(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sqlx::Error> {
+    sqlx::query_as::<_, OutboxRow>(
+        "SELECT id, account_id, notification_id, kind FROM push_outbox \
+          WHERE sent_at IS NULL ORDER BY created_at, id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Marks one queue row done. Delivery is at-least-once: a crash between the HTTP call and
+/// this update sends the same notification again on the next boot.
+pub async fn mark_sent(pool: &PgPool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE push_outbox SET sent_at = now() WHERE id = $1 AND sent_at IS NULL")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Records a queue-level failure (the payload could not be built or every attempt errored)
+/// and leaves the row for a later pass.
+pub async fn mark_attempt_failed(pool: &PgPool, id: &str, error: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE push_outbox SET attempts = attempts + 1, last_error = $2 WHERE id = $1")
+        .bind(id)
+        .bind(error)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The notification's text and actor, for the push payload.
+pub async fn notice(
+    pool: &PgPool,
+    account_id: &str,
+    notification_id: &str,
+) -> Result<Option<NoticeRow>, sqlx::Error> {
+    sqlx::query_as::<_, NoticeRow>(
+        "SELECT n.note, a.display_name AS actor, left(s.content, 280) AS status_text \
+           FROM notification n \
+           LEFT JOIN account a ON a.id = n.from_account_id \
+           LEFT JOIN status s ON s.id = n.status_id \
+          WHERE n.id = $1 AND n.account_id = $2",
+    )
+    .bind(notification_id)
+    .bind(account_id)
     .fetch_optional(pool)
     .await
 }

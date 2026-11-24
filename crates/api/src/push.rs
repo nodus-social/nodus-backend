@@ -1,16 +1,17 @@
 //! `POST|GET|PUT|DELETE /api/v1/push/subscription` — the browser's Web Push registration.
 //!
-//! This is slice 1 of Web Push: the store and its API. Delivering a notification and
-//! encrypting its payload are slice 2; nothing here sends anything.
+//! This is the registration half of Web Push; [`crate::webpush`] is the sender. The
+//! subscription entity carries `server_key` so a client can build the matching
+//! subscription, and every verb answers `501` when this instance has no VAPID key: storing
+//! a row that can never be encrypted to would make a browser believe it subscribed.
 //!
 //! Shape, read from Mastodon 4.6's REST serializer: the subscription entity is
 //! `{"id", "endpoint", "server_key", "alerts"}`, and `alerts` is an **object** of booleans
 //! keyed by notification kind (`{"mention": true, "admin.sign_up": false, …}`), not a
 //! bitmask. Upstream stores the alert names as an array internally but serializes the
 //! object a client draws checkboxes from, so this instance stores and returns the object
-//! verbatim. `server_key` is deliberately absent: this slice has no VAPID public key to
-//! send, and inventing one would be worse than omitting a field slice 2 will add with the
-//! key itself.
+//! verbatim. `server_key` is the instance's VAPID public key, the same value every
+//! subscription is delivered with.
 //!
 //! The request body is the same nesting Mastodon's form parameters use:
 //! `subscription[endpoint]`, `subscription[keys][p256dh]`, `subscription[keys][auth]`,
@@ -33,6 +34,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use nodus_server_store::push;
+
+use nodus_server_runtime::Vapid;
 
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult};
@@ -60,14 +63,16 @@ pub const ALERTS: [&str; 10] = [
 pub struct SubscriptionDto {
     pub id: String,
     pub endpoint: String,
+    pub server_key: String,
     pub alerts: Value,
 }
 
-impl From<push::SubscriptionRow> for SubscriptionDto {
-    fn from(row: push::SubscriptionRow) -> Self {
+impl SubscriptionDto {
+    fn from_row(row: push::SubscriptionRow, vapid: &Vapid) -> Self {
         Self {
             id: row.id,
             endpoint: row.endpoint,
+            server_key: vapid.public_key().to_owned(),
             alerts: row.alerts,
         }
     }
@@ -116,6 +121,7 @@ pub async fn create(
     body: Bytes,
 ) -> ApiResult<Json<SubscriptionDto>> {
     auth.require_scope("push")?;
+    let vapid = require_vapid(&state)?;
     let input = parse_body(&headers, &body)?;
     let endpoint = required(&input.subscription.endpoint, "subscription[endpoint]")?;
     let p256dh = required(
@@ -136,16 +142,17 @@ pub async fn create(
         user_agent.as_deref(),
     )
     .await?;
-    Ok(Json(row.into()))
+    Ok(Json(SubscriptionDto::from_row(row, vapid)))
 }
 
 /// `GET /api/v1/push/subscription` — the newest subscription, or Mastodon's 404.
 pub async fn show(State(state): State<AppState>, auth: Auth) -> ApiResult<Json<SubscriptionDto>> {
     auth.require_scope("push")?;
+    let vapid = require_vapid(&state)?;
     let row = push::get(state.store().pool(), &auth.0.account.id)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    Ok(Json(row.into()))
+    Ok(Json(SubscriptionDto::from_row(row, vapid)))
 }
 
 /// `PUT /api/v1/push/subscription` — alerts only; keys and endpoint are untouched.
@@ -159,6 +166,7 @@ pub async fn update(
     body: Bytes,
 ) -> ApiResult<Json<SubscriptionDto>> {
     auth.require_scope("push")?;
+    let vapid = require_vapid(&state)?;
     let input = parse_body(&headers, &body)?;
     let current = push::get(state.store().pool(), &auth.0.account.id)
         .await?
@@ -167,7 +175,7 @@ pub async fn update(
     let row = push::update_alerts(state.store().pool(), &auth.0.account.id, &alerts)
         .await?
         .ok_or_else(|| ApiError::not_found("Record not found"))?;
-    Ok(Json(row.into()))
+    Ok(Json(SubscriptionDto::from_row(row, vapid)))
 }
 
 /// `DELETE /api/v1/push/subscription` — `204` even when there was nothing to remove.
@@ -178,10 +186,26 @@ pub async fn destroy(
     body: Bytes,
 ) -> ApiResult<StatusCode> {
     auth.require_scope("push")?;
+    require_vapid(&state)?;
     let input = parse_body(&headers, &body)?;
     let endpoint = required(&input.subscription.endpoint, "subscription[endpoint]")?;
     push::delete(state.store().pool(), &auth.0.account.id, endpoint).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The VAPID key this instance delivers with, or the `501` that says it cannot.
+///
+/// Mastodon has no such status here; `501` is the honest one for a server that keeps the
+/// route but has no sender behind it. It is a sentence rather than an empty body so an
+/// operator reading a client's error sees which variable to set.
+fn require_vapid(state: &AppState) -> ApiResult<&Vapid> {
+    state.vapid().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "Web Push is not configured on this instance: set NODUS_VAPID_PUBLIC_KEY and \
+             NODUS_VAPID_PRIVATE_KEY",
+        )
+    })
 }
 
 /// The router fragment, mounted by `crate::router`.

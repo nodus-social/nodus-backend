@@ -445,6 +445,14 @@ pub async fn notify_with_note(
     };
     if let Some((id, false)) = written {
         crate::live::notification(account_id, &id);
+        // The push queue is published after the notification commits, not inside the
+        // insert: one statement cannot both write the row and hand it to a worker, and a
+        // push service must never make the favourite wait. A queue failure is logged
+        // rather than returned, because the notification itself is already durable and a
+        // missing push is a degraded delivery, not a failed write.
+        if let Err(error) = crate::push::enqueue(pool, account_id, &id, kind).await {
+            tracing::warn!(%error, "push notification could not be queued");
+        }
     }
     Ok(())
 }

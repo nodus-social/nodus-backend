@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nodus_activitypub_client::{ActivityPub, HttpSigner};
+use nodus_server_runtime::Vapid;
 use nodus_server_store::invalidate::InvalidationSink;
 use nodus_server_store::writer::{DbWriter, DbWriterHandle, WriterConfig};
 use nodus_server_store::Store;
@@ -82,6 +83,9 @@ struct Inner {
     /// The sink committed home removals are published to. Kept here as well as in the
     /// writer, because the delete path publishes long after the writer's commit.
     sink: Option<DebugSink>,
+    /// The VAPID identity push is signed with. `None` means the subscription verbs answer
+    /// `501`: this process has nothing it could ever deliver.
+    vapid: Option<Arc<Vapid>>,
 }
 
 /// Cloned into every handler; `Store` is a pool handle and `InstanceConfig` is small.
@@ -215,6 +219,7 @@ impl AppState {
                 writer,
                 home: None,
                 sink: sink.map(DebugSink),
+                vapid: None,
             }),
         }
     }
@@ -240,6 +245,7 @@ impl AppState {
                 writer: self.inner.writer.clone(),
                 home,
                 sink: self.inner.sink.clone(),
+                vapid: self.inner.vapid.clone(),
             }),
         }
     }
@@ -265,6 +271,7 @@ impl AppState {
                 writer: self.inner.writer.clone(),
                 home: self.inner.home.clone(),
                 sink: self.inner.sink.clone(),
+                vapid: self.inner.vapid.clone(),
             }),
         }
     }
@@ -291,6 +298,7 @@ impl AppState {
                 writer: self.inner.writer.clone(),
                 home: self.inner.home.clone(),
                 sink: self.inner.sink.clone(),
+                vapid: self.inner.vapid.clone(),
             }),
         }
     }
@@ -316,6 +324,7 @@ impl AppState {
                 writer: self.inner.writer.clone(),
                 home: self.inner.home.clone(),
                 sink: self.inner.sink.clone(),
+                vapid: self.inner.vapid.clone(),
             }),
         }
     }
@@ -338,6 +347,7 @@ impl AppState {
                 writer: self.inner.writer.clone(),
                 home: self.inner.home.clone(),
                 sink: self.inner.sink.clone(),
+                vapid: self.inner.vapid.clone(),
             }),
         }
     }
@@ -359,6 +369,36 @@ impl AppState {
     #[must_use]
     pub fn account_delete_grace_days(&self) -> i64 {
         self.inner.account_delete_grace_days
+    }
+
+    /// The same state with Web Push configured. `None` keeps the subscription verbs at
+    /// `501`, which is the honest answer when this process has no key to sign with.
+    #[must_use]
+    pub fn with_vapid(self, vapid: Option<Arc<Vapid>>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                store: self.inner.store.clone(),
+                instance: self.inner.instance.clone(),
+                federation: self.inner.federation.clone(),
+                authorized_fetch: self.inner.authorized_fetch,
+                require_email_confirmation: self.inner.require_email_confirmation,
+                drive_share: self.inner.drive_share,
+                stats_cache: Mutex::new(HashMap::new()),
+                actor_keys: Mutex::new(HashMap::new()),
+                key_fetches: Mutex::new(HashMap::new()),
+                account_delete_grace_days: self.inner.account_delete_grace_days,
+                writer: self.inner.writer.clone(),
+                home: self.inner.home.clone(),
+                sink: self.inner.sink.clone(),
+                vapid,
+            }),
+        }
+    }
+
+    /// The VAPID identity push is signed with, when this process has one.
+    #[must_use]
+    pub fn vapid(&self) -> Option<&Vapid> {
+        self.inner.vapid.as_deref()
     }
 
     #[must_use]

@@ -23,9 +23,23 @@ use std::sync::Arc;
 use nodus_server_api::home::{HomeCache, HomeShards};
 use nodus_server_api::{root_router, AppState, InstanceConfig};
 use nodus_server_core::Id;
+use nodus_server_runtime::Vapid;
 use nodus_server_store::accounts::{self, NewAccount};
 use nodus_server_store::statuses::{self, NewStatus};
 use nodus_server_store::{social, Store};
+
+/// A fixed, valid VAPID pair for the tests. It is test material and appears nowhere else;
+/// generating a key per test would make every subscription test depend on randomness.
+pub fn test_vapid() -> Arc<Vapid> {
+    Arc::new(
+        Vapid::parse(
+            "BEQ_vQvXWheO53GFQiNgkzAPA5_PbzspTHLPG1b2uHLYT_DzvrHtcf1oJS5Sml9X1-STaOZWADZPdPxc7n0ma8c",
+            "Dn6X2fr0gIb2-WHOc8sJ5JGcPXBCVLWd2wpeeW0mWtI",
+            "mailto:admin@social.test",
+        )
+        .expect("test VAPID key pair"),
+    )
+}
 
 pub fn instance_config() -> InstanceConfig {
     InstanceConfig {
@@ -50,7 +64,8 @@ where
         return;
     };
     // The auth pages live in their own router, the way the server mounts them.
-    let api = root_router(AppState::new(store.clone(), instance_config()));
+    let api =
+        root_router(AppState::new(store.clone(), instance_config()).with_vapid(Some(test_vapid())));
     let auth = nodus_auth::router(nodus_auth::AppState::new(
         nodus_auth::store::PgAuthStore::new(store.pool().clone()),
         nodus_auth::Config {
@@ -83,7 +98,9 @@ where
         return;
     };
     let home = Arc::new(HomeShards::new(caches, nodus_server_api::home::DEFAULT_CAP));
-    let state = AppState::new(store.clone(), instance_config()).with_home(Some(home.clone()));
+    let state = AppState::new(store.clone(), instance_config())
+        .with_home(Some(home.clone()))
+        .with_vapid(Some(test_vapid()));
 
     let outcome = tokio::spawn(async move { body(store, state, home).await }).await;
     let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))

@@ -81,6 +81,16 @@ where
     if let Some(mail) = mail.clone() {
         tokio::spawn(nodus_auth::outbox::run(store.pool().clone(), mail));
     }
+    // Push without a key is a degraded feature, not a broken API: log what an operator
+    // must set and let the subscription verbs answer `501`. One line per process.
+    if let Some(vapid) = config.vapid.clone() {
+        tokio::spawn(crate::webpush::run(store.pool().clone(), vapid));
+    } else {
+        tracing::info!(
+            "Web Push is off: set NODUS_VAPID_PUBLIC_KEY and NODUS_VAPID_PRIVATE_KEY to \
+             accept subscriptions"
+        );
+    }
     // One variable turns the home timelines' fan-out on: with no `NODUS_VALKEY_URL` this is
     // `None`, and every home read is the SQL query it has always been.
     let home = crate::home::HomeShards::from_env();
@@ -103,7 +113,8 @@ where
     .with_require_email_confirmation(config.require_email_confirmation)
     .with_drive_share(crate::drive::share_links_configured())
     .with_account_delete_grace_days(config.account_delete_grace_days)
-    .with_home(home.clone());
+    .with_home(home.clone())
+    .with_vapid(config.vapid.clone().map(Arc::new));
     if let Some(home) = home.as_ref() {
         // Removals another replica published are applied here; a single-process deployment
         // hears its own echo and finds nothing left to remove.
@@ -200,7 +211,8 @@ fn router(
         .with_require_email_confirmation(config.require_email_confirmation)
         .with_drive_share(crate::drive::share_links_configured())
         .with_account_delete_grace_days(config.account_delete_grace_days)
-        .with_home(home),
+        .with_home(home)
+        .with_vapid(config.vapid.clone().map(Arc::new)),
     );
     let mut auth_state = nodus_auth::AppState::new(
         PgAuthStore::new(store.pool().clone()),

@@ -16,6 +16,9 @@ nodus-server-telemetry = { path = "../telemetry" }
 nodus-server-transport = { path = "../transport" }
 
 axum.workspace = true
+base64.workspace = true
+p256.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tonic.workspace = true

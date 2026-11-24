@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aes-gcm = { workspace = true }
 ammonia = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
@@ -24,6 +25,7 @@ nodus-server-scan = { path = "../scan" }
 nodus-server-store = { workspace = true }
 nodus-server-transport = { path = "../transport" }
 nodus-storage = { path = "../storage" }
+p256 = { workspace = true }
 nodus-shared = { path = "../../../sdk/crates/shared", version = "0.1.0" }
 nodus-auth = { workspace = true }
 nodus-mail = { workspace = true }
@@ -46,6 +48,7 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
+hkdf = { workspace = true }
 tower-http = { workspace = true }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
@@ -53,6 +56,7 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 http-body-util = "0.1"
 # The insecure-peer test captures the once-per-host warning, the way
 # `crates/store/tests/invalidate.rs` captures its once-per-outage one.

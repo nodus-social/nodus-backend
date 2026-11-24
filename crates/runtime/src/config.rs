@@ -70,6 +70,171 @@ impl VideoCodec {
     }
 }
 
+/// The VAPID identity every Web Push delivery is signed with.
+///
+/// The three variables are read once at startup. A key that is not a P-256 key is a
+/// deployment mistake that can never deliver anything, so it stops the process here
+/// rather than at the first notification; an instance with no key at all keeps running
+/// and answers the subscription verbs `501`, because refusing mail-like optional
+/// features must not take the whole API down.
+#[derive(Clone)]
+pub struct Vapid {
+    public_key: String,
+    subject: String,
+    signing_key: p256::ecdsa::SigningKey,
+}
+
+impl std::fmt::Debug for Vapid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Vapid")
+            .field("public_key", &self.public_key)
+            .field("subject", &self.subject)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The subject a VAPID JWT carries when `NODUS_VAPID_SUBJECT` says nothing.
+const DEFAULT_VAPID_SUBJECT_DOMAIN: &str = "localhost";
+
+impl Vapid {
+    /// Reads `NODUS_VAPID_PUBLIC_KEY`, `NODUS_VAPID_PRIVATE_KEY` and
+    /// `NODUS_VAPID_SUBJECT` (the last optional).
+    ///
+    /// # Errors
+    ///
+    /// Fails when only one of the two keys is set, or when either is not the base64url
+    /// form of a matching P-256 key pair. The message names the variable.
+    pub fn from_env(domain: &str) -> Result<Option<Self>, String> {
+        let public = env::var("NODUS_VAPID_PUBLIC_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let private = env::var("NODUS_VAPID_PRIVATE_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let subject = env::var("NODUS_VAPID_SUBJECT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                let domain = if domain.trim().is_empty() {
+                    DEFAULT_VAPID_SUBJECT_DOMAIN
+                } else {
+                    domain
+                };
+                format!("mailto:admin@{domain}")
+            });
+        match (public, private) {
+            (None, None) => Ok(None),
+            (Some(public), Some(private)) => Self::parse(&public, &private, &subject).map(Some),
+            (None, Some(_)) => Err(
+                "NODUS_VAPID_PUBLIC_KEY is not set but NODUS_VAPID_PRIVATE_KEY is; \
+                 set both or neither"
+                    .to_owned(),
+            ),
+            (Some(_), None) => Err(
+                "NODUS_VAPID_PRIVATE_KEY is not set but NODUS_VAPID_PUBLIC_KEY is; \
+                 set both or neither"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    /// Parses and validates one key pair. The two keys must belong together: a JWT signs
+    /// with the private half while the header publishes the public half, so a mismatched
+    /// pair would be rejected by every push service with no useful error here.
+    ///
+    /// # Errors
+    ///
+    /// Names the offending variable and what was wrong with it.
+    pub fn parse(public: &str, private: &str, subject: &str) -> Result<Self, String> {
+        let public_bytes = decode_key(public)
+            .map_err(|error| format!("NODUS_VAPID_PUBLIC_KEY is not base64url: {error}"))?;
+        p256::PublicKey::from_sec1_bytes(&public_bytes)
+            .map_err(|error| format!("NODUS_VAPID_PUBLIC_KEY is not a P-256 point: {error}"))?;
+        let private_bytes = decode_key(private)
+            .map_err(|error| format!("NODUS_VAPID_PRIVATE_KEY is not base64url: {error}"))?;
+        let secret = p256::SecretKey::from_slice(&private_bytes)
+            .map_err(|error| format!("NODUS_VAPID_PRIVATE_KEY is not a P-256 scalar: {error}"))?;
+        let signing_key = p256::ecdsa::SigningKey::from(secret);
+        if signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            != public_bytes
+        {
+            return Err("NODUS_VAPID_PUBLIC_KEY does not match NODUS_VAPID_PRIVATE_KEY".to_owned());
+        }
+        Ok(Self {
+            public_key: public.trim().to_owned(),
+            subject: subject.to_owned(),
+            signing_key,
+        })
+    }
+
+    /// The value `GET /api/v1/push/subscription` returns as `server_key`.
+    #[must_use]
+    pub fn public_key(&self) -> &str {
+        &self.public_key
+    }
+
+    /// The `Authorization` header value for one push service endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the endpoint has no `scheme://host` origin to name as the audience.
+    pub fn authorization(&self, endpoint: &str) -> Result<String, String> {
+        let audience = origin_of(endpoint)
+            .ok_or_else(|| format!("push endpoint is not an absolute URL: {endpoint}"))?;
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("system clock is before the epoch: {error}"))?
+            .as_secs()
+            + 12 * 60 * 60;
+        let header = serde_json::json!({"typ": "JWT", "alg": "ES256"});
+        let claims = serde_json::json!({
+            "aud": audience,
+            "exp": expires,
+            "sub": self.subject,
+        });
+        let signing_input = format!(
+            "{}.{}",
+            base64_url(&serde_json::to_vec(&header).map_err(|error| error.to_string())?),
+            base64_url(&serde_json::to_vec(&claims).map_err(|error| error.to_string())?)
+        );
+        use p256::ecdsa::signature::Signer;
+        let signature: p256::ecdsa::Signature = self.signing_key.sign(signing_input.as_bytes());
+        let token = format!("{signing_input}.{}", base64_url(&signature.to_bytes()));
+        Ok(format!("vapid t={token},k={}", self.public_key))
+    }
+}
+
+fn decode_key(value: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let value = value.trim();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
+        .map_err(|error| error.to_string())
+}
+
+fn base64_url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// `scheme://host[:port]`, which is what a VAPID JWT names as its audience.
+fn origin_of(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.split_once("://")?;
+    if scheme.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
+}
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each switch is an independent deployment decision, not a state"
@@ -96,6 +261,10 @@ pub struct Config {
     /// Encoder for `WebM` renditions (`NODUS_MEDIA_VIDEO_CODEC`, default VP8). Read once
     /// here so a typo fails startup instead of the first uploaded video.
     pub video_codec: VideoCodec,
+    /// The Web Push signing identity (`NODUS_VAPID_*`). `None` means this instance
+    /// cannot deliver push: the subscription verbs refuse rather than store a row that
+    /// will never be sent.
+    pub vapid: Option<Vapid>,
     pub migrate_only: bool,
     /// `TOKEN_ENC_KEY`, the base64 32-byte key that seals stored instance tokens.
     ///
@@ -166,6 +335,7 @@ pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
         .transpose()?
         .unwrap_or(DEFAULT_ACCOUNT_DELETE_GRACE_DAYS);
     let video_codec = VideoCodec::from_env()?;
+    let vapid = Vapid::from_env(&domain)?;
     let bootstrap = match (
         env::var("NODUS_BOOTSTRAP_EMAIL"),
         env::var("NODUS_BOOTSTRAP_USERNAME"),
@@ -216,6 +386,7 @@ pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
         require_email_confirmation,
         account_delete_grace_days,
         video_codec,
+        vapid,
         migrate_only: env::args().any(|argument| argument == "--migrate-only"),
         token_enc_key: env::var("TOKEN_ENC_KEY")
             .ok()

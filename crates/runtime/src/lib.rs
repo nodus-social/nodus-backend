@@ -12,7 +12,7 @@ mod telemetry;
 
 pub use boot::{init, prepare, provision_bootstrap, shutdown};
 pub use config::{
-    read, read_with_bind, Bootstrap, Config, VideoCodec, DEFAULT_BIND, DEFAULT_DATABASE_URL,
+    read, read_with_bind, Bootstrap, Config, Vapid, VideoCodec, DEFAULT_BIND, DEFAULT_DATABASE_URL,
     DEFAULT_VIDEO_CODEC,
 };
 pub use media::{media_dir, prune_media, prune_media_in, variants_dir};

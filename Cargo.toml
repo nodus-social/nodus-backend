@@ -25,14 +25,17 @@ nodus-server-sdk = { path = "../server-sdk/crates/server", features = ["activity
 
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
+aes-gcm = "0.10"
 argon2 = "0.5"
 base64 = "0.22"
+hkdf = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 leptos = { version = "0.8.23", features = ["ssr"] }
 rand = "0.9"
 redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 rsa = { version = "0.9", features = ["sha2", "pem"] }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = [
