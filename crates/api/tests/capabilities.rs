@@ -514,6 +514,9 @@ const MODULE_FEATURES: &[(&str, &[&str])] = &[
     ("ip_blocks", &["admin"]),
     ("media", &["media_quarantine"]),
     ("moderation_rules", &["moderation_rules"]),
+    // Relays are instance administration with no client-facing name of their own: the
+    // console reaches them through the `admin` door, like address blocks.
+    ("relays", &["admin"]),
     ("reports", &["moderation"]),
     ("rules", &["instance_rules"]),
     ("scanners", &["scanners"]),
@@ -556,6 +559,7 @@ const ADMIN_SOURCES: &[(&str, &str)] = &[
         "admin/moderation_rules.rs",
         include_str!("../src/admin/moderation_rules.rs"),
     ),
+    ("admin/relays.rs", include_str!("../src/admin/relays.rs")),
     ("admin/reports.rs", include_str!("../src/admin/reports.rs")),
     ("admin/rules.rs", include_str!("../src/admin/rules.rs")),
     (
@@ -1290,6 +1294,7 @@ const ROUTE_SOURCES: &[(&str, &str)] = route_sources![
     "admin/media.rs",
     "admin/mod.rs",
     "admin/moderation_rules.rs",
+    "admin/relays.rs",
     "admin/reports.rs",
     "admin/rules.rs",
     "admin/scanners.rs",

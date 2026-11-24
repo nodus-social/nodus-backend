@@ -29,6 +29,7 @@ use nodus_server_sdk::activitypub::{
 use nodus_server_store::accounts::{self, AccountRow};
 use nodus_server_store::media;
 use nodus_server_store::polls;
+use nodus_server_store::relay;
 use nodus_server_store::statuses::{self, StatusRow};
 
 use crate::dto::profile_picture_url;
@@ -448,6 +449,17 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
         );
         return Ok(());
     }
+    // Relay answers and relay announcements are instance infrastructure, not a person's
+    // activity: they are matched against the relay table before the actor is resolved, so a
+    // relay that serves no actor document is still answered instead of failing the inbox.
+    if matches!(activity.kind, ActivityKind::Accept | ActivityKind::Reject)
+        && relay_answer(state, activity).await?
+    {
+        return Ok(());
+    }
+    if activity.kind == ActivityKind::Announce && relay_announce(state, activity).await? {
+        return Ok(());
+    }
     let remote = ensure_remote_actor(state, &activity.actor).await?;
     match activity.kind {
         ActivityKind::Follow => {
@@ -482,6 +494,79 @@ async fn ingest_activity(state: &AppState, activity: &Activity) -> ApiResult<()>
         _ => {}
     }
     Ok(())
+}
+
+/// Applies a relay's `Accept` or `Reject` to the subscription whose `Follow` it names.
+///
+/// The relay echoes the `Follow` id as the activity's object, which is why it is stored:
+/// the answer is matched by that id rather than by an actor URL a relay may spell its own
+/// way. `false` means no subscription names that `Follow`, so the activity is not ours and
+/// the caller can ignore it as it did before.
+async fn relay_answer(state: &AppState, activity: &Activity) -> ApiResult<bool> {
+    let Some(follow_id) = follow_id_of(activity) else {
+        return Ok(false);
+    };
+    let Some(row) = relay::by_follow_activity(state.store().pool(), follow_id).await? else {
+        return Ok(false);
+    };
+    let accepted = activity.kind == ActivityKind::Accept;
+    let state_name = if accepted {
+        relay::ACCEPTED
+    } else {
+        relay::REJECTED
+    };
+    relay::set_state(state.store().pool(), &row.id, state_name).await?;
+    tracing::info!(
+        relay = %row.actor_uri,
+        accepted,
+        "relay answered our follow"
+    );
+    Ok(true)
+}
+
+/// The `id` of the `Follow` an `Accept` or `Reject` answers.
+///
+/// Relays embed the whole `Follow` rather than citing its id, so all three shapes the
+/// parser can produce are read here: a bare id, an embedded object, an embedded activity.
+fn follow_id_of(activity: &Activity) -> Option<&str> {
+    match &activity.object {
+        ActivityObject::Id(id) => Some(id.as_str()),
+        ActivityObject::Value(value) => value.get("id").and_then(Value::as_str),
+        ActivityObject::Activity(inner) => inner.id.as_deref(),
+    }
+}
+
+/// Whether this `Announce` came from a relay we are subscribed to.
+///
+/// Ingesting what a relay announces is a separate slice. Until then the activity is
+/// acknowledged with a log line naming that gap, so the relay stops retrying and an
+/// operator can see the traffic arriving rather than wonder where it went.
+async fn relay_announce(state: &AppState, activity: &Activity) -> ApiResult<bool> {
+    let subscribed = relay::list(state.store().pool())
+        .await?
+        .into_iter()
+        .any(|row| row.actor_uri == activity.actor || same_host(&row.actor_uri, &activity.actor));
+    if !subscribed {
+        return Ok(false);
+    }
+    tracing::warn!(
+        actor = %activity.actor,
+        "relay announcement acknowledged; relay ingestion is not implemented"
+    );
+    Ok(true)
+}
+
+/// Whether two URLs name the same host.
+///
+/// A relay's inbox and the actor it announces from need not be the same URL, so the host is
+/// the strongest match available without fetching the relay's actor document.
+fn same_host(left: &str, right: &str) -> bool {
+    let host = |raw: &str| {
+        url::Url::parse(raw)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+    };
+    host(left).is_some() && host(left) == host(right)
 }
 
 /// A `Flag` whose object is a list.

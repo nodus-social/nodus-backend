@@ -138,6 +138,8 @@ const TABLES: &[Table] = &[
     // QUESTION: `0067` postdates the roster. Keyed by email, like `email_domain_block`; the
     // account may not exist, which is the point of a reset request.
     Table { name: "password_reset_attempt", bucket: Bucket::GlobalReplicated, why: "Reset rate limit keyed by email; names no account." },
+    // QUESTION: `0071` postdates the roster. Instance-wide relay subscriptions; no account.
+    Table { name: "relay", bucket: Bucket::GlobalReplicated, why: "Instance's own relay subscriptions; names no local account." },
 
     // §2.3 CROSS-SHARD-BY-DESIGN (18).
     Table { name: "account_relation", bucket: Bucket::CrossShardByDesign, why: "Two accounts; blocks must be readable from both sides." },
@@ -654,8 +656,8 @@ fn every_shipped_table_has_a_bucket() {
     }
 
     let count = |bucket: Bucket| TABLES.iter().filter(|table| table.bucket == bucket).count();
-    // docs/18-sharding.md §2 says 28 / 26 / 18 = 72. The eleven rows marked QUESTION above
-    // are migrations 0062-0070 landing after that roster; this is the parse's answer, kept
+    // docs/18-sharding.md §2 says 28 / 26 / 18 = 72. The twelve rows marked QUESTION above
+    // are migrations 0062-0071 landing after that roster; this is the parse's answer, kept
     // exact so the difference has to be a deliberate edit rather than a quiet drift.
     assert_eq!(
         (
@@ -664,9 +666,9 @@ fn every_shipped_table_has_a_bucket() {
             count(Bucket::GlobalReplicated),
             count(Bucket::CrossShardByDesign),
         ),
-        (83, 36, 29, 18),
+        (84, 36, 30, 18),
         "the doc's roster is 72 (28 affine / 26 global / 18 cross-shard); the parse finds \
-         83, and the extra eleven must be the QUESTION rows above"
+         84, and the extra twelve must be the QUESTION rows above"
     );
 }
 

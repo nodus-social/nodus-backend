@@ -395,6 +395,44 @@ pub async fn deliver_remote_block(
     enqueue_with(state, sender_id, activity, vec![inbox], true).await;
 }
 
+/// The `Follow` that subscribes this instance to a relay, and the `Undo` that ends it.
+///
+/// The relay is addressed the way Mastodon addresses one: the activity names the relay URL
+/// as its object and is posted to that same URL. The id is derived from the pair rather
+/// than minted per attempt, because the relay echoes it as the object of its answer and the
+/// `Undo` must name the very activity the relay stored.
+pub fn relay_follow(actor: &str, relay_uri: &str) -> Value {
+    pointing(ActivityKind::Follow, "follows", actor, relay_uri)
+}
+
+/// The `Undo` that withdraws a relay subscription's `Follow`.
+pub fn relay_undo(actor: &str, relay_uri: &str, follow_id: &str) -> Value {
+    undoing(
+        actor,
+        json!({ "id": follow_id, "type": "Follow", "actor": actor, "object": relay_uri }),
+    )
+}
+
+/// Queues an already-built relay activity for the relay's inbox.
+///
+/// The queue is the only delivery path: a relay that is down must not fail the console
+/// request, and the worker signs the activity with the subscribing account's key.
+pub async fn queue_relay(
+    state: &AppState,
+    account_id: &str,
+    activity: &Value,
+    relay_uri: &str,
+) -> ApiResult<u64> {
+    nodus_server_store::delivery::enqueue(
+        state.store().pool(),
+        account_id,
+        activity,
+        &[relay_uri.to_owned()],
+    )
+    .await
+    .map_err(Into::into)
+}
+
 /// Answers a pending follow request.
 pub async fn deliver_follow_response(
     state: &AppState,

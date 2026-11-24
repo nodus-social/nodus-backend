@@ -150,7 +150,7 @@ So: routing is by account. Ids stay opaque. The only thing that must become rout
 ## 2. Table classification
 
 83 tables at `e7ce483`, each with the migration that creates it. The survey that produced
-this roster saw 72; the eleven added since — 2FA, password reset, push, email, IP blocks —
+this roster saw 72; the twelve added since — 2FA, password reset, push, email, IP blocks, relays —
 are recorded in §2.5, and the guard test (`crates/api/tests/sharding_invariants.rs`) now
 holds the numbers in this file to the migrations rather than to memory. The tiebreak rule,
 stated so it can be argued with:
@@ -285,7 +285,7 @@ under §2.4 rather than quietly filed.
    are on shards, the queue is not. Correct as designed, but every job payload must be
    readable without a join, because the worker may be on a different shard from the subject.
 
-### 2.5 The eleven tables added after the survey
+### 2.5 The twelve tables added after the survey
 
 The survey predates the account-safety and push work, so these rows are decisions rather
 than findings: the bucket follows §2's rule applied to the schema as it now stands, and the
@@ -305,6 +305,7 @@ is created.
 | `email_outbox` | `0065` | GLOBAL-REPLICATED | Addressed before an account is confirmed; one SMTP egress.** |
 | `password_reset_attempt` | `0067` | GLOBAL-REPLICATED | Keyed by address, so it exists before an account is known.** |
 | `ip_block` | `0063` | GLOBAL-REPLICATED | Instance-wide address policy, evaluated at every door. |
+| `relay` | `0071` | GLOBAL-REPLICATED | Instance's own relay subscriptions; names no local account. |
 
 ** The two rows that disagree with the "a queue every worker polls is global" reading are
 both here on purpose, and the tension is real: `push_outbox` is a queue too. It stays affine

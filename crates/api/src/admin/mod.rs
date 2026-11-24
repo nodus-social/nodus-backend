@@ -18,6 +18,7 @@ mod forwarded;
 mod ip_blocks;
 mod media;
 mod moderation_rules;
+mod relays;
 mod reports;
 mod rules;
 mod scanners;
@@ -922,6 +923,7 @@ pub fn router() -> Router<AppState> {
         .merge(media::router())
         .merge(rules::router())
         .merge(moderation_rules::router())
+        .merge(relays::router())
         .merge(settings_transfer::router())
         .merge(topology::router())
         .route("/api/v1/admin/meta", get(meta))
