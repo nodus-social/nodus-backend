@@ -10,7 +10,9 @@ use std::sync::{Arc, LazyLock};
 
 use argon2::password_hash::{PasswordHash, PasswordVerifier};
 use argon2::Argon2;
-use axum::extract::{ConnectInfo, Form, FromRequestParts, Path, Query, RawQuery, State};
+use axum::extract::{
+    ConnectInfo, Form, FromRequest, FromRequestParts, Path, Query, RawQuery, Request, State,
+};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -29,7 +31,7 @@ use crate::domain::{
 };
 use crate::outbox::Confirmation;
 use crate::store::{
-    AuthStore, Credential, IpBlockVerdict, PgAuthStore, RegisterError, SessionAccount,
+    AuthStore, Credential, IpBlockVerdict, PgAuthStore, RegisterError, SessionAccount, TotpState,
 };
 
 pub mod domain;
@@ -257,12 +259,14 @@ pub fn router<S: AuthStore>(state: AppState<S>) -> Router {
         .route("/auth/confirm/{token}", get(confirm_page::<S>))
         .route(
             "/auth/2fa",
-            get(two_factor_page::<S>).post(two_factor_submit::<S>),
+            get(two_factor_entry::<S>).post(two_factor_submit::<S>),
         )
         .route(
             "/auth/2fa/enroll",
             get(enrol_page::<S>).post(enrol_submit::<S>),
         )
+        .route("/auth/2fa/enable", post(enable_json::<S>))
+        .route("/auth/2fa/disable", post(disable_json::<S>))
         .route("/auth/2fa/recovery", post(regenerate_recovery::<S>))
         .route("/auth/session", get(session::<S>))
         .route(
@@ -878,6 +882,122 @@ struct TwoFactorForm {
     csrf_token: String,
 }
 
+fn accepts_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
+}
+
+fn is_json_content(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
+}
+
+fn json_error(status: StatusCode, error: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+fn attempts_left(attempts: i32) -> u32 {
+    u32::try_from((CHALLENGE_ATTEMPTS - attempts).max(0)).unwrap_or(0)
+}
+
+#[derive(Debug, Serialize)]
+struct TwoFactorStateJson {
+    enabled: bool,
+    recovery_codes_remaining: u32,
+    attempts_remaining: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TwoFactorJson {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    csrf_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EnrolmentJson {
+    secret: String,
+    otpauth_url: String,
+    recovery_codes: Vec<String>,
+}
+
+/// Answers a browser with the page it has always seen and a JSON client with the same
+/// state it could read from the page.
+async fn two_factor_entry<S: AuthStore>(
+    state: State<AppState<S>>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    if accepts_json(&headers) {
+        two_factor_state(state, jar).await
+    } else {
+        two_factor_page(state, jar, Query(query)).await
+    }
+}
+
+async fn two_factor_state<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+) -> Response {
+    let challenge = jar.get(TWO_FACTOR_COOKIE).map(Cookie::value);
+    let account_id = if let Some(account) = current_account(&state, &jar).await {
+        account.account_id
+    } else {
+        let Some(challenge) = challenge else {
+            return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+        };
+        let Some(account_id) = state
+            .store
+            .challenge_account(&token_hash(challenge))
+            .await
+            .ok()
+            .flatten()
+        else {
+            return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+        };
+        account_id
+    };
+    let enabled = state
+        .store
+        .totp_state(&account_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|state| state.confirmed);
+    let recovery_codes_remaining = state
+        .store
+        .unspent_recovery_codes(&account_id)
+        .await
+        .unwrap_or(0);
+    // The count belongs to the sign-in challenge, not the account: once the challenge is
+    // gone there is nothing left to spend, so the honest answer is `null`.
+    let attempts_remaining = match challenge {
+        Some(challenge) => state
+            .store
+            .challenge_attempts(&token_hash(challenge))
+            .await
+            .ok()
+            .flatten()
+            .map(attempts_left),
+        None => None,
+    };
+    (
+        StatusCode::OK,
+        Json(TwoFactorStateJson {
+            enabled,
+            recovery_codes_remaining,
+            attempts_remaining,
+        }),
+    )
+        .into_response()
+}
+
 async fn two_factor_page<S: AuthStore>(
     State(state): State<AppState<S>>,
     jar: CookieJar,
@@ -913,11 +1033,31 @@ async fn two_factor_page<S: AuthStore>(
 }
 
 async fn two_factor_submit<S: AuthStore>(
+    state: State<AppState<S>>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    peer: Peer,
+    request: Request,
+) -> Response {
+    if is_json_content(&headers) {
+        match Json::<TwoFactorJson>::from_request(request, &state.0).await {
+            Ok(Json(body)) => two_factor_submit_json(state, jar, headers, peer, body).await,
+            Err(rejection) => rejection.into_response(),
+        }
+    } else {
+        match Form::<TwoFactorForm>::from_request(request, &state.0).await {
+            Ok(Form(form)) => two_factor_submit_form(state, jar, headers, peer, form).await,
+            Err(rejection) => rejection.into_response(),
+        }
+    }
+}
+
+async fn two_factor_submit_form<S: AuthStore>(
     State(state): State<AppState<S>>,
     jar: CookieJar,
     headers: HeaderMap,
     peer: Peer,
-    Form(form): Form<TwoFactorForm>,
+    form: TwoFactorForm,
 ) -> Response {
     let (jar, _csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
     if !has_valid_csrf(&jar, Some(form.csrf_token.as_str()), None) {
@@ -1011,6 +1151,138 @@ async fn two_factor_submit<S: AuthStore>(
         .into_response()
 }
 
+/// Answers a live sign-in challenge for a JSON client and issues the session cookie.
+///
+/// A wrong code reports the remaining budget in the body and keeps the challenge cookie,
+/// because that cookie is what the next attempt spends; a browser sees the same rule
+/// through the re-rendered form.
+async fn two_factor_submit_json<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    peer: Peer,
+    body: TwoFactorJson,
+) -> Response {
+    let (jar, _csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    if !has_valid_csrf(&jar, Some(body.csrf_token.as_str()), None) {
+        return json_error(StatusCode::FORBIDDEN, "invalid_csrf_token");
+    }
+    let Some(challenge) = jar.get(TWO_FACTOR_COOKIE).map(Cookie::value) else {
+        return json_error(StatusCode::UNAUTHORIZED, "challenge_expired");
+    };
+    let challenge_hash = token_hash(challenge);
+    let Some(account_id) = state
+        .store
+        .challenge_account(&challenge_hash)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            json_error(StatusCode::UNAUTHORIZED, "challenge_expired"),
+        )
+            .into_response();
+    };
+    let Some(totp_state) = state
+        .store
+        .totp_state(&account_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|state| state.confirmed)
+    else {
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            json_error(StatusCode::UNAUTHORIZED, "challenge_expired"),
+        )
+            .into_response();
+    };
+    let code = body.code.as_deref().unwrap_or_default();
+    let step = totp::step_at(Utc::now().timestamp());
+    let accepted = match totp::verify(&totp_state.secret, code, step, totp_state.last_used_step) {
+        Some(step) => state
+            .store
+            .advance_totp_step(&account_id, step)
+            .await
+            .unwrap_or(false),
+        None => state
+            .store
+            .consume_recovery_code(&account_id, &totp::recovery_code_hash(code))
+            .await
+            .unwrap_or(false),
+    };
+    if !accepted {
+        return refuse_challenge_json(&state, jar, &challenge_hash).await;
+    }
+    if !state
+        .store
+        .delete_2fa_challenge(&challenge_hash)
+        .await
+        .unwrap_or(false)
+    {
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            json_error(StatusCode::UNAUTHORIZED, "challenge_expired"),
+        )
+            .into_response();
+    }
+    let Ok(cookie) = issue_session(&state, &account_id, &headers, peer).await else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session_could_not_be_stored",
+        );
+    };
+    let rotated_csrf = csrf_cookie(opaque_token(), state.config.secure_cookies);
+    (
+        jar.add(cookie)
+            .add(rotated_csrf)
+            .remove(expired_two_factor_cookie()),
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+/// Spends one attempt and answers 401 with the remaining budget, or `challenge_expired`
+/// once the row is gone (which also clears the cookie that would otherwise point at it).
+async fn refuse_challenge_json<S: AuthStore>(
+    state: &AppState<S>,
+    jar: CookieJar,
+    challenge_hash: &str,
+) -> Response {
+    let survives = state
+        .store
+        .record_failed_2fa_attempt(challenge_hash, CHALLENGE_ATTEMPTS)
+        .await
+        .unwrap_or(false);
+    if !survives {
+        return (
+            jar.remove(expired_two_factor_cookie()),
+            json_error(StatusCode::UNAUTHORIZED, "challenge_expired"),
+        )
+            .into_response();
+    }
+    let attempts_remaining = state
+        .store
+        .challenge_attempts(challenge_hash)
+        .await
+        .ok()
+        .flatten()
+        .map(attempts_left);
+    (
+        jar,
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "invalid_code",
+                "attempts_remaining": attempts_remaining,
+            })),
+        )
+            .into_response(),
+    )
+        .into_response()
+}
+
 /// Answers a wrong code while spending one of the challenge's attempts.
 ///
 /// The count and the decision to burn the row happen under one row lock, so parallel
@@ -1095,9 +1367,243 @@ async fn enrol_page<S: AuthStore>(State(state): State<AppState<S>>, jar: CookieJ
 }
 
 async fn enrol_submit<S: AuthStore>(
+    state: State<AppState<S>>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    request: Request,
+) -> Response {
+    if is_json_content(&headers) {
+        match Json::<TwoFactorJson>::from_request(request, &state.0).await {
+            Ok(Json(body)) => enrol_submit_json(state, jar, body).await,
+            Err(rejection) => rejection.into_response(),
+        }
+    } else {
+        match Form::<TwoFactorForm>::from_request(request, &state.0).await {
+            Ok(Form(form)) => enrol_submit_form(state, jar, form).await,
+            Err(rejection) => rejection.into_response(),
+        }
+    }
+}
+
+/// Starts an enrolment and, when a `code` is present, confirms the secret that a previous
+/// call returned. Confirmation is still the moment the factor starts gating logins, so the
+/// JSON surface adds a representation, not a state.
+async fn enrol_submit_json<S: AuthStore>(
     State(state): State<AppState<S>>,
     jar: CookieJar,
-    Form(form): Form<TwoFactorForm>,
+    body: TwoFactorJson,
+) -> Response {
+    let Some(account) = current_account(&state, &jar).await else {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    let (jar, _csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    if !has_valid_csrf(&jar, Some(body.csrf_token.as_str()), None) {
+        return json_error(StatusCode::FORBIDDEN, "invalid_csrf_token");
+    }
+    let totp_state = state
+        .store
+        .totp_state(&account.account_id)
+        .await
+        .ok()
+        .flatten();
+    if totp_state.as_ref().is_some_and(|state| state.confirmed) {
+        return json_error(StatusCode::CONFLICT, "two_factor_already_enabled");
+    }
+    if let Some(code) = body
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    {
+        let Some(totp_state) = totp_state else {
+            return json_error(StatusCode::BAD_REQUEST, "enrolment_not_started");
+        };
+        return match confirm_enrolment_json(&state, &account, totp_state, code).await {
+            Ok(enrolment) => (jar, Json(enrolment)).into_response(),
+            Err((status, error)) => json_error(status, error),
+        };
+    }
+    // Reuse an unfinished secret for the same reason the page does: a reload must not
+    // invalidate a QR the user already scanned.
+    let secret = if let Some(totp_state) = totp_state {
+        totp_state.secret
+    } else {
+        let secret = totp::generate_secret();
+        if state
+            .store
+            .start_totp_enrolment(&account.account_id, &secret)
+            .await
+            .is_err()
+        {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "enrolment_could_not_be_stored",
+            );
+        }
+        secret
+    };
+    let otpauth_url = totp::provisioning_uri(&state.config.domain, &account.username, &secret);
+    (
+        jar,
+        Json(EnrolmentJson {
+            secret,
+            otpauth_url,
+            recovery_codes: Vec::new(),
+        }),
+    )
+        .into_response()
+}
+
+async fn confirm_enrolment_json<S: AuthStore>(
+    state: &AppState<S>,
+    account: &SessionAccount,
+    totp_state: TotpState,
+    code: &str,
+) -> Result<EnrolmentJson, (StatusCode, &'static str)> {
+    if totp_state.confirmed {
+        return Err((StatusCode::CONFLICT, "two_factor_already_enabled"));
+    }
+    let step = totp::step_at(Utc::now().timestamp());
+    let Some(step) = totp::verify(&totp_state.secret, code, step, None) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid_code"));
+    };
+    let codes: Vec<String> = (0..totp::RECOVERY_CODES)
+        .map(|_| totp::generate_recovery_code())
+        .collect();
+    let hashes: Vec<String> = codes
+        .iter()
+        .map(|code| totp::recovery_code_hash(code))
+        .collect();
+    if state
+        .store
+        .confirm_totp(&account.account_id, step, &hashes)
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "enrolment_could_not_be_confirmed",
+        ));
+    }
+    let otpauth_url =
+        totp::provisioning_uri(&state.config.domain, &account.username, &totp_state.secret);
+    Ok(EnrolmentJson {
+        secret: totp_state.secret,
+        otpauth_url,
+        recovery_codes: codes,
+    })
+}
+
+async fn enable_json<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    Json(body): Json<TwoFactorJson>,
+) -> Response {
+    let Some(account) = current_account(&state, &jar).await else {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    let (jar, _csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    if !has_valid_csrf(&jar, Some(body.csrf_token.as_str()), None) {
+        return json_error(StatusCode::FORBIDDEN, "invalid_csrf_token");
+    }
+    let Some(totp_state) = state
+        .store
+        .totp_state(&account.account_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return json_error(StatusCode::BAD_REQUEST, "enrolment_not_started");
+    };
+    let Some(code) = body
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    else {
+        return json_error(StatusCode::BAD_REQUEST, "missing_code");
+    };
+    match confirm_enrolment_json(&state, &account, totp_state, code).await {
+        Ok(enrolment) => (jar, Json(enrolment)).into_response(),
+        Err((status, error)) => json_error(status, error),
+    }
+}
+
+/// Disables the factor after a current TOTP code or an unused recovery code.
+///
+/// A session-authenticated disable with no attempt budget is brute-forceable against a
+/// 6-digit code; nothing in this router rate-limits `/auth/*`. The budget belongs on the
+/// account, deliberately scoped, rather than borrowed from the sign-in challenge (which a
+/// signed-in caller does not have).
+///
+/// TODO(owner: auth): add an account-scoped attempt budget for this route.
+async fn disable_json<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    Json(body): Json<TwoFactorJson>,
+) -> Response {
+    let Some(account) = current_account(&state, &jar).await else {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    let (jar, _csrf_token) = ensure_csrf(jar, None, state.config.secure_cookies);
+    if !has_valid_csrf(&jar, Some(body.csrf_token.as_str()), None) {
+        return json_error(StatusCode::FORBIDDEN, "invalid_csrf_token");
+    }
+    let Some(totp_state) = state
+        .store
+        .totp_state(&account.account_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|state| state.confirmed)
+    else {
+        return json_error(StatusCode::CONFLICT, "two_factor_not_enabled");
+    };
+    let Some(code) = body
+        .code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+    else {
+        return json_error(StatusCode::BAD_REQUEST, "missing_code");
+    };
+    let step = totp::step_at(Utc::now().timestamp());
+    let accepted = match totp::verify(&totp_state.secret, code, step, totp_state.last_used_step) {
+        Some(step) => state
+            .store
+            .advance_totp_step(&account.account_id, step)
+            .await
+            .unwrap_or(false),
+        None => state
+            .store
+            .consume_recovery_code(&account.account_id, &totp::recovery_code_hash(code))
+            .await
+            .unwrap_or(false),
+    };
+    if !accepted {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_code");
+    }
+    if state.store.disable_totp(&account.account_id).await.is_err() {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "two_factor_could_not_be_disabled",
+        );
+    }
+    (
+        jar,
+        Json(TwoFactorStateJson {
+            enabled: false,
+            recovery_codes_remaining: 0,
+            attempts_remaining: None,
+        }),
+    )
+        .into_response()
+}
+
+async fn enrol_submit_form<S: AuthStore>(
+    State(state): State<AppState<S>>,
+    jar: CookieJar,
+    form: TwoFactorForm,
 ) -> Response {
     let Some(account) = current_account(&state, &jar).await else {
         return Redirect::to("/auth/login").into_response();

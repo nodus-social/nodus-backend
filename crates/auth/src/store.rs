@@ -226,6 +226,21 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
         recovery_hashes: &[String],
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
+    /// How many recovery codes the account can still spend.
+    fn unspent_recovery_codes(
+        &self,
+        account_id: &str,
+    ) -> impl Future<Output = Result<u32, Error>> + Send;
+
+    /// Removes the factor and every recovery code in one transaction.
+    fn disable_totp(&self, account_id: &str) -> impl Future<Output = Result<(), Error>> + Send;
+
+    /// The wrong-answer count on a live challenge; `None` when it is unknown or expired.
+    fn challenge_attempts(
+        &self,
+        token_hash: &str,
+    ) -> impl Future<Output = Result<Option<i32>, Error>> + Send;
+
     /// Records `step` as spent, returning false when it was already at or below the floor.
     fn advance_totp_step(
         &self,
@@ -820,6 +835,44 @@ impl AuthStore for PgAuthStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn unspent_recovery_codes(&self, account_id: &str) -> Result<u32, Error> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM account_recovery_code \
+             WHERE account_id = $1 AND used_at IS NULL",
+        )
+        .bind(account_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    async fn disable_totp(&self, account_id: &str) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        // The secret and the codes are one factor: deleting them together means a disable
+        // cannot leave a live recovery code pointing at an account with no TOTP row.
+        sqlx::query("DELETE FROM account_recovery_code WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM account_totp WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn challenge_attempts(&self, token_hash: &str) -> Result<Option<i32>, Error> {
+        let attempts = sqlx::query_scalar(
+            "SELECT attempts FROM auth_2fa_challenge \
+             WHERE token_hash = $1 AND expires_at > now()",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(attempts)
     }
 
     async fn advance_totp_step(&self, account_id: &str, step: i64) -> Result<bool, Error> {
