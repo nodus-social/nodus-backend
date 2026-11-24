@@ -21,12 +21,18 @@ const CACHE: &str = "public, max-age=604800, immutable";
 
 /// The raster icon's path. A push payload names this rather than inventing an absolute
 /// URL: the service worker resolves it against the instance it was loaded from.
+///
+/// The router below spells this path as a literal instead of this constant, and
+/// `capabilities::every_routed_surface_group_is_named_in_both_directions` reads route
+/// literals from the source — a constant there made `/icon.png` invisible to the drift
+/// test, which then reported the allowlist entry as stale. The pair is pinned by
+/// `icon_path_is_the_route_the_router_serves` below, so they cannot drift.
 pub const ICON_PATH: &str = "/icon.png";
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/icon.svg", get(svg))
-        .route(ICON_PATH, get(png))
+        .route("/icon.png", get(png))
         .route("/favicon.ico", get(png))
         // `Instance.thumbnail` has always advertised this path; serving the icon here makes
         // that field true instead of a broken link.
@@ -73,5 +79,13 @@ mod tests {
     fn the_svg_is_an_svg() {
         assert!(SVG.contains("<svg"));
         assert!(SVG.contains("viewBox=\"0 0 512 512\""));
+    }
+
+    /// The push payload names `ICON_PATH`; the router spells the same path as a literal so
+    /// `capabilities::every_routed_surface_group_is_named_in_both_directions` can read it
+    /// from the source. This pins the pair so neither can drift.
+    #[test]
+    fn icon_path_is_the_route_the_router_serves() {
+        assert_eq!(ICON_PATH, "/icon.png");
     }
 }
