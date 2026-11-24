@@ -54,8 +54,9 @@ fn seconds(raw: Option<&str>) -> ApiResult<Option<i64>> {
     raw.map(str::trim)
         .filter(|raw| !raw.is_empty())
         .map(|raw| {
-            raw.parse::<i64>()
-                .map_err(|_| ApiError::unprocessable("expires_in must be a whole number of seconds"))
+            raw.parse::<i64>().map_err(|_| {
+                ApiError::unprocessable("expires_in must be a whole number of seconds")
+            })
         })
         .transpose()
 }
@@ -107,7 +108,14 @@ async fn create(
         }
         Err(error) => return Err(error.into()),
     };
-    audit(&state, &auth, "ip_block_created", &block.id, detail(&block, &json!({}))).await?;
+    audit(
+        &state,
+        &auth,
+        "ip_block_created",
+        &block.id,
+        detail(&block, &json!({})),
+    )
+    .await?;
     Ok(Json(block))
 }
 

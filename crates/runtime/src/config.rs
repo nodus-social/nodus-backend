@@ -158,8 +158,8 @@ pub fn read_with_bind(bind: Address) -> Result<Config, Box<dyn Error>> {
         env::var("NODUS_REGISTRATIONS_OPEN").map_or(Ok(false), |value| value.parse())?;
     let authorized_fetch =
         env::var("NODUS_AUTHORIZED_FETCH").map_or(Ok(false), |value| value.parse())?;
-    let require_email_confirmation = env::var("NODUS_REQUIRE_EMAIL_CONFIRMATION")
-        .map_or(Ok(false), |value| value.parse())?;
+    let require_email_confirmation =
+        env::var("NODUS_REQUIRE_EMAIL_CONFIRMATION").map_or(Ok(false), |value| value.parse())?;
     let account_delete_grace_days = env::var("NODUS_ACCOUNT_DELETE_GRACE_DAYS")
         .ok()
         .map(|value| value.parse())

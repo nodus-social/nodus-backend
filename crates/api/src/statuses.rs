@@ -772,7 +772,8 @@ pub async fn account_statuses(
     // decorations and viewer flags of every row separately: ~12 statements per status,
     // 245 for a 20-status page, all queueing for a pool connection.
     let viewer = auth.as_ref().map(|auth| auth.0.account.id.as_str());
-    let (items, _, _) = crate::pages::hydrate_statuses(&state, page.items, viewer, &[], None).await?;
+    let (items, _, _) =
+        crate::pages::hydrate_statuses(&state, page.items, viewer, &[], None).await?;
     let mut response = Json(items).into_response();
     if let Some(next) = page.next_max_id {
         let size = nodus_server_core::PageSize::default_max(params.limit);

@@ -96,14 +96,7 @@ async fn an_unknown_severity_and_a_plain_user_are_refused() {
 
         let plain = create_account(pool, "ip-plain").await;
         let plain_token = create_token(pool, &plain, &["read", "write"]).await;
-        let (status, body) = send(
-            &app,
-            &plain_token,
-            "GET",
-            "/api/v1/admin/ip_blocks",
-            None,
-        )
-        .await;
+        let (status, body) = send(&app, &plain_token, "GET", "/api/v1/admin/ip_blocks", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
     })
     .await;

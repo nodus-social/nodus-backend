@@ -137,7 +137,9 @@ pub(crate) async fn require_confirmed_email(
     if !state.require_email_confirmation() {
         return Ok(());
     }
-    let confirmed = nodus_server_store::accounts::credential_confirmed(state.store().pool(), account_id).await?;
+    let confirmed =
+        nodus_server_store::accounts::credential_confirmed(state.store().pool(), account_id)
+            .await?;
     if matches!(confirmed, Some(false)) {
         return Err(ApiError::forbidden(
             "Confirm your email address before posting or following. \

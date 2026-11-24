@@ -379,7 +379,15 @@ async fn a_response_reads_picture_shapes_once_however_many_statuses_it_paints() 
         // page seam makes the count a property of the page, not of its length.
         let one_outbox_owner = create_account(pool, "picture-outbox-one").await;
         give_pictures(&store, &one_outbox_owner).await;
-        create_status(pool, &one_outbox_owner, "one outbox post", "public", &[], &[]).await;
+        create_status(
+            pool,
+            &one_outbox_owner,
+            "one outbox post",
+            "public",
+            &[],
+            &[],
+        )
+        .await;
         let twenty_outbox_owner = create_account(pool, "picture-outbox-twenty").await;
         give_pictures(&store, &twenty_outbox_owner).await;
         for _ in 0..20 {

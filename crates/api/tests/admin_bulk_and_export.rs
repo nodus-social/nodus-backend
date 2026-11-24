@@ -288,13 +288,12 @@ async fn sensitive_marks_media_and_an_unsuspend_keeps_the_earlier_decision_on_re
             assert_eq!(status, StatusCode::OK, "{action}: {body}");
             assert_eq!(json_of(&body)["applied"], json!(1), "{action}: {body}");
         }
-        let still_suspended: bool = sqlx::query_scalar(
-            "SELECT suspended_at IS NOT NULL FROM account WHERE id = $1",
-        )
-        .bind(&target)
-        .fetch_one(pool)
-        .await
-        .expect("read suspension");
+        let still_suspended: bool =
+            sqlx::query_scalar("SELECT suspended_at IS NOT NULL FROM account WHERE id = $1")
+                .bind(&target)
+                .fetch_one(pool)
+                .await
+                .expect("read suspension");
         assert!(!still_suspended, "the unsuspend lifted the suspension");
         let history: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT action, detail->>'text' FROM audit_log \
@@ -390,7 +389,10 @@ async fn the_account_and_report_exports_stream_a_header_and_keep_free_text_in_it
             "id,username,domain,email,created_at,approved,silenced,suspended,sensitive,role,\
              open_reports,strike_count"
         );
-        assert!(body.contains(&local), "the local account is missing: {body}");
+        assert!(
+            body.contains(&local),
+            "the local account is missing: {body}"
+        );
         assert_eq!(body.matches(&local).count(), 1);
 
         // The export sees what the list sees, no more: a filter the list honours has to
@@ -627,13 +629,11 @@ async fn a_batch_from_a_report_closes_it_and_keeps_each_accounts_history() {
         assert_eq!(status, StatusCode::OK, "batch refused: {body}");
         assert_eq!(json_of(&body)["applied"], json!(1));
 
-        let resolved: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM report WHERE id = $1",
-        )
-        .bind(&report.id)
-        .fetch_one(pool)
-        .await
-        .expect("report state");
+        let resolved: Option<String> = sqlx::query_scalar("SELECT state FROM report WHERE id = $1")
+            .bind(&report.id)
+            .fetch_one(pool)
+            .await
+            .expect("report state");
         assert_eq!(resolved.as_deref(), Some("resolved"));
 
         // Lifting the restriction must not erase the case: both decisions stay in the
@@ -665,13 +665,12 @@ async fn a_batch_from_a_report_closes_it_and_keeps_each_accounts_history() {
         .await
         .expect("report audit row");
         assert_eq!(report_rows, 1);
-        let suspended: Option<String> = sqlx::query_scalar(
-            "SELECT suspended_at::text FROM account WHERE id = $1",
-        )
-        .bind(&target)
-        .fetch_one(pool)
-        .await
-        .expect("account state");
+        let suspended: Option<String> =
+            sqlx::query_scalar("SELECT suspended_at::text FROM account WHERE id = $1")
+                .bind(&target)
+                .fetch_one(pool)
+                .await
+                .expect("account state");
         assert!(suspended.is_none(), "the account is no longer suspended");
     })
     .await;

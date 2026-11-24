@@ -26,7 +26,9 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 use super::{audit_write_detail, offset, page};
-use super::{check_batch, csv_cell, csv_response, AccountBulkItemDto, AccountBulkResponseDto, BulkFailure};
+use super::{
+    check_batch, csv_cell, csv_response, AccountBulkItemDto, AccountBulkResponseDto, BulkFailure,
+};
 
 #[derive(Debug, Serialize)]
 pub struct AdminAccountDto {
@@ -843,14 +845,9 @@ async fn bulk_action(
     }
     tx.commit().await?;
     if let Some(report_id) = form.report_id.as_deref() {
-        if moderation::resolve_report(
-            state.store().pool(),
-            report_id,
-            &auth.0.account.id,
-            reason,
-        )
-        .await?
-        .is_some()
+        if moderation::resolve_report(state.store().pool(), report_id, &auth.0.account.id, reason)
+            .await?
+            .is_some()
         {
             // The same report audit row the single-account path writes, so a report closed
             // through a batch still counts towards the dashboard's resolution figures.
@@ -906,9 +903,21 @@ fn account_csv_row(row: &AdminAccountRow) -> String {
         csv_cell(row.email.as_deref().unwrap_or("")),
         csv_cell(&account.created_at.to_rfc3339()),
         csv_cell(if account.approved { "true" } else { "false" }),
-        csv_cell(if account.silenced_at.is_some() { "true" } else { "false" }),
-        csv_cell(if account.suspended_at.is_some() { "true" } else { "false" }),
-        csv_cell(if account.sensitized_at.is_some() { "true" } else { "false" }),
+        csv_cell(if account.silenced_at.is_some() {
+            "true"
+        } else {
+            "false"
+        }),
+        csv_cell(if account.suspended_at.is_some() {
+            "true"
+        } else {
+            "false"
+        }),
+        csv_cell(if account.sensitized_at.is_some() {
+            "true"
+        } else {
+            "false"
+        }),
         csv_cell(&account.staff_role),
         csv_cell(&row.open_reports.to_string()),
         csv_cell(&row.strike_count.to_string()),
