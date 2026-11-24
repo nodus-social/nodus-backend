@@ -19,7 +19,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -66,6 +66,12 @@ const CHALLENGE_MINUTES: i64 = 5;
 /// than the account (see `0065_two_factor_attempts.sql`), so it cannot be used to deny the
 /// owner a login.
 pub const CHALLENGE_ATTEMPTS: i32 = 5;
+/// Five consecutive wrong codes lock the session-authenticated disable route for
+/// [`DISABLE_LOCK_MINUTES`]. The budget is account-scoped (see
+/// `0068_2fa_disable_budget.sql`) because the caller already has a session and therefore
+/// no challenge to spend; a successful disable clears it.
+const DISABLE_ATTEMPTS: i32 = 5;
+const DISABLE_LOCK_MINUTES: i64 = 15;
 /// Long enough to survive a mail queue and a weekend, short enough to be worthless later.
 const CONFIRMATION_HOURS: i64 = 48;
 const CODE_MINUTES: i64 = 5;
@@ -1531,12 +1537,10 @@ async fn enable_json<S: AuthStore>(
 
 /// Disables the factor after a current TOTP code or an unused recovery code.
 ///
-/// A session-authenticated disable with no attempt budget is brute-forceable against a
-/// 6-digit code; nothing in this router rate-limits `/auth/*`. The budget belongs on the
-/// account, deliberately scoped, rather than borrowed from the sign-in challenge (which a
-/// signed-in caller does not have).
-///
-/// TODO(owner: auth): add an account-scoped attempt budget for this route.
+/// The account-scoped attempt budget (five misses, then a fifteen-minute lock) is what
+/// stops a stolen session from looping over a six-digit code; the sign-in budget cannot
+/// cover this caller, who has no challenge row. A lock also has to hold against the
+/// enrolment route, which refuses to start while a confirmed factor exists.
 async fn disable_json<S: AuthStore>(
     State(state): State<AppState<S>>,
     jar: CookieJar,
@@ -1567,6 +1571,23 @@ async fn disable_json<S: AuthStore>(
     else {
         return json_error(StatusCode::BAD_REQUEST, "missing_code");
     };
+    // The attempt is reserved before the code is looked at, and under a row lock. A
+    // request that finds the budget spent is refused here, so a correct code cannot
+    // end a lock early; and two concurrent wrong codes take different numbers instead
+    // of both reading the same count.
+    let Ok(locked_until) = state
+        .store
+        .begin_2fa_disable_attempt(&account.account_id, DISABLE_ATTEMPTS, DISABLE_LOCK_MINUTES)
+        .await
+    else {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "attempt_budget_unavailable",
+        );
+    };
+    if let Some(locked_until) = locked_until {
+        return too_many_codes(locked_until);
+    }
     let step = totp::step_at(Utc::now().timestamp());
     let accepted = match totp::verify(&totp_state.secret, code, step, totp_state.last_used_step) {
         Some(step) => state
@@ -1581,6 +1602,16 @@ async fn disable_json<S: AuthStore>(
             .unwrap_or(false),
     };
     if !accepted {
+        // A miss ends the run. The fifth miss starts the lock and answers 429; earlier
+        // misses are a plain 400. The reservation above already counted this attempt.
+        let locked_until = state
+            .store
+            .record_failed_2fa_disable(&account.account_id, DISABLE_ATTEMPTS, DISABLE_LOCK_MINUTES)
+            .await
+            .unwrap_or(None);
+        if let Some(locked_until) = locked_until {
+            return too_many_codes(locked_until);
+        }
         return json_error(StatusCode::BAD_REQUEST, "invalid_code");
     }
     if state.store.disable_totp(&account.account_id).await.is_err() {
@@ -1596,6 +1627,23 @@ async fn disable_json<S: AuthStore>(
             recovery_codes_remaining: 0,
             attempts_remaining: None,
         }),
+    )
+        .into_response()
+}
+
+/// A refusal that says the window, not the counter: the exact count is a progress meter
+/// for an attacker, while the deadline is what a legitimate client needs to back off.
+fn too_many_codes(locked_until: DateTime<Utc>) -> Response {
+    let retry_after = (locked_until - Utc::now()).num_seconds().max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, retry_after.to_string())],
+        Json(serde_json::json!({
+            "error": "too_many_codes",
+            "message": format!(
+                "Too many codes tried. Try again in {DISABLE_LOCK_MINUTES} minutes."
+            ),
+        })),
     )
         .into_response()
 }

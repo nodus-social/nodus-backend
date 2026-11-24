@@ -234,7 +234,6 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
 
     /// Removes the factor and every recovery code in one transaction.
     fn disable_totp(&self, account_id: &str) -> impl Future<Output = Result<(), Error>> + Send;
-
     /// The wrong-answer count on a live challenge; `None` when it is unknown or expired.
     fn challenge_attempts(
         &self,
@@ -290,6 +289,36 @@ pub trait AuthStore: Clone + Send + Sync + 'static {
         token_hash: &str,
         limit: i32,
     ) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// Reserves one attempt at disabling the factor, returning the lock deadline when the
+    /// budget is already spent.
+    ///
+    /// The attempt is counted before the code is checked, under a row lock on the
+    /// account. Reserving first is what serialises concurrent guesses: each one takes the
+    /// next number, so two requests cannot both see "four failures" and both be allowed.
+    /// `Some(deadline)` means the caller must answer 429 and must not look at the code at
+    /// all, so a correct guess while locked changes nothing. The budget is cleared by
+    /// [`AuthStore::disable_totp`], in the same transaction as the removal, so a disable
+    /// that commits cannot leave a spent budget behind.
+    fn begin_2fa_disable_attempt(
+        &self,
+        account_id: &str,
+        limit: i32,
+        lock_minutes: i64,
+    ) -> impl Future<Output = Result<Option<DateTime<Utc>>, Error>> + Send;
+
+    /// Applies the lock once a run of misses has reached `limit`.
+    ///
+    /// The reservation in [`AuthStore::begin_2fa_disable_attempt`] is what makes the count
+    /// race-free, but the last reservation must still be allowed to verify its code: the
+    /// fifth attempt may be the right one. Only a miss ends the run, so the handler calls
+    /// this on the failure path and answers 429 with the returned deadline.
+    fn record_failed_2fa_disable(
+        &self,
+        account_id: &str,
+        limit: i32,
+        lock_minutes: i64,
+    ) -> impl Future<Output = Result<Option<DateTime<Utc>>, Error>> + Send;
 
     /// Counts a reset request against the address and says whether it may proceed.
     ///
@@ -851,12 +880,18 @@ impl AuthStore for PgAuthStore {
     async fn disable_totp(&self, account_id: &str) -> Result<(), Error> {
         let mut tx = self.pool.begin().await?;
         // The secret and the codes are one factor: deleting them together means a disable
-        // cannot leave a live recovery code pointing at an account with no TOTP row.
+        // cannot leave a live recovery code pointing at an account with no TOTP row. The
+        // attempt budget belongs to this operation too, so it goes in the same commit: a
+        // completed disable is the one thing that resets the count.
         sqlx::query("DELETE FROM account_recovery_code WHERE account_id = $1")
             .bind(account_id)
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM account_totp WHERE account_id = $1")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM account_2fa_disable_attempt WHERE account_id = $1")
             .bind(account_id)
             .execute(&mut *tx)
             .await?;
@@ -997,6 +1032,98 @@ impl AuthStore for PgAuthStore {
             .await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    async fn begin_2fa_disable_attempt(
+        &self,
+        account_id: &str,
+        limit: i32,
+        lock_minutes: i64,
+    ) -> Result<Option<DateTime<Utc>>, Error> {
+        let mut tx = self.pool.begin().await?;
+        // Insert first so the very first attempt takes the same locked path as later ones;
+        // without a row there is nothing to lock and two first guesses could race.
+        sqlx::query(
+            "INSERT INTO account_2fa_disable_attempt (account_id) VALUES ($1) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+        // Same shape as the challenge counter: the count is read, compared and bumped
+        // while every other attempt for this account waits on the row.
+        let (attempts, first_attempt_at, locked_until): (
+            i32,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        ) = sqlx::query_as(
+            "SELECT failed_attempts, first_attempt_at, locked_until \
+             FROM account_2fa_disable_attempt WHERE account_id = $1 FOR UPDATE",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let now = Utc::now();
+        if let Some(until) = locked_until.filter(|until| *until > now) {
+            tx.rollback().await?;
+            return Ok(Some(until));
+        }
+        // A lapsed lock is a fresh run, as is a run whose first miss is older than the
+        // lock window: one typo a day must not add up to a lock.
+        let starts_over = locked_until.is_some()
+            || (attempts > 0 && first_attempt_at <= now - Duration::minutes(lock_minutes));
+        // A full run with a lapsed deadline is what a crash between reserving the last
+        // attempt and recording its miss leaves behind; it locks rather than grants a
+        // free guess.
+        if !starts_over && attempts >= limit {
+            let locked_until = now + Duration::minutes(lock_minutes);
+            sqlx::query(
+                "UPDATE account_2fa_disable_attempt \
+                 SET locked_until = $2 WHERE account_id = $1",
+            )
+            .bind(account_id)
+            .bind(locked_until)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(Some(locked_until));
+        }
+        let attempts = if starts_over { 1 } else { attempts + 1 };
+        let first_attempt_at = if starts_over { now } else { first_attempt_at };
+        sqlx::query(
+            "UPDATE account_2fa_disable_attempt \
+             SET failed_attempts = $2, first_attempt_at = $3, locked_until = NULL \
+             WHERE account_id = $1",
+        )
+        .bind(account_id)
+        .bind(attempts)
+        .bind(first_attempt_at)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(None)
+    }
+
+    async fn record_failed_2fa_disable(
+        &self,
+        account_id: &str,
+        limit: i32,
+        lock_minutes: i64,
+    ) -> Result<Option<DateTime<Utc>>, Error> {
+        // One statement, so the deadline is stamped once even if two misses race: the
+        // COALESCE keeps the earlier lock and the RETURNING says which one won.
+        let locked_until = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "UPDATE account_2fa_disable_attempt \
+             SET locked_until = COALESCE(locked_until, $2) \
+             WHERE account_id = $1 AND failed_attempts >= $3 \
+             RETURNING locked_until",
+        )
+        .bind(account_id)
+        .bind(Utc::now() + Duration::minutes(lock_minutes))
+        .bind(limit)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(locked_until)
     }
 
     async fn allow_password_reset_request(&self, email: &str) -> Result<bool, Error> {
