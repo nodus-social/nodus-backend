@@ -15,7 +15,6 @@ use crate::auth::Auth;
 use crate::error::ApiResult;
 use crate::mastodon::PageQuery;
 use crate::state::AppState;
-use crate::statuses;
 
 /// `GET /api/v1/favourites`
 pub async fn favourites(
@@ -83,18 +82,18 @@ async fn page(
         }
     };
 
-    let pictures = statuses::pictures_for_rows(state, &rows).await?;
-    let mut items = Vec::with_capacity(rows.len());
-    for row in &rows {
-        items.push(statuses::dto_with_pictures(state, row, Some(auth), Some(&pictures)).await?);
-    }
-
-    let mut response = axum::Json(items).into_response();
-    if let Some(link) = rows
+    // The shelf is a page of statuses, so it is hydrated as one: the row count must not
+    // decide how many statements build the payload. The cursor comes from the page's
+    // last row before hydration, and the order is the shelf query's order.
+    let link = rows
         .last()
         .and_then(|row| params.next_link(shelf.path(), row.id.parse().ok(), size))
-        .and_then(|link| HeaderValue::from_str(&link).ok())
-    {
+        .and_then(|link| HeaderValue::from_str(&link).ok());
+    let viewer = Some(auth.0.account.id.as_str());
+    let (items, _, _) = crate::pages::hydrate_statuses(state, rows, viewer, &[], None).await?;
+
+    let mut response = axum::Json(items).into_response();
+    if let Some(link) = link {
         response
             .headers_mut()
             .insert(axum::http::header::LINK, link);

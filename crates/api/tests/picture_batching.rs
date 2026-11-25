@@ -245,12 +245,11 @@ async fn a_response_reads_picture_shapes_once_however_many_statuses_it_paints() 
             thread_twenty.pictures, 1,
             "twenty-reply thread picture reads"
         );
-        // Totals pinned as they stand. What still grows with the reply count is the
-        // per-row account, media and decoration work outside this seam; a reintroduced
-        // per-row picture read moves these numbers by N and fails here.
-        assert_eq!(thread_one.statements, 18, "one-reply thread statements");
+        // Pinned flat: the thread is hydrated as one page, so one reply and twenty replies
+        // cost the same statements. A reintroduced per-row read moves the twenty by N.
+        assert_eq!(thread_one.statements, 16, "one-reply thread statements");
         assert_eq!(
-            thread_twenty.statements, 189,
+            thread_twenty.statements, 16,
             "twenty-reply thread statements"
         );
         for (index, status) in thread_twenty.body["descendants"]
@@ -296,9 +295,10 @@ async fn a_response_reads_picture_shapes_once_however_many_statuses_it_paints() 
             collection_twenty.pictures, 1,
             "twenty-favourite picture reads"
         );
-        assert_eq!(collection_one.statements, 20, "one-favourite statements");
+        // A shelf is a page too: the same hydration paints one favourite and twenty.
+        assert_eq!(collection_one.statements, 13, "one-favourite statements");
         assert_eq!(
-            collection_twenty.statements, 153,
+            collection_twenty.statements, 13,
             "twenty-favourite statements"
         );
         // The boost paints two accounts: its author and the boosted author, whose id the

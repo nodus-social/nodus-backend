@@ -18,7 +18,6 @@ use crate::auth::MaybeAuth;
 use crate::dto::{accounts_with_pictures, AccountDto, StatusDto};
 use crate::error::ApiResult;
 use crate::state::AppState;
-use crate::statuses;
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
@@ -120,12 +119,13 @@ pub async fn search(
             limit,
         )
         .await?;
-        let pictures = statuses::pictures_for_rows(&state, &rows).await?;
-        for row in &rows {
-            result
-                .statuses
-                .push(statuses::dto_with_pictures(&state, row, viewer, Some(&pictures)).await?);
-        }
+        // Search returns a page of statuses, so it pays one page hydration rather than
+        // one row read per hit. The store query already applied the audience predicate;
+        // hydration keeps each row's own moderated-visibility check.
+        let viewer = viewer.map(|auth| auth.0.account.id.as_str());
+        let (statuses, _, _) =
+            crate::pages::hydrate_statuses(&state, rows, viewer, &[], None).await?;
+        result.statuses = statuses;
     }
     if want == "all" || want == "hashtags" {
         let rows = nodus_server_store::discovery::search_tags(pool, &term, limit).await?;
@@ -238,13 +238,10 @@ pub async fn trending_statuses(
         i64::from(nodus_server_core::limits::PAGE_DEFAULT),
     )
     .await?;
-    let pictures = statuses::pictures_for_rows(&state, &rows).await?;
-    let mut items = Vec::with_capacity(rows.len());
-    for row in &rows {
-        items.push(
-            statuses::dto_with_pictures(&state, row, auth.0.as_ref(), Some(&pictures)).await?,
-        );
-    }
+    // Trends are the same page shape as search: one hydration for the whole list. Only
+    // anonymous/public rows reach here, but the per-row moderation gate still runs.
+    let viewer = auth.0.as_ref().map(|auth| auth.0.account.id.as_str());
+    let (items, _, _) = crate::pages::hydrate_statuses(&state, rows, viewer, &[], None).await?;
     Ok(Json(items))
 }
 

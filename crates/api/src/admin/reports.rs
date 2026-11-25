@@ -96,8 +96,11 @@ async fn one_report_dto(state: &AppState, row: ReportRow) -> ApiResult<ReportDto
     report_dto(state, row, &accounts).await
 }
 
-/// Builds one report for the queue. Statuses are hydrated in order: a report is about a
-/// handful of posts, and a moderator reads them, so the cost is worth paying once.
+/// Builds one report for the queue. Statuses are hydrated here, one report at a time:
+/// a moderator must see reported private and direct posts, and the page hydration's
+/// audience gate hides exactly those from a viewer-less caller. Batching a queue's
+/// report statuses therefore needs a moderator-scoped hydration; until that exists,
+/// this stays the single-subject path on purpose.
 pub(super) async fn report_dto(
     state: &AppState,
     row: ReportRow,

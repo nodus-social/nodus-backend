@@ -718,39 +718,31 @@ pub async fn context(
     let _ = visible_status(&state, auth.as_ref(), &id).await?;
     let (ancestors, descendants) =
         nodus_server_store::statuses::context(state.store().pool(), &id).await?;
-    let mut visible_ancestors = Vec::with_capacity(ancestors.len());
-    for row in ancestors {
-        if can_view(&state, auth.as_ref(), &row).await? {
-            visible_ancestors.push(row);
-        }
-    }
-    let mut visible_descendants = Vec::with_capacity(descendants.len());
-    for row in descendants {
-        if can_view(&state, auth.as_ref(), &row).await? {
-            visible_descendants.push(row);
-        }
-    }
-    // The audience gate above stays one row at a time; the picture shapes for the whole
-    // thread are one read, however many posts the thread holds.
-    let pictures = pictures_for_rows(
-        &state,
-        visible_ancestors.iter().chain(visible_descendants.iter()),
-    )
-    .await?;
-    let mut context = ContextDto {
-        ancestors: Vec::with_capacity(visible_ancestors.len()),
-        descendants: Vec::with_capacity(visible_descendants.len()),
+    let ancestor_ids: Vec<String> = ancestors.iter().map(|row| row.id.clone()).collect();
+    let descendant_ids: Vec<String> = descendants.iter().map(|row| row.id.clone()).collect();
+    let mut rows = Vec::with_capacity(ancestors.len() + descendants.len());
+    rows.extend(ancestors);
+    rows.extend(descendants);
+    // The audience gate stays per subject inside `hydrate_statuses`: twenty ancestors are
+    // checked one at a time and never "approved as a set". What the thread does not pay
+    // per row is the account, media, decoration and picture work. The reply order comes
+    // from the id lists, not from the hydration map.
+    let viewer = auth.as_ref().map(|auth| auth.0.account.id.as_str());
+    let (statuses, _, _) = crate::pages::hydrate_statuses(&state, rows, viewer, &[], None).await?;
+    let mut by_id: std::collections::HashMap<String, StatusDto> = statuses
+        .into_iter()
+        .map(|dto| (dto.id.clone(), dto))
+        .collect();
+    let context = ContextDto {
+        ancestors: ancestor_ids
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect(),
+        descendants: descendant_ids
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .collect(),
     };
-    for row in &visible_ancestors {
-        context
-            .ancestors
-            .push(dto_with_pictures(&state, row, auth.as_ref(), Some(&pictures)).await?);
-    }
-    for row in &visible_descendants {
-        context
-            .descendants
-            .push(dto_with_pictures(&state, row, auth.as_ref(), Some(&pictures)).await?);
-    }
     Ok(Json(context))
 }
 

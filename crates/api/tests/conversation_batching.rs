@@ -158,19 +158,52 @@ async fn a_thread_reads_its_participants_once() {
             "every participant still reaches the payload: {body}"
         );
 
-        // The list route renders the same threads; it batched already, and stays at one.
+        // The list route renders the same threads. It reads participants in one statement
+        // and the threads' last-status authors in a second: two batch reads for the page,
+        // not one per thread.
         clear(&log);
         let (status, list) = send(&app, &token, "GET", "/api/v1/conversations", None).await;
         let list = expect_ok(status, &list, "/api/v1/conversations");
         assert_eq!(
             batched_account_reads(&log),
-            1,
-            "the conversation list reads participants in one statement for the page"
+            2,
+            "the conversation list reads participants and status authors in two statements"
         );
         assert_eq!(
             json_of(&list).as_array().expect("list array").len(),
             1,
             "the thread is listed"
+        );
+
+        // The inbox is a page: one thread and twenty must cost the same statements. The
+        // last statuses are named in one `by_ids` read and painted by one page hydration;
+        // a per-thread `by_id` loop would add a statement for every extra row.
+        let one_page = statements(&log);
+        for _ in 1..20 {
+            seed_thread(pool, &viewer, &participants).await;
+        }
+        clear(&log);
+        let (status, list) = send(&app, &token, "GET", "/api/v1/conversations", None).await;
+        let list = expect_ok(status, &list, "/api/v1/conversations");
+        let twenty_page = statements(&log);
+        assert_eq!(
+            json_of(&list).as_array().expect("list array").len(),
+            20,
+            "twenty threads are listed"
+        );
+        // A conversation's newest status is direct, so its audience check cannot be
+        // batched: `can_view_for_viewer` reads the author's account state per subject
+        // (deleted, remote moderation) before it serves the row. That floor is two
+        // statements per thread. Everything else — the page query, participants, muted
+        // roots, the last-status `by_ids` and the page hydration — is flat.
+        assert_eq!(
+            twenty_page - one_page,
+            2 * 19,
+            "only the per-subject DM audience check may grow with the page"
+        );
+        eprintln!(
+            "conversation list: {one_page} statements at one thread, {twenty_page} at twenty \
+             (+2 per thread: the per-subject audience check)"
         );
 
         let before = old_path_statements(&store, &viewer, &root, &log).await;

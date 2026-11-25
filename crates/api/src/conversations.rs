@@ -82,16 +82,21 @@ pub async fn list(
         );
     }
 
-    // One read per thread's last status, then one picture batch for all of them, so a
-    // page of twenty conversations does not read twenty profiles.
-    let mut last_statuses = Vec::with_capacity(rows.len());
-    for row in &rows {
-        last_statuses.push(nodus_server_store::statuses::by_id(pool, &row.last_status_id).await?);
-    }
-    let pictures = statuses::pictures_for_rows(&state, last_statuses.iter().flatten()).await?;
+    // The inbox is a page: its threads' last statuses are named in one read and painted
+    // by one page hydration, so a page of twenty does not pay twenty status builds. The
+    // unread/muted flags and participant order still come from `rows`.
+    let last_ids: Vec<String> = rows.iter().map(|row| row.last_status_id.clone()).collect();
+    let last_rows = nodus_server_store::statuses::by_ids(pool, &last_ids).await?;
+    let viewer = Some(auth.0.account.id.as_str());
+    let (hydrated, _, _) =
+        crate::pages::hydrate_statuses(&state, last_rows, viewer, &[], None).await?;
+    let mut last_statuses: HashMap<String, StatusDto> = hydrated
+        .into_iter()
+        .map(|dto| (dto.id.clone(), dto))
+        .collect();
 
     let mut items = Vec::with_capacity(rows.len());
-    for (row, last_status_row) in rows.iter().zip(&last_statuses) {
+    for row in &rows {
         let participants = by_root.get(&row.root_id).map_or(&[][..], Vec::as_slice);
         let accounts = match &participant_outcome {
             Some(outcome) => {
@@ -103,12 +108,7 @@ pub async fn list(
             }
             None => Vec::new(),
         };
-        let last_status = match last_status_row {
-            Some(status) => Some(
-                statuses::dto_with_pictures(&state, status, Some(&auth), Some(&pictures)).await?,
-            ),
-            None => None,
-        };
+        let last_status = last_statuses.remove(&row.last_status_id);
         // Unread means the newest status arrived after the reader last opened the thread
         // and is not their own. A muted thread is still listed but stops asking for
         // attention, which is what muting a conversation is for.
@@ -232,6 +232,8 @@ async fn conversation_dto(
 ) -> ApiResult<ConversationDto> {
     let pool = state.store().pool();
     let accounts = participant_dtos(state, auth, &row.root_id).await?;
+    // One thread is a single subject: its newest status is painted by the single-status
+    // path. The inbox list, which paints a page of them, hydrates them together instead.
     let last_status = match nodus_server_store::statuses::by_id(pool, &row.last_status_id).await? {
         Some(status) => Some(statuses::dto(state, &status, Some(auth)).await?),
         None => None,
