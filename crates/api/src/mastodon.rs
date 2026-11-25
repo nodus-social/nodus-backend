@@ -76,7 +76,7 @@ pub async fn instance_v1(State(state): State<AppState>) -> ApiResult<Json<Instan
         invites_enabled: false,
         configuration: ConfigurationDto::build(
             instance,
-            state.vapid().map(|vapid| vapid.public_key()),
+            state.vapid().map(nodus_server_runtime::Vapid::public_key),
         ),
         rules: rules.into_iter().map(RuleDto::from_row).collect(),
     }))
@@ -101,7 +101,7 @@ pub async fn instance_v2(State(state): State<AppState>) -> ApiResult<Json<Instan
         languages: vec!["en".to_owned()],
         configuration: ConfigurationDto::build(
             instance,
-            state.vapid().map(|vapid| vapid.public_key()),
+            state.vapid().map(nodus_server_runtime::Vapid::public_key),
         ),
         registrations: RegistrationsDto {
             enabled: instance.registrations_open,
