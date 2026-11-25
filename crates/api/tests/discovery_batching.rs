@@ -111,6 +111,10 @@ async fn a_discovery_page_hydrates_its_statuses_once() {
 
         // Search used to pay one `by_id`/account/media/decoration build per hit; both
         // endpoints now hydrate the whole page in one pass.
+        eprintln!(
+            "discovery: search {search_one} at one hit, {search_twenty} at twenty; trends \
+             {trends_one} at one, {trends_twenty} at twenty"
+        );
         assert_eq!(search_one, search_twenty, "search statements must not grow");
         assert_eq!(trends_one, trends_twenty, "trends statements must not grow");
     })
